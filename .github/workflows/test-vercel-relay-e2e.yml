@@ -1,0 +1,23 @@
+name: Test Vercel Relay E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Run production relay E2E
+        working-directory: relay/vercel
+        env:
+          RELAY_URL: https://personal-mcp-hub-relay.vercel.app/api/exa-mcp
+          HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+        run: node e2e.mjs

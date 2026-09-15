@@ -47,7 +47,10 @@ export async function withUpstreamClient<T>(
   const client = new Client(
     { name: `personal-mcp-hub/${upstream.id}`, version: "1.0.0" },
     {
-      versionNegotiation: { mode: "auto" },
+      // Hosted upstreams in the current build are 2025-era Streamable HTTP servers.
+      // Use the legacy initialize handshake directly. Auto mode first sends the
+      // 2026 server/discover probe, and Exa currently rejects that probe with 403.
+      versionNegotiation: { mode: "legacy" },
       listMaxPages: 8,
     },
   );

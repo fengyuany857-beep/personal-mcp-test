@@ -43,6 +43,48 @@ async function mcpFetch(method, params = {}, notification = false) {
   return payload.result;
 }
 
+async function directExaProbe() {
+  const exaEndpoint = "https://mcp.exa.ai/mcp?tools=web_search_exa";
+  let exaSession = null;
+  let exaId = 0;
+
+  const call = async (method, params = {}, notification = false) => {
+    const headers = {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+    };
+    if (exaSession) headers["mcp-session-id"] = exaSession;
+    const body = { jsonrpc: "2.0", method, params };
+    if (!notification) body.id = ++exaId;
+    const response = await fetch(exaEndpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    exaSession = response.headers.get("mcp-session-id") ?? exaSession;
+    const text = await response.text();
+    if (!response.ok) throw new Error(`${method} HTTP ${response.status}: ${text.slice(0, 500)}`);
+    if (notification || response.status === 202) return null;
+    const payload = parseResponseBody(response.headers.get("content-type") ?? "", text);
+    if (payload.error) throw new Error(`${method} MCP error: ${JSON.stringify(payload.error)}`);
+    return payload.result;
+  };
+
+  try {
+    const init = await call("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "personal-mcp-exa-direct-probe", version: "1.0.0" },
+    });
+    await call("notifications/initialized", {}, true);
+    const list = await call("tools/list", {});
+    const names = (list?.tools ?? []).map((tool) => tool.name).sort();
+    console.log(`EXA_DIRECT_PROBE=PASS server=${JSON.stringify(init?.serverInfo ?? null)} tools=${JSON.stringify(names)}`);
+  } catch (error) {
+    console.log(`EXA_DIRECT_PROBE=FAIL ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
+  }
+}
+
 function getStructured(result) {
   if (result?.structuredContent) return result.structuredContent;
   const text = result?.content?.find((entry) => entry?.type === "text")?.text;
@@ -95,6 +137,8 @@ const echoResult = getStructured(
 );
 assertEqual(echoResult, { ok: true, echo: echoText }, "echo result");
 console.log(`ECHO=PASS ${JSON.stringify(echoResult)}`);
+
+await directExaProbe();
 
 const exaStatusCall = await mcpFetch("tools/call", {
   name: "system.upstream_status",

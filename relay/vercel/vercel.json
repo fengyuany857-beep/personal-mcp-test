@@ -4,5 +4,11 @@
     "api/exa-mcp.mjs": {
       "maxDuration": 60
     }
-  }
+  },
+  "routes": [
+    {
+      "src": "/api/exa-mcp",
+      "dest": "/api/exa-mcp.mjs"
+    }
+  ]
 }

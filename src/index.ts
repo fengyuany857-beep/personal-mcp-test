@@ -23,9 +23,11 @@ function createExaUpstream(env: Env) {
     id: "exa",
     url: EXA_ENDPOINT,
     timeoutMs: 15_000,
-    ...(env.EXA_API_KEY
-      ? { headers: { "x-api-key": env.EXA_API_KEY } }
-      : {}),
+    headers: {
+      "User-Agent": "Personal-MCP-Hub/1.0",
+      "x-exa-source": "personal-mcp-hub",
+      ...(env.EXA_API_KEY ? { "x-api-key": env.EXA_API_KEY } : {}),
+    },
   };
 }
 

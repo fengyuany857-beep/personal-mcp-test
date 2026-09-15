@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - feature/personal-mcp-hub
     paths:
       - DEPLOY_TRIGGER
 

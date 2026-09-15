@@ -4,9 +4,11 @@ import { z } from "zod";
 import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
 
 const SERVER_NAME = "personal-mcp-test" as const;
-const SERVER_VERSION = "1.1.0" as const;
+const SERVER_VERSION = "1.2.0" as const;
 const EXA_TOOL = "web_search_exa" as const;
 const EXA_ENDPOINT = `https://mcp.exa.ai/mcp?tools=${EXA_TOOL}`;
+const FIRECRAWL_TOOL = "firecrawl_scrape" as const;
+const FIRECRAWL_ENDPOINT = "https://mcp.firecrawl.dev/v2/mcp";
 const MAX_PROXY_TEXT_CHARS = 32_000;
 
 type Env = {
@@ -18,6 +20,17 @@ type Env = {
 function capText(text: string): string {
   if (text.length <= MAX_PROXY_TEXT_CHARS) return text;
   return `${text.slice(0, MAX_PROXY_TEXT_CHARS)}\n\n[Hub truncated upstream text at ${MAX_PROXY_TEXT_CHARS} characters.]`;
+}
+
+function findMarkdown(value: unknown, depth = 0): string | undefined {
+  if (depth > 8 || value == null || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.markdown === "string") return record.markdown;
+  for (const child of Object.values(record)) {
+    const found = findMarkdown(child, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 function configuredRelayUrl(env: Env): string | undefined {
@@ -57,6 +70,14 @@ function createExaUpstream(env: Env) {
       "x-exa-source": "personal-mcp-hub",
       ...(env.EXA_API_KEY ? { "x-api-key": env.EXA_API_KEY } : {}),
     },
+  };
+}
+
+function createFirecrawlUpstream() {
+  return {
+    id: "firecrawl",
+    url: FIRECRAWL_ENDPOINT,
+    timeoutMs: 30_000,
   };
 }
 
@@ -112,7 +133,7 @@ function createServer(env: Env) {
     "system.upstream_status",
     {
       description: "Checks whether an allowlisted upstream MCP is reachable and exposes the expected curated tool.",
-      inputSchema: z.object({ service: z.enum(["exa"]) }),
+      inputSchema: z.object({ service: z.enum(["exa", "firecrawl"]) }),
       outputSchema: z.object({
         ok: z.boolean(),
         service: z.string(),
@@ -122,14 +143,16 @@ function createServer(env: Env) {
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ service }) => {
+      const expectedTool = service === "exa" ? EXA_TOOL : FIRECRAWL_TOOL;
+      const upstream = service === "exa" ? createExaUpstream(env) : createFirecrawlUpstream();
       try {
-        return await withUpstreamClient(createExaUpstream(env), async (client) => {
+        return await withUpstreamClient(upstream, async (client) => {
           const { tools } = await client.listTools();
-          const toolFound = tools.some((tool) => tool.name === EXA_TOOL);
+          const toolFound = tools.some((tool) => tool.name === expectedTool);
           const result = {
             ok: toolFound,
             service,
-            expectedTool: EXA_TOOL,
+            expectedTool,
             toolFound,
           };
           return {
@@ -144,7 +167,7 @@ function createServer(env: Env) {
           structuredContent: {
             ok: false,
             service,
-            expectedTool: EXA_TOOL,
+            expectedTool,
             toolFound: false,
           },
           isError: true,
@@ -195,6 +218,77 @@ function createServer(env: Env) {
         });
       } catch (error) {
         const failure = toSafeUpstreamFailure("exa", error);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(failure) }],
+          structuredContent: failure,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.registerTool(
+    "crawl.firecrawl_scrape",
+    {
+      description: "L0/L1 read-only page extraction through the allowlisted Firecrawl MCP firecrawl_scrape tool. Returns clean main-content Markdown.",
+      inputSchema: z.object({
+        url: z.string().url(),
+      }),
+      outputSchema: z.object({
+        ok: z.literal(true),
+        url: z.string(),
+        markdown: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        openWorldHint: true,
+        destructiveHint: false,
+      },
+    },
+    async ({ url }) => {
+      try {
+        return await withUpstreamClient(createFirecrawlUpstream(), async (client) => {
+          const { tools } = await client.listTools();
+          const tool = tools.find((candidate) => candidate.name === FIRECRAWL_TOOL);
+          if (!tool) throw new Error(`MCP protocol drift: missing ${FIRECRAWL_TOOL}`);
+
+          const upstreamResult = await client.callTool(
+            {
+              name: FIRECRAWL_TOOL,
+              arguments: {
+                url,
+                formats: ["markdown"],
+                onlyMainContent: true,
+              },
+            },
+            undefined,
+            { toolDefinition: tool },
+          );
+          if (upstreamResult.isError) throw new Error("MCP protocol error: firecrawl_scrape returned isError");
+
+          let markdown = findMarkdown(upstreamResult.structuredContent);
+          if (!markdown) {
+            for (const entry of upstreamResult.content) {
+              if (entry.type !== "text") continue;
+              try {
+                markdown = findMarkdown(JSON.parse(entry.text));
+              } catch {
+                if (entry.text.trim()) markdown = entry.text;
+              }
+              if (markdown) break;
+            }
+          }
+          if (!markdown) throw new Error("MCP protocol drift: firecrawl_scrape returned no Markdown");
+
+          const result = { ok: true as const, url, markdown: capText(markdown) };
+          return {
+            content: [{ type: "text" as const, text: result.markdown }],
+            structuredContent: result,
+          };
+        });
+      } catch (error) {
+        const failure = toSafeUpstreamFailure("firecrawl", error);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(failure) }],
           structuredContent: failure,

@@ -59,7 +59,7 @@ function assertEqual(actual, expected, label) {
 const init = await mcpFetch("initialize", {
   protocolVersion: "2025-03-26",
   capabilities: {},
-  clientInfo: { name: "personal-mcp-independent-test", version: "1.0.0" },
+  clientInfo: { name: "personal-mcp-independent-test", version: "1.1.0" },
 });
 if (init?.serverInfo?.name !== "personal-mcp-test") {
   throw new Error(`Unexpected serverInfo: ${JSON.stringify(init?.serverInfo)}`);
@@ -70,7 +70,11 @@ await mcpFetch("notifications/initialized", {}, true);
 
 const tools = await mcpFetch("tools/list", {});
 const toolNames = (tools?.tools ?? []).map((tool) => tool.name).sort();
-assertEqual(toolNames, ["echo", "ping"], "tools/list");
+assertEqual(
+  toolNames,
+  ["echo", "ping", "search.exa_search", "system.upstream_status"],
+  "tools/list",
+);
 console.log(`TOOLS_LIST=PASS ${JSON.stringify(toolNames)}`);
 
 const nonce = `independent-${Date.now()}-${crypto.randomUUID()}`;
@@ -92,4 +96,31 @@ const echoResult = getStructured(
 assertEqual(echoResult, { ok: true, echo: echoText }, "echo result");
 console.log(`ECHO=PASS ${JSON.stringify(echoResult)}`);
 
-console.log("REMOTE_MCP_PASS");
+const exaStatusCall = await mcpFetch("tools/call", {
+  name: "system.upstream_status",
+  arguments: { service: "exa" },
+});
+if (exaStatusCall?.isError) throw new Error(`EXA_STATUS isError: ${JSON.stringify(exaStatusCall)}`);
+const exaStatus = getStructured(exaStatusCall);
+assertEqual(
+  exaStatus,
+  { ok: true, service: "exa", expectedTool: "web_search_exa", toolFound: true },
+  "exa upstream status",
+);
+console.log(`EXA_DISCOVERY=PASS ${JSON.stringify(exaStatus)}`);
+
+const exaSearch = await mcpFetch("tools/call", {
+  name: "search.exa_search",
+  arguments: {
+    query: "official Model Context Protocol specification documentation",
+    numResults: 3,
+  },
+});
+if (exaSearch?.isError) throw new Error(`EXA_SEARCH isError: ${JSON.stringify(exaSearch)}`);
+const exaText = exaSearch?.content?.find((entry) => entry?.type === "text")?.text ?? "";
+if (exaText.length < 40 || !/https?:\/\//i.test(exaText)) {
+  throw new Error(`EXA_SEARCH unexpected result: ${exaText.slice(0, 1000)}`);
+}
+console.log(`EXA_SEARCH=PASS chars=${exaText.length}`);
+
+console.log("EXA_HUB_PASS");

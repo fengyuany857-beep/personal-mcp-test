@@ -14,6 +14,7 @@ export type UpstreamFailure = {
   service: string;
   code: "UPSTREAM_TIMEOUT" | "UPSTREAM_UNAVAILABLE" | "UPSTREAM_PROTOCOL_ERROR";
   message: string;
+  diagnostic?: string;
 };
 
 function createTimeoutFetch(timeoutMs: number): typeof fetch {
@@ -30,8 +31,6 @@ function createTimeoutFetch(timeoutMs: number): typeof fetch {
     }
 
     try {
-      // Cloudflare Workers accepts string | Request for fetch input. The MCP SDK's
-      // FetchLike also permits URL, so normalize URL here at the runtime boundary.
       const workerInput = input instanceof URL ? input.toString() : input;
       return await fetch(workerInput, { ...init, signal: controller.signal });
     } finally {
@@ -72,7 +71,20 @@ export async function withUpstreamClient<T>(
   }
 }
 
+function safeDiagnostic(error: unknown): string {
+  if (!(error instanceof Error)) return `non-error:${typeof error}`;
+  const maybe = error as Error & { code?: unknown; status?: unknown };
+  const code = typeof maybe.code === "string" || typeof maybe.code === "number" ? String(maybe.code) : "none";
+  const status = typeof maybe.status === "number" ? String(maybe.status) : "none";
+  const message = error.message
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
+    .replace(/([?&](?:exaApiKey|api[_-]?key|token)=)[^&\s]+/gi, "$1[REDACTED]")
+    .slice(0, 240);
+  return `${error.name}|code=${code}|status=${status}|${message}`;
+}
+
 export function toSafeUpstreamFailure(service: string, error: unknown): UpstreamFailure {
+  const diagnostic = safeDiagnostic(error);
   const isTimeout =
     (error instanceof DOMException && error.name === "AbortError") ||
     (error instanceof Error && /abort|timeout/i.test(`${error.name} ${error.message}`));
@@ -83,6 +95,7 @@ export function toSafeUpstreamFailure(service: string, error: unknown): Upstream
       service,
       code: "UPSTREAM_TIMEOUT",
       message: `${service} did not respond before the Hub timeout.`,
+      diagnostic,
     };
   }
 
@@ -94,5 +107,6 @@ export function toSafeUpstreamFailure(service: string, error: unknown): Upstream
     service,
     code: isProtocolError ? "UPSTREAM_PROTOCOL_ERROR" : "UPSTREAM_UNAVAILABLE",
     message: `${service} is currently unavailable through the Hub.`,
+    diagnostic,
   };
 }

@@ -1,0 +1,27 @@
+name: Test Vercel Relay
+
+on:
+  push:
+    branches:
+      - main
+      - feature/personal-mcp-hub
+    paths:
+      - "relay/vercel/**"
+      - ".github/workflows/test-vercel-relay.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Run relay unit checks
+        working-directory: relay/vercel
+        run: npm test

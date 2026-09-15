@@ -30,7 +30,10 @@ function createTimeoutFetch(timeoutMs: number): typeof fetch {
     }
 
     try {
-      return await fetch(input, { ...init, signal: controller.signal });
+      // Cloudflare Workers accepts string | Request for fetch input. The MCP SDK's
+      // FetchLike also permits URL, so normalize URL here at the runtime boundary.
+      const workerInput = input instanceof URL ? input.toString() : input;
+      return await fetch(workerInput, { ...init, signal: controller.signal });
     } finally {
       clearTimeout(timer);
       parentSignal?.removeEventListener("abort", abortFromParent);

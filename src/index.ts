@@ -4,11 +4,14 @@ import { z } from "zod";
 import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
 
 const SERVER_NAME = "personal-mcp-test" as const;
-const SERVER_VERSION = "1.2.0" as const;
+const SERVER_VERSION = "1.3.0" as const;
 const EXA_TOOL = "web_search_exa" as const;
 const EXA_ENDPOINT = `https://mcp.exa.ai/mcp?tools=${EXA_TOOL}`;
 const FIRECRAWL_TOOL = "firecrawl_scrape" as const;
 const FIRECRAWL_ENDPOINT = "https://mcp.firecrawl.dev/v2/mcp";
+const APIFY_SEARCH_TOOL = "search-actors" as const;
+const APIFY_DETAILS_TOOL = "fetch-actor-details" as const;
+const APIFY_ENDPOINT = `https://mcp.apify.com?tools=${APIFY_SEARCH_TOOL},${APIFY_DETAILS_TOOL}`;
 const MAX_PROXY_TEXT_CHARS = 32_000;
 
 type Env = {
@@ -20,6 +23,13 @@ type Env = {
 function capText(text: string): string {
   if (text.length <= MAX_PROXY_TEXT_CHARS) return text;
   return `${text.slice(0, MAX_PROXY_TEXT_CHARS)}\n\n[Hub truncated upstream text at ${MAX_PROXY_TEXT_CHARS} characters.]`;
+}
+
+function textContent(result: { content: Array<{ type: string; text?: string }> }): string {
+  return result.content
+    .filter((entry) => entry.type === "text" && typeof entry.text === "string")
+    .map((entry) => entry.text as string)
+    .join("\n");
 }
 
 function findMarkdown(value: unknown, depth = 0): string | undefined {
@@ -81,6 +91,14 @@ function createFirecrawlUpstream() {
   };
 }
 
+function createApifyUpstream() {
+  return {
+    id: "apify",
+    url: APIFY_ENDPOINT,
+    timeoutMs: 20_000,
+  };
+}
+
 function createServer(env: Env) {
   const server = new McpServer({
     name: SERVER_NAME,
@@ -133,7 +151,7 @@ function createServer(env: Env) {
     "system.upstream_status",
     {
       description: "Checks whether an allowlisted upstream MCP is reachable and exposes the expected curated tool.",
-      inputSchema: z.object({ service: z.enum(["exa", "firecrawl"]) }),
+      inputSchema: z.object({ service: z.enum(["exa", "firecrawl", "apify"]) }),
       outputSchema: z.object({
         ok: z.boolean(),
         service: z.string(),
@@ -143,8 +161,10 @@ function createServer(env: Env) {
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ service }) => {
-      const expectedTool = service === "exa" ? EXA_TOOL : FIRECRAWL_TOOL;
-      const upstream = service === "exa" ? createExaUpstream(env) : createFirecrawlUpstream();
+      const expectedTool =
+        service === "exa" ? EXA_TOOL : service === "firecrawl" ? FIRECRAWL_TOOL : APIFY_SEARCH_TOOL;
+      const upstream =
+        service === "exa" ? createExaUpstream(env) : service === "firecrawl" ? createFirecrawlUpstream() : createApifyUpstream();
       try {
         return await withUpstreamClient(upstream, async (client) => {
           const { tools } = await client.listTools();
@@ -289,6 +309,134 @@ function createServer(env: Env) {
         });
       } catch (error) {
         const failure = toSafeUpstreamFailure("firecrawl", error);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(failure) }],
+          structuredContent: failure,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.registerTool(
+    "actor.search",
+    {
+      description: "Read-only discovery of existing Actors in Apify Store. This tool never runs an Actor.",
+      inputSchema: z.object({
+        keywords: z.string().max(200).optional(),
+        limit: z.number().int().min(1).max(10).optional(),
+      }),
+      outputSchema: z.object({
+        ok: z.literal(true),
+        keywords: z.string(),
+        results: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+    },
+    async ({ keywords, limit }) => {
+      try {
+        return await withUpstreamClient(createApifyUpstream(), async (client) => {
+          const { tools } = await client.listTools();
+          const tool = tools.find((candidate) => candidate.name === APIFY_SEARCH_TOOL);
+          if (!tool) throw new Error(`MCP protocol drift: missing ${APIFY_SEARCH_TOOL}`);
+
+          const upstreamResult = await client.callTool(
+            {
+              name: APIFY_SEARCH_TOOL,
+              arguments: {
+                keywords: keywords ?? "",
+                limit: limit ?? 5,
+                offset: 0,
+              },
+            },
+            undefined,
+            { toolDefinition: tool },
+          );
+          if (upstreamResult.isError) throw new Error("MCP protocol error: search-actors returned isError");
+          const results = capText(textContent(upstreamResult));
+          if (!results) throw new Error("MCP protocol drift: search-actors returned no text");
+
+          const result = { ok: true as const, keywords: keywords ?? "", results };
+          return {
+            content: [{ type: "text" as const, text: results }],
+            structuredContent: result,
+          };
+        });
+      } catch (error) {
+        const failure = toSafeUpstreamFailure("apify", error);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(failure) }],
+          structuredContent: failure,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.registerTool(
+    "actor.fetch_details",
+    {
+      description: "Read-only metadata lookup for one existing Apify Actor. Returns description, usage stats, pricing, rating, metadata, and input schema. This tool never runs an Actor.",
+      inputSchema: z.object({
+        actor: z.string().min(3).max(200).regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+      }),
+      outputSchema: z.object({
+        ok: z.literal(true),
+        actor: z.string(),
+        details: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+    },
+    async ({ actor }) => {
+      try {
+        return await withUpstreamClient(createApifyUpstream(), async (client) => {
+          const { tools } = await client.listTools();
+          const tool = tools.find((candidate) => candidate.name === APIFY_DETAILS_TOOL);
+          if (!tool) throw new Error(`MCP protocol drift: missing ${APIFY_DETAILS_TOOL}`);
+
+          const upstreamResult = await client.callTool(
+            {
+              name: APIFY_DETAILS_TOOL,
+              arguments: {
+                actor,
+                output: {
+                  description: true,
+                  stats: true,
+                  pricing: true,
+                  rating: true,
+                  metadata: true,
+                  inputSchema: true,
+                  readme: false,
+                  outputSchema: false,
+                  mcpTools: false,
+                },
+              },
+            },
+            undefined,
+            { toolDefinition: tool },
+          );
+          if (upstreamResult.isError) throw new Error("MCP protocol error: fetch-actor-details returned isError");
+          const details = capText(textContent(upstreamResult));
+          if (!details) throw new Error("MCP protocol drift: fetch-actor-details returned no text");
+
+          const result = { ok: true as const, actor, details };
+          return {
+            content: [{ type: "text" as const, text: details }],
+            structuredContent: result,
+          };
+        });
+      } catch (error) {
+        const failure = toSafeUpstreamFailure("apify", error);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(failure) }],
           structuredContent: failure,

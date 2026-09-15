@@ -1,0 +1,24 @@
+name: Probe Firecrawl MCP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/personal-mcp-hub
+    paths:
+      - FIRECRAWL_PROBE_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Probe bare Firecrawl MCP endpoint
+        run: node scripts/firecrawl-probe.mjs

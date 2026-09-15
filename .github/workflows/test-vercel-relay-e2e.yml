@@ -2,6 +2,11 @@ name: Test Vercel Relay E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/personal-mcp-hub
+    paths:
+      - "RELAY_E2E_TRIGGER"
 
 permissions:
   contents: read

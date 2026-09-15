@@ -1,0 +1,24 @@
+name: Test Exa to Firecrawl Chain
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/personal-mcp-hub
+    paths:
+      - FIRECRAWL_CHAIN_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Exa finds URL then Firecrawl scrapes it
+        run: node scripts/firecrawl-chain-test.mjs

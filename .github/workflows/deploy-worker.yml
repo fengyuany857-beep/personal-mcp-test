@@ -28,6 +28,15 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      - name: Sync relay secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+        run: |
+          test -n "$HUB_RELAY_TOKEN"
+          printf '%s' "$HUB_RELAY_TOKEN" | npx wrangler secret put HUB_RELAY_TOKEN
+
       - name: Deploy Worker
         id: deploy
         uses: cloudflare/wrangler-action@v4

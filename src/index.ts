@@ -11,6 +11,8 @@ const MAX_PROXY_TEXT_CHARS = 32_000;
 
 type Env = {
   EXA_API_KEY?: string;
+  EXA_RELAY_URL?: string;
+  HUB_RELAY_TOKEN?: string;
 };
 
 function capText(text: string): string {
@@ -18,7 +20,34 @@ function capText(text: string): string {
   return `${text.slice(0, MAX_PROXY_TEXT_CHARS)}\n\n[Hub truncated upstream text at ${MAX_PROXY_TEXT_CHARS} characters.]`;
 }
 
+function configuredRelayUrl(env: Env): string | undefined {
+  const raw = env.EXA_RELAY_URL?.trim();
+  if (!raw) return undefined;
+
+  const url = new URL(raw);
+  if (url.protocol !== "https:") {
+    throw new Error("MCP relay configuration error: EXA_RELAY_URL must use HTTPS");
+  }
+  return url.toString();
+}
+
 function createExaUpstream(env: Env) {
+  const relayUrl = configuredRelayUrl(env);
+  if (relayUrl) {
+    if (!env.HUB_RELAY_TOKEN) {
+      throw new Error("MCP relay configuration error: HUB_RELAY_TOKEN is required when EXA_RELAY_URL is set");
+    }
+
+    return {
+      id: "exa",
+      url: relayUrl,
+      timeoutMs: 15_000,
+      headers: {
+        "x-hub-relay-token": env.HUB_RELAY_TOKEN,
+      },
+    };
+  }
+
   return {
     id: "exa",
     url: EXA_ENDPOINT,

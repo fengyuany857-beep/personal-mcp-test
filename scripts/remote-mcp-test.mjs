@@ -106,7 +106,7 @@ function extractUrls(text) {
 const init = await mcpFetch("initialize", {
   protocolVersion: "2025-03-26",
   capabilities: {},
-  clientInfo: { name: "personal-mcp-independent-test", version: "1.2.0" },
+  clientInfo: { name: "personal-mcp-independent-test", version: "1.3.0" },
 });
 if (init?.serverInfo?.name !== "personal-mcp-test") {
   throw new Error(`Unexpected serverInfo: ${JSON.stringify(init?.serverInfo)}`);
@@ -119,7 +119,15 @@ const tools = await mcpFetch("tools/list", {});
 const toolNames = (tools?.tools ?? []).map((tool) => tool.name).sort();
 assertEqual(
   toolNames,
-  ["crawl.firecrawl_scrape", "echo", "ping", "search.exa_search", "system.upstream_status"],
+  [
+    "actor.fetch_details",
+    "actor.search",
+    "crawl.firecrawl_scrape",
+    "echo",
+    "ping",
+    "search.exa_search",
+    "system.upstream_status",
+  ],
   "tools/list",
 );
 console.log(`TOOLS_LIST=PASS ${JSON.stringify(toolNames)}`);
@@ -214,3 +222,48 @@ if (/<html[\s>]/i.test(firecrawlResult.markdown) || /<body[\s>]/i.test(firecrawl
 }
 console.log(`FIRECRAWL_SCRAPE=PASS chars=${firecrawlResult.markdown.length}`);
 console.log("FIRECRAWL_HUB_PASS");
+
+const apifyStatusCall = await mcpFetch("tools/call", {
+  name: "system.upstream_status",
+  arguments: { service: "apify" },
+});
+if (apifyStatusCall?.isError) throw new Error(`APIFY_STATUS isError: ${JSON.stringify(apifyStatusCall)}`);
+const apifyStatus = getStructured(apifyStatusCall);
+assertEqual(
+  apifyStatus,
+  { ok: true, service: "apify", expectedTool: "search-actors", toolFound: true },
+  "apify upstream status",
+);
+console.log(`APIFY_DISCOVERY=PASS ${JSON.stringify(apifyStatus)}`);
+
+const apifySearchCall = await mcpFetch("tools/call", {
+  name: "actor.search",
+  arguments: { keywords: "Google Maps", limit: 3 },
+});
+if (apifySearchCall?.isError) throw new Error(`APIFY_SEARCH isError: ${JSON.stringify(apifySearchCall)}`);
+const apifySearch = getStructured(apifySearchCall);
+if (apifySearch?.ok !== true || typeof apifySearch?.results !== "string" || apifySearch.results.length < 100) {
+  throw new Error(`APIFY_SEARCH unexpected result: ${JSON.stringify(apifySearch).slice(0, 1200)}`);
+}
+const actorMatch = apifySearch.results.match(/`([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)`/);
+const actor = actorMatch?.[1];
+if (!actor) throw new Error(`APIFY_SEARCH did not return a parsable actor full name: ${apifySearch.results.slice(0, 1200)}`);
+console.log(`APIFY_SEARCH=PASS actor=${actor} chars=${apifySearch.results.length}`);
+
+const apifyDetailsCall = await mcpFetch("tools/call", {
+  name: "actor.fetch_details",
+  arguments: { actor },
+});
+if (apifyDetailsCall?.isError) throw new Error(`APIFY_FETCH_DETAILS isError: ${JSON.stringify(apifyDetailsCall)}`);
+const apifyDetails = getStructured(apifyDetailsCall);
+if (
+  apifyDetails?.ok !== true ||
+  apifyDetails?.actor !== actor ||
+  typeof apifyDetails?.details !== "string" ||
+  apifyDetails.details.length < 100 ||
+  !apifyDetails.details.includes(actor)
+) {
+  throw new Error(`APIFY_FETCH_DETAILS unexpected result: ${JSON.stringify(apifyDetails).slice(0, 1200)}`);
+}
+console.log(`APIFY_FETCH_DETAILS=PASS actor=${actor} chars=${apifyDetails.details.length}`);
+console.log("APIFY_DISCOVERY_HUB_PASS");

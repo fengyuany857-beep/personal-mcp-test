@@ -98,10 +98,15 @@ function assertEqual(actual, expected, label) {
   if (a !== e) throw new Error(`${label} mismatch\nexpected=${e}\nactual=${a}`);
 }
 
+function extractUrls(text) {
+  const matches = text.match(/https?:\/\/[^\s)\]}>"']+/g) ?? [];
+  return [...new Set(matches.map((url) => url.replace(/[.,;:!?]+$/, "")))];
+}
+
 const init = await mcpFetch("initialize", {
   protocolVersion: "2025-03-26",
   capabilities: {},
-  clientInfo: { name: "personal-mcp-independent-test", version: "1.1.0" },
+  clientInfo: { name: "personal-mcp-independent-test", version: "1.2.0" },
 });
 if (init?.serverInfo?.name !== "personal-mcp-test") {
   throw new Error(`Unexpected serverInfo: ${JSON.stringify(init?.serverInfo)}`);
@@ -114,7 +119,7 @@ const tools = await mcpFetch("tools/list", {});
 const toolNames = (tools?.tools ?? []).map((tool) => tool.name).sort();
 assertEqual(
   toolNames,
-  ["echo", "ping", "search.exa_search", "system.upstream_status"],
+  ["crawl.firecrawl_scrape", "echo", "ping", "search.exa_search", "system.upstream_status"],
   "tools/list",
 );
 console.log(`TOOLS_LIST=PASS ${JSON.stringify(toolNames)}`);
@@ -156,8 +161,8 @@ console.log(`EXA_DISCOVERY=PASS ${JSON.stringify(exaStatus)}`);
 const exaSearch = await mcpFetch("tools/call", {
   name: "search.exa_search",
   arguments: {
-    query: "official Model Context Protocol specification documentation",
-    numResults: 3,
+    query: "official Model Context Protocol documentation modelcontextprotocol.io introduction",
+    numResults: 5,
   },
 });
 if (exaSearch?.isError) throw new Error(`EXA_SEARCH isError: ${JSON.stringify(exaSearch)}`);
@@ -166,5 +171,46 @@ if (exaText.length < 40 || !/https?:\/\//i.test(exaText)) {
   throw new Error(`EXA_SEARCH unexpected result: ${exaText.slice(0, 1000)}`);
 }
 console.log(`EXA_SEARCH=PASS chars=${exaText.length}`);
-
 console.log("EXA_HUB_PASS");
+
+const firecrawlStatusCall = await mcpFetch("tools/call", {
+  name: "system.upstream_status",
+  arguments: { service: "firecrawl" },
+});
+if (firecrawlStatusCall?.isError) {
+  throw new Error(`FIRECRAWL_STATUS isError: ${JSON.stringify(firecrawlStatusCall)}`);
+}
+const firecrawlStatus = getStructured(firecrawlStatusCall);
+assertEqual(
+  firecrawlStatus,
+  { ok: true, service: "firecrawl", expectedTool: "firecrawl_scrape", toolFound: true },
+  "firecrawl upstream status",
+);
+console.log(`FIRECRAWL_DISCOVERY=PASS ${JSON.stringify(firecrawlStatus)}`);
+
+const urls = extractUrls(exaText);
+const scrapeUrl = urls.find((url) => /modelcontextprotocol\.io/i.test(url)) ?? urls[0];
+if (!scrapeUrl) throw new Error("EXA_TO_FIRECRAWL no URL found in Exa response");
+console.log(`EXA_TO_FIRECRAWL_URL=PASS ${scrapeUrl}`);
+
+const firecrawlCall = await mcpFetch("tools/call", {
+  name: "crawl.firecrawl_scrape",
+  arguments: { url: scrapeUrl },
+});
+if (firecrawlCall?.isError) {
+  throw new Error(`FIRECRAWL_SCRAPE isError: ${JSON.stringify(firecrawlCall)}`);
+}
+const firecrawlResult = getStructured(firecrawlCall);
+if (
+  firecrawlResult?.ok !== true ||
+  firecrawlResult?.url !== scrapeUrl ||
+  typeof firecrawlResult?.markdown !== "string" ||
+  firecrawlResult.markdown.length < 200
+) {
+  throw new Error(`FIRECRAWL_SCRAPE unexpected result: ${JSON.stringify(firecrawlResult).slice(0, 1200)}`);
+}
+if (/<html[\s>]/i.test(firecrawlResult.markdown) || /<body[\s>]/i.test(firecrawlResult.markdown)) {
+  throw new Error("FIRECRAWL_SCRAPE returned raw HTML instead of clean Markdown");
+}
+console.log(`FIRECRAWL_SCRAPE=PASS chars=${firecrawlResult.markdown.length}`);
+console.log("FIRECRAWL_HUB_PASS");

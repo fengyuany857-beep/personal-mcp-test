@@ -48,8 +48,12 @@ try {
   console.log(`FIRECRAWL_INITIALIZE=PASS ${JSON.stringify(init?.serverInfo ?? null)}`);
   await call("notifications/initialized", {}, true);
   const list = await call("tools/list", {});
-  const names = (list?.tools ?? []).map((tool) => tool.name).sort();
+  const tools = list?.tools ?? [];
+  const names = tools.map((tool) => tool.name).sort();
   console.log(`FIRECRAWL_TOOLS_LIST=PASS ${JSON.stringify(names)}`);
+  const scrape = tools.find((tool) => tool.name === "firecrawl_scrape");
+  if (!scrape) throw new Error("firecrawl_scrape missing");
+  console.log(`FIRECRAWL_SCRAPE_SCHEMA=${JSON.stringify({ inputSchema: scrape.inputSchema, outputSchema: scrape.outputSchema ?? null, annotations: scrape.annotations ?? null })}`);
   console.log("FIRECRAWL_BARE_ENDPOINT_PASS");
 } catch (error) {
   console.log(`FIRECRAWL_BARE_ENDPOINT_FAIL ${error instanceof Error ? error.message : String(error)}`);

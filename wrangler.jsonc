@@ -2,5 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "personal-mcp-test",
   "main": "src/index.ts",
-  "compatibility_date": "2026-09-15"
+  "compatibility_date": "2026-09-15",
+  "vars": {
+    "EXA_RELAY_URL": "https://personal-mcp-hub-relay.vercel.app/api/exa-mcp"
+  }
 }

@@ -2,6 +2,8 @@ import { createMcpHandler } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
+import { TicketControlPlane } from "./ticket/control";
+import { makeTargetSet, newTaskId, type TaskSpec } from "./ticket/contracts";
 
 const SERVER_NAME = "personal-mcp-test" as const;
 const SERVER_VERSION = "1.3.0" as const;
@@ -13,6 +15,7 @@ const APIFY_SEARCH_TOOL = "search-actors" as const;
 const APIFY_DETAILS_TOOL = "fetch-actor-details" as const;
 const APIFY_ENDPOINT = `https://mcp.apify.com?tools=${APIFY_SEARCH_TOOL},${APIFY_DETAILS_TOOL}`;
 const MAX_PROXY_TEXT_CHARS = 32_000;
+const ticketControl = new TicketControlPlane();
 
 type Env = {
   EXA_API_KEY?: string;
@@ -146,6 +149,55 @@ function createServer(env: Env) {
       };
     },
   );
+
+  server.registerTool("ticket.status", {
+    description: "Read-only ticket control-plane and local-runner status. Never submits an order.",
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async () => ({ structuredContent: ticketControl.status(), content: [{ type: "text" as const, text: JSON.stringify(ticketControl.status()) }] }));
+
+  server.registerTool("ticket.probe", {
+    description: "Read-only runner/session readiness probe. Challenges require human action and are never bypassed.",
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async () => { const result = ticketControl.probe(); return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] }; });
+
+  server.registerTool("ticket.prepare", {
+    description: "Freezes a bounded ticket target set. It does not contact 12306 or submit an order.",
+    inputSchema: z.object({
+      task_id: z.string().optional(), travel_date: z.string(), origin: z.string(), destination: z.string(),
+      passenger_refs: z.array(z.string()).min(1), account_ref: z.string(), runner_ref: z.string(),
+      query_budget: z.number().int().min(1).max(1000), time_budget_ms: z.number().int().min(1).max(86_400_000),
+      submit_budget: z.number().int().min(0).max(1), deadline: z.string().optional(),
+      candidates: z.array(z.object({ candidate_id: z.string(), train_code: z.string(), seat_classes: z.array(z.string()).min(1), quantity: z.number().int().min(1).max(9), priority: z.number().int().min(0), max_price_optional: z.number().nonnegative().optional() })).min(1),
+    }),
+    annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (input) => {
+    const task: TaskSpec = { task_id: input.task_id ?? newTaskId(), task_revision: 1, travel_date: input.travel_date, origin: input.origin, destination: input.destination, passenger_refs: input.passenger_refs, target_set: makeTargetSet({ target_set_id: `${input.task_id ?? "new"}-targets`, candidates: input.candidates }), account_ref: input.account_ref, runner_ref: input.runner_ref, query_budget: input.query_budget, time_budget_ms: input.time_budget_ms, submit_budget: input.submit_budget, deadline: input.deadline };
+    const result = ticketControl.prepare(task);
+    return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+  });
+
+  server.registerTool("ticket.arm", {
+    description: "Creates a bounded, expiring authorization lease for the previously prepared task. No order action is performed.",
+    inputSchema: z.object({ task_id: z.string(), principal_ref: z.string(), runner_ref: z.string(), expiry: z.string() }),
+    annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+  }, async ({ task_id, principal_ref, runner_ref, expiry }) => {
+    const result = ticketControl.arm(task_id, principal_ref, runner_ref, expiry);
+    return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+  });
+
+  server.registerTool("ticket.disarm", {
+    description: "Revokes a ticket authorization lease and prevents future effects for it.",
+    inputSchema: z.object({ task_id: z.string() }),
+    annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ task_id }) => { const result = ticketControl.disarm(task_id); return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] }; });
+
+  server.registerTool("ticket.result", {
+    description: "Read-only result lookup. Payment links, payment tokens, credentials and raw passenger identity are never returned.",
+    inputSchema: z.object({ task_id: z.string() }),
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async ({ task_id }) => { const result = ticketControl.result(task_id); return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] }; });
 
   server.registerTool(
     "system.upstream_status",

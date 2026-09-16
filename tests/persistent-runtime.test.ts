@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { LocalRunner } from "../runner/local-runner.ts";
 import { CheckpointStore } from "../runner/runtime.ts";
@@ -11,7 +13,7 @@ import { SqliteAccountLeaseManager, SqliteEffectLedger } from "../runner/persist
 function withTempDb(run: (path: string) => void | Promise<void>) {
   const directory = mkdtempSync(join(tmpdir(), "ticket-persistent-runtime-"));
   const path = join(directory, "runtime.sqlite");
-  return Promise.resolve(run(path)).finally(() => rmSync(directory, { recursive: true, force: true }));
+  return Promise.resolve().then(() => run(path)).finally(() => rmSync(directory, { recursive: true, force: true }));
 }
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -50,6 +52,36 @@ test("account lease survives manager restart and blocks another holder until exp
     } finally {
       restarted.close();
     }
+  });
+});
+
+test("account lease excludes a separate OS process using the same durable database", async () => {
+  await withTempDb(path => {
+    const parent = new SqliteAccountLeaseManager(path, { holderId: "parent-process", leaseTtlMs: 5_000 });
+    parent.acquire("acct-process");
+    parent.close();
+
+    const moduleUrl = pathToFileURL(resolve("runner/persistent-state.ts")).href;
+    const childSource = `
+      const { SqliteAccountLeaseManager } = await import(${JSON.stringify(moduleUrl)});
+      const manager = new SqliteAccountLeaseManager(${JSON.stringify(path)}, { holderId: "child-process", leaseTtlMs: 5000 });
+      try {
+        manager.acquire("acct-process");
+        console.error("unexpected-acquire");
+        process.exitCode = 2;
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "BLOCKED_RESOURCE_BUSY") throw error;
+        console.log("BLOCKED_RESOURCE_BUSY");
+      } finally {
+        manager.close();
+      }
+    `;
+    const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", childSource], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+    assert.match(child.stdout, /BLOCKED_RESOURCE_BUSY/);
   });
 });
 

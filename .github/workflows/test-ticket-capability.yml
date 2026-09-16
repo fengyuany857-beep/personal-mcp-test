@@ -24,7 +24,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
+      - name: Verify lockfile
+        run: |
+          node --version
+          npm --version
+          test -f package-lock.json
+          node -e "const lock=require('./package-lock.json'); if (lock.lockfileVersion < 1) process.exit(1); console.log('lockfileVersion='+lock.lockfileVersion)"
       - run: npm ci
       - run: npm test

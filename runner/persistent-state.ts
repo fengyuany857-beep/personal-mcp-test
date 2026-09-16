@@ -12,13 +12,18 @@ function openDatabase(path: string): DatabaseSync {
   const db = new DatabaseSync(path, { timeout: 5_000 });
   db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;");
   db.exec(`
+    CREATE TABLE IF NOT EXISTS ticket_account_fence (
+      resource_key TEXT PRIMARY KEY,
+      last_fencing_token INTEGER NOT NULL CHECK (last_fencing_token >= 0)
+    );
     CREATE TABLE IF NOT EXISTS ticket_account_lease (
       resource_key TEXT PRIMARY KEY,
       lease_id TEXT NOT NULL,
       holder_id TEXT NOT NULL,
       fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
       acquired_at_ms INTEGER NOT NULL,
-      expires_at_ms INTEGER NOT NULL
+      expires_at_ms INTEGER NOT NULL,
+      FOREIGN KEY(resource_key) REFERENCES ticket_account_fence(resource_key)
     );
     CREATE TABLE IF NOT EXISTS ticket_effect_record (
       effect_id TEXT PRIMARY KEY,
@@ -70,6 +75,8 @@ function iso(ms: number): string { return new Date(ms).toISOString(); }
 /**
  * Durable account-submit lease for a single shared filesystem/runtime domain.
  * SQLite serializes writers across processes that open the same database file.
+ * Fencing tokens are monotonic per account even after release/expiry because
+ * the durable fence counter is intentionally separate from the current lease.
  * This is not a cross-host/distributed lock: multi-replica deployments must use
  * a provider-backed distributed lease before enabling consequential submit.
  */
@@ -90,12 +97,21 @@ export class SqliteAccountLeaseManager implements AccountLeaseProvider {
     const resourceKey = `12306-account:${accountRef}`;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const current = this.db.prepare("SELECT fencing_token, expires_at_ms FROM ticket_account_lease WHERE resource_key = ?").get(resourceKey) as { fencing_token: number; expires_at_ms: number } | undefined;
+      const current = this.db.prepare("SELECT expires_at_ms FROM ticket_account_lease WHERE resource_key = ?")
+        .get(resourceKey) as { expires_at_ms: number } | undefined;
       const now = nowMs();
       if (current && Number(current.expires_at_ms) > now) throw new Error("BLOCKED_RESOURCE_BUSY");
 
+      this.db.prepare("INSERT INTO ticket_account_fence(resource_key, last_fencing_token) VALUES (?, 0) ON CONFLICT(resource_key) DO NOTHING")
+        .run(resourceKey);
+      this.db.prepare("UPDATE ticket_account_fence SET last_fencing_token = last_fencing_token + 1 WHERE resource_key = ?")
+        .run(resourceKey);
+      const fence = this.db.prepare("SELECT last_fencing_token FROM ticket_account_fence WHERE resource_key = ?")
+        .get(resourceKey) as { last_fencing_token: number } | undefined;
+      if (!fence || !Number.isSafeInteger(Number(fence.last_fencing_token)) || Number(fence.last_fencing_token) < 1) throw new Error("ACCOUNT_FENCE_CORRUPT");
+
       const leaseId = crypto.randomUUID();
-      const fencingToken = current ? Number(current.fencing_token) + 1 : 1;
+      const fencingToken = Number(fence.last_fencing_token);
       const expiresAt = now + this.leaseTtlMs;
       this.db.prepare(`INSERT INTO ticket_account_lease(resource_key, lease_id, holder_id, fencing_token, acquired_at_ms, expires_at_ms)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -133,9 +149,9 @@ export class SqliteAccountLeaseManager implements AccountLeaseProvider {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = this.db.prepare(`DELETE FROM ticket_account_lease
-        WHERE resource_key=? AND lease_id=? AND fencing_token=? AND holder_id=?`)
-        .run(lease.resource_key, lease.lease_id, lease.fencing_token, this.holderId);
-      if (Number(result.changes) !== 1) throw new Error("STALE_ACCOUNT_LEASE");
+        WHERE resource_key=? AND lease_id=? AND fencing_token=? AND holder_id=? AND expires_at_ms>?`)
+        .run(lease.resource_key, lease.lease_id, lease.fencing_token, this.holderId, nowMs());
+      if (Number(result.changes) !== 1) throw new Error("STALE_OR_EXPIRED_ACCOUNT_LEASE");
       this.db.exec("COMMIT");
     } catch (error) {
       try { this.db.exec("ROLLBACK"); } catch { /* original error wins */ }

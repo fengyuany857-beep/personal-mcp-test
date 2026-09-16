@@ -1,3 +1,4 @@
+import { rmSync } from "node:fs";
 import { defaultLocalQrPath, Rail12306LocalAuthenticatedProvider } from "../runner/12306-local-auth-readonly.ts";
 
 const aliasKey = process.env.RAIL12306_ALIAS_KEY?.trim();
@@ -7,11 +8,13 @@ if (!aliasKey || aliasKey.length < 16) {
 }
 
 const provider = new Rail12306LocalAuthenticatedProvider({ aliasKey });
+let qrFile: string | undefined;
 
 try {
   let state = await provider.sessionState();
   if (state !== "READY") {
     const challenge = await provider.beginQrLogin(defaultLocalQrPath());
+    qrFile = challenge.qr_file;
     console.log(JSON.stringify({
       ok: true,
       stage: "QR_REQUIRED",
@@ -50,4 +53,8 @@ try {
     payment_capability: "NOT_AVAILABLE",
   }));
   process.exitCode = 1;
+} finally {
+  if (qrFile) {
+    try { rmSync(qrFile, { force: true }); } catch { /* best-effort cleanup; no retry loop */ }
+  }
 }

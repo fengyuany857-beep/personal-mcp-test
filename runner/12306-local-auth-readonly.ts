@@ -117,6 +117,10 @@ function asObject(value: unknown, code: string): JsonObject {
   return value as JsonObject;
 }
 
+function optionalObject(value: unknown): JsonObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
 function parseJson(body: string, code: string): JsonObject {
   try { return asObject(JSON.parse(body), code); }
   catch (error) { if (error instanceof Error && error.message === code) throw error; throw new Error(code); }
@@ -133,6 +137,15 @@ function arrayValue(value: unknown): JsonObject[] {
 function firstString(object: JsonObject, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = stringValue(object[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function firstStringAcross(objects: Array<JsonObject | undefined>, keys: string[]): string | undefined {
+  for (const object of objects) {
+    if (!object) continue;
+    const value = firstString(object, keys);
     if (value) return value;
   }
   return undefined;
@@ -161,6 +174,14 @@ function explicitPaymentState(order: JsonObject, tickets: JsonObject[]): Pending
   return /待支付|未支付|等待支付|支付未完成/.test(texts) ? "WAITING_FOR_PAYMENT" : "UNKNOWN";
 }
 
+function ticketPassenger(ticket: JsonObject): JsonObject {
+  return optionalObject(ticket.passengerDTO) ?? optionalObject(ticket.passenger) ?? ticket;
+}
+
+function ticketStation(ticket: JsonObject): JsonObject | undefined {
+  return optionalObject(ticket.stationTrainDTO) ?? optionalObject(ticket.station_train_dto);
+}
+
 export function extractNoCompleteOrderList(payload: unknown): JsonObject[] {
   const root = asObject(payload, "RAIL12306_PENDING_SCHEMA_DRIFT");
   if (root.status !== true) throw new Error("RAIL12306_PENDING_QUERY_REJECTED");
@@ -174,25 +195,33 @@ export function extractNoCompleteOrderList(payload: unknown): JsonObject[] {
 }
 
 export function redactNoCompleteOrders(payload: unknown, passengerAliases: ReadonlyMap<string, string>): PendingOrder[] {
-  return extractNoCompleteOrderList(payload).map(order => {
+  return extractNoCompleteOrderList(payload).map((order, index) => {
+    const orderId = firstString(order, ["sequence_no", "order_id", "sequenceNo"]);
+    if (!orderId) throw new Error(`RAIL12306_PENDING_ORDER_ID_MISSING:${index}`);
+
     const tickets = arrayValue(order.tickets);
-    const refs = tickets.map(ticket => firstString(ticket, ["passenger_name", "passengerName"]))
+    const firstStation = tickets.map(ticketStation).find((value): value is JsonObject => !!value);
+    const refs = tickets.map(ticket => firstString(ticketPassenger(ticket), ["passenger_name", "passengerName"]))
       .filter((name): name is string => !!name)
       .map(name => passengerAliases.get(name))
       .filter((ref): ref is string => !!ref);
     const allPassengerNamesMapped = tickets.length > 0 && refs.length === tickets.length;
-    const seatClasses = [...new Set(tickets.map(ticket => firstString(ticket, ["seat_type_name", "seatTypeName"]))
+    const seatClasses = [...new Set(tickets.map(ticket => firstStringAcross([ticket, optionalObject(ticket.seatDTO)], ["seat_type_name", "seatTypeName", "seat_name", "seatName"]))
       .filter((seat): seat is string => !!seat))];
     const paymentDeadline = firstString(order, ["payment_deadline", "pay_deadline", "lose_time"]);
     const amount = numericValue(order.ticket_total_price_page ?? order.ticket_total_price ?? order.total_price);
+    const travelDate = normalizedDate(firstStringAcross([order, firstStation], ["start_train_date_page", "start_train_date", "train_date"]));
+    const trainCode = firstStringAcross([order, firstStation], ["train_code_page", "station_train_code", "train_code"]);
+    const origin = firstStringAcross([order, firstStation], ["from_station_name_page", "from_station_name"]);
+    const destination = firstStringAcross([order, firstStation], ["to_station_name_page", "to_station_name"]);
 
     return {
-      order_id: firstString(order, ["sequence_no", "order_id", "sequenceNo"]) ?? "UNKNOWN_ORDER_ID",
+      order_id: orderId,
       status: explicitPaymentState(order, tickets),
-      ...(normalizedDate(firstString(order, ["start_train_date_page", "start_train_date", "train_date"])) ? { travel_date: normalizedDate(firstString(order, ["start_train_date_page", "start_train_date", "train_date"])) } : {}),
-      ...(firstString(order, ["train_code_page", "station_train_code", "train_code"]) ? { train_code: firstString(order, ["train_code_page", "station_train_code", "train_code"]) } : {}),
-      ...(firstString(order, ["from_station_name_page", "from_station_name"]) ? { origin: firstString(order, ["from_station_name_page", "from_station_name"]) } : {}),
-      ...(firstString(order, ["to_station_name_page", "to_station_name"]) ? { destination: firstString(order, ["to_station_name_page", "to_station_name"]) } : {}),
+      ...(travelDate ? { travel_date: travelDate } : {}),
+      ...(trainCode ? { train_code: trainCode } : {}),
+      ...(origin ? { origin } : {}),
+      ...(destination ? { destination } : {}),
       ...(allPassengerNamesMapped ? { passenger_refs: [...new Set(refs)] } : {}),
       ...(seatClasses.length ? { seat_classes: seatClasses } : {}),
       ...(tickets.length ? { quantity: tickets.length } : {}),
@@ -207,6 +236,7 @@ export class Rail12306LocalAuthenticatedProvider implements AuthenticatedReadOnl
   private readonly transport: LocalSessionHttpTransport;
   private readonly aliasKey: string;
   private readonly passengerAliasesByName = new Map<string, string>();
+  private readonly ambiguousPassengerNames = new Set<string>();
 
   constructor(options: { aliasKey: string; transport?: LocalSessionHttpTransport }) {
     if (!options.aliasKey || options.aliasKey.length < 16) throw new Error("RAIL12306_ALIAS_KEY_REQUIRED");
@@ -278,6 +308,8 @@ export class Rail12306LocalAuthenticatedProvider implements AuthenticatedReadOnl
     const payload = parseJson(response.body, "RAIL12306_PASSENGER_SCHEMA_DRIFT");
     const data = asObject(payload.data, "RAIL12306_PASSENGER_SCHEMA_DRIFT");
     if (!Array.isArray(data.normal_passengers)) throw new Error("RAIL12306_PASSENGER_SCHEMA_DRIFT");
+    this.passengerAliasesByName.clear();
+    this.ambiguousPassengerNames.clear();
     const aliases: PassengerAlias[] = [];
     for (const passenger of arrayValue(data.normal_passengers)) {
       const name = firstString(passenger, ["passenger_name", "passengerName"]);
@@ -285,7 +317,13 @@ export class Rail12306LocalAuthenticatedProvider implements AuthenticatedReadOnl
       const idType = firstString(passenger, ["passenger_id_type_code", "passengerIdTypeCode", "id_type_code"]) ?? "unknown";
       if (!name || !id) continue;
       const passengerRef = `psg_${createHmac("sha256", this.aliasKey).update(`${idType}:${id}`).digest("hex").slice(0, 24)}`;
-      this.passengerAliasesByName.set(name, passengerRef);
+      const existing = this.passengerAliasesByName.get(name);
+      if (existing && existing !== passengerRef) {
+        this.passengerAliasesByName.delete(name);
+        this.ambiguousPassengerNames.add(name);
+      } else if (!this.ambiguousPassengerNames.has(name)) {
+        this.passengerAliasesByName.set(name, passengerRef);
+      }
       aliases.push({ passenger_ref: passengerRef, ...(firstString(passenger, ["passenger_type", "passengerType"]) ? { passenger_type: firstString(passenger, ["passenger_type", "passengerType"]) } : {}) });
     }
     return aliases;
@@ -293,7 +331,7 @@ export class Rail12306LocalAuthenticatedProvider implements AuthenticatedReadOnl
 
   async readPendingOrders(): Promise<PendingOrder[]> {
     await this.requireReady();
-    if (this.passengerAliasesByName.size === 0) await this.readPassengers();
+    if (this.passengerAliasesByName.size === 0 && this.ambiguousPassengerNames.size === 0) await this.readPassengers();
     const response = await this.transport.request("POST", "/otn/queryOrder/queryMyOrderNoComplete", { _json_att: "" });
     if (response.status === 401 || response.status === 403) throw new Error("AUTH_REQUIRED");
     if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_PENDING_HTTP_ERROR:${response.status}`);

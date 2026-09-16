@@ -1,5 +1,5 @@
 import { assertArm, type ArmLease, type Candidate, type Checkpoint, type EffectRecord, type TaskSpec, type TicketState } from "../src/ticket/contracts.ts";
-import { CheckpointStore, EffectLedger, NotificationOutbox, type PendingOrderReader, RunnerSupervisor } from "./runtime.ts";
+import { AccountLeaseManager, CheckpointStore, EffectLedger, NotificationOutbox, type PendingOrderReader, RunnerSupervisor } from "./runtime.ts";
 
 export interface ReadOnly12306Adapter {
   sessionState(): Promise<"READY" | "AUTH_REQUIRED" | "HUMAN_ACTION_REQUIRED">;
@@ -11,14 +11,14 @@ export class TaskCache { private readonly tasks = new Map<string, TaskSpec>(); p
 export class AuthorizationVerifier { verify(arm: ArmLease, task: TaskSpec, principal: string, runnerRef: string, now = new Date()) { assertArm(arm, task, principal, runnerRef, now); return true; } }
 export class SessionManager { private readonly adapter: ReadOnly12306Adapter; constructor(adapter: ReadOnly12306Adapter) { this.adapter = adapter; } async readiness() { return this.adapter.sessionState(); } }
 export class ClockSync { serverOffsetMs = 0; update(serverNowMs: number, localNowMs = Date.now()) { this.serverOffsetMs = serverNowMs - localNowMs; return this.serverOffsetMs; } }
-export class AccountLeaseManager { private readonly held = new Set<string>(); acquire(accountRef: string) { const key = `12306-account:${accountRef}`; if (this.held.has(key)) throw new Error("BLOCKED_RESOURCE_BUSY"); this.held.add(key); return key; } release(key: string) { this.held.delete(key); } }
 export class SelectionEngine { select(candidates: Candidate[]) { return [...candidates].sort((a, b) => a.priority - b.priority)[0]; } }
 
 export class LocalRunner {
-  readonly supervisor: RunnerSupervisor; readonly cache = new TaskCache(); readonly scheduler = new Scheduler(); readonly auth = new AuthorizationVerifier(); readonly clock = new ClockSync(); readonly accounts = new AccountLeaseManager(); readonly selection = new SelectionEngine(); readonly ledger = new EffectLedger(); readonly checkpoints = new CheckpointStore(); readonly notifications = new NotificationOutbox();
+  readonly supervisor: RunnerSupervisor; readonly cache = new TaskCache(); readonly scheduler = new Scheduler(); readonly auth = new AuthorizationVerifier(); readonly clock = new ClockSync(); readonly accounts = new AccountLeaseManager(); readonly selection = new SelectionEngine(); readonly ledger = new EffectLedger(); readonly checkpoints: CheckpointStore; readonly notifications = new NotificationOutbox();
   private readonly adapter: ReadOnly12306Adapter;
-  constructor(runnerRef: string, adapter: ReadOnly12306Adapter) { this.supervisor = new RunnerSupervisor(runnerRef); this.adapter = adapter; }
+  constructor(runnerRef: string, adapter: ReadOnly12306Adapter, checkpoints = new CheckpointStore()) { this.supervisor = new RunnerSupervisor(runnerRef); this.adapter = adapter; this.checkpoints = checkpoints; }
   async readOnlyPreflight(task: TaskSpec): Promise<{ state: TicketState; session: string; pending_count: number }> { this.cache.put(task); const session = await new SessionManager(this.adapter).readiness(); if (session !== "READY") return { state: session, session, pending_count: 0 }; const pending = await this.adapter.readPendingOrders(); return { state: "PROBED", session, pending_count: pending.length }; }
+  resume(taskId: string) { return this.supervisor.resume(this.checkpoints.load(taskId)); }
   submitOrder(): never { throw new Error("CAPABILITY_NOT_AVAILABLE"); }
 }
 

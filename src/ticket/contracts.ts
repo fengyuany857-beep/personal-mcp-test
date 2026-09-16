@@ -4,7 +4,7 @@ export type TicketState =
   | "OFFLINE" | "AUTH_REQUIRED" | "READY" | "PROBED" | "PREPARED" | "ARMED"
   | "WAITING_FOR_SALE" | "SEARCHING" | "COMMIT_CANDIDATE_SELECTED" | "SUBMITTING"
   | "OUTCOME_UNKNOWN" | "RECONCILING" | "QUEUED" | "ORDER_ID_OBSERVED"
-  | "ORDER_LOCKED" | "WAITING_FOR_PAYMENT" | "HUMAN_ACTION_REQUIRED";
+  | "ORDER_LOCKED" | "WAITING_FOR_PAYMENT" | "HUMAN_ACTION_REQUIRED" | "BLOCKED";
 
 export type Candidate = {
   candidate_id: string;
@@ -53,13 +53,24 @@ export type ArmLease = {
   used: boolean;
 };
 
+export type EffectState = "STARTED" | "COMPLETED" | "UNKNOWN" | "BLOCKED" | "RECONCILING";
+
 export type EffectRecord = {
   effect_id: string;
   task_id: string;
   effect: "QUERY" | "SUBMIT_ORDER" | "READ_PENDING_ORDER" | "NOTIFICATION";
   semantics: "IDEMPOTENT" | "NON_IDEMPOTENT_UNKNOWN";
-  state: "STARTED" | "COMPLETED" | "UNKNOWN" | "BLOCKED";
+  state: EffectState;
   at: string;
+};
+
+export type EffectTransition = {
+  transition_id: string;
+  effect_id: string;
+  from_state: EffectState | "NONE";
+  to_state: EffectState;
+  observed_at: string;
+  reason: string;
 };
 
 export type Checkpoint = {

@@ -47,15 +47,30 @@ export class TicketControlPlane {
 
   result(taskId: string) { return this.results.get(taskId) ?? { task_id: taskId, state: this.runner.task_id === taskId ? this.runner.state : "OFFLINE", notification: { ok: true, kind: "NONE" as const } }; }
 
-  authorize(taskId: string, principal: string, runnerRef: string, now = new Date()) {
+  validateAuthorization(taskId: string, principal: string, runnerRef: string, now = new Date()) {
     const task = this.tasks.get(taskId); const arm = this.arms.get(taskId);
     if (!task || !arm) throw new Error("ARM_NOT_FOUND");
     assertArm(arm, task, principal, runnerRef, now);
     if (arm.revocation_generation !== this.revocation) throw new Error("ARM_REVOKED");
+    if (arm.submit_budget < 1) throw new Error("SUBMIT_BUDGET_EXHAUSTED");
+    return arm;
+  }
+
+  consumeAuthorization(taskId: string, expectedNonce: string) {
+    const arm = this.arms.get(taskId);
+    if (!arm) throw new Error("ARM_NOT_FOUND");
+    if (arm.used) throw new Error("ARM_REPLAY");
+    if (arm.nonce !== expectedNonce) throw new Error("ARM_NONCE_MISMATCH");
     arm.used = true;
     return arm;
   }
 
+  authorize(taskId: string, principal: string, runnerRef: string, now = new Date()) {
+    const arm = this.validateAuthorization(taskId, principal, runnerRef, now);
+    return this.consumeAuthorization(taskId, arm.nonce);
+  }
+
   recordResult(result: ExecutionResult) { this.results.set(result.task_id, result); this.runner = { ...this.runner, state: result.state, last_sync: new Date().toISOString() }; }
+  transition(taskId: string, state: TicketState, error_code?: string) { const result: ExecutionResult = { task_id: taskId, state, ...(error_code ? { error_code } : {}), notification: { ok: true, kind: "NONE" } }; this.recordResult(result); return result; }
   lockPending(task: TaskSpec, order: PendingOrder) { this.pendingOrder = order; const result = { task_id: task.task_id, state: "WAITING_FOR_PAYMENT" as TicketState, order_id: order.order_id, notification: safeNotification(task, order) }; this.recordResult(result); return result; }
 }

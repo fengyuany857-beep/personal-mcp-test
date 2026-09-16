@@ -5,6 +5,7 @@ import {
   MobileAccountSessionHttpTransport,
   Rail12306MobileAccountAuth,
   classifyAccountLoginResponse,
+  encrypt12306Password,
 } from "../runner/12306-mobile-auth.ts";
 import type { LocalSessionHttpResponse, LocalSessionHttpTransport } from "../runner/12306-local-auth-readonly.ts";
 
@@ -25,8 +26,14 @@ class ScriptedTransport implements LocalSessionHttpTransport {
 function json(body: unknown, status = 200): LocalSessionHttpResponse { return { status, body: JSON.stringify(body) }; }
 const ready = () => json({ status: true, data: { flag: true } });
 
-test("mobile account login completes the existing authenticated session handshake without exposing credentials", async () => {
+test("12306 password encryption uses deterministic SM4-ECB ciphertext and never returns plaintext", () => {
+  assert.equal(encrypt12306Password("123456"), "@grRrViQiBQgpTr59DNzcVw==");
+  assert.equal(encrypt12306Password("123456").includes("123456"), false);
+});
+
+test("mobile account login probes verification first, encrypts password and completes authenticated handshake", async () => {
   const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ login_check_code: 0 }) },
     { method: "POST", path: "/passport/web/login", response: json({ result_code: 0, result_message: "登录成功" }) },
     { method: "POST", path: "/passport/web/auth/uamtk", response: json({ result_code: 0, newapptk: "OPAQUE-UAMTK" }) },
     { method: "POST", path: "/otn/uamauthclient", response: json({ result_code: 0 }) },
@@ -38,12 +45,51 @@ test("mobile account login completes the existing authenticated session handshak
   assert.deepEqual(result, { state: "READY", session_state: "READY", retryable: false });
   assert.equal(JSON.stringify(result).includes("FAKE-PASSWORD"), false);
   assert.deepEqual(transport.calls.map(call => call.path), [
+    "/passport/web/checkLoginVerify",
     "/passport/web/login",
     "/passport/web/auth/uamtk",
     "/otn/uamauthclient",
     "/otn/login/checkUser",
   ]);
+  const loginForm = transport.calls[1]?.form ?? {};
+  assert.equal(loginForm.password, "@aLUX4YDHgmUX+DRoSxzu7tUUh4PyBvnK5vZLxH3nxnw=");
+  assert.equal(loginForm.password.includes("FAKE-PASSWORD"), false);
   assert.equal(transport.calls.some(call => /submitOrderRequest|confirmSingleForQueue|pay/i.test(call.path)), false);
+});
+
+test("verification preflight exposes SMS/slide choices without sending a password", async () => {
+  const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ login_check_code: 1 }) },
+  ]);
+  const auth = new Rail12306MobileAccountAuth({ aliasKey: "mobile-alias-key-123456789", transport });
+  const probe = await auth.probeVerification("fake-user");
+  assert.deepEqual(probe, { state: "SMS_REQUIRED", available_verifications: ["sms", "slide"] });
+  assert.equal(transport.calls.length, 1);
+  assert.equal(Object.hasOwn(transport.calls[0]?.form ?? {}, "password"), false);
+});
+
+test("SMS verification requests a code with transient ID suffix then continues the same login session", async () => {
+  const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/getMessageCode", response: json({ result_code: 0, result_message: "获取手机验证码成功" }) },
+    { method: "POST", path: "/passport/web/login", response: json({ result_code: 0, result_message: "登录成功" }) },
+    { method: "POST", path: "/passport/web/auth/uamtk", response: json({ result_code: 0, newapptk: "OPAQUE-UAMTK" }) },
+    { method: "POST", path: "/otn/uamauthclient", response: json({ result_code: 0 }) },
+    { method: "POST", path: "/otn/login/checkUser", response: ready() },
+  ]);
+  const auth = new Rail12306MobileAccountAuth({ aliasKey: "mobile-alias-key-123456789", transport });
+
+  assert.deepEqual(await auth.requestSmsCode("fake-user", "12X4"), { state: "SMS_CODE_SENT", retryable: false });
+  const result = await auth.loginWithSms("fake-user", "fake-password", "804921");
+  assert.equal(result.state, "READY");
+
+  const smsForm = transport.calls[0]?.form ?? {};
+  assert.deepEqual(smsForm, { appid: "otn", username: "fake-user", castNum: "12X4" });
+  const loginForm = transport.calls[1]?.form ?? {};
+  assert.equal(loginForm.checkMode, "0");
+  assert.equal(loginForm.randCode, "804921");
+  assert.equal(loginForm.password.startsWith("@"), true);
+  assert.equal(JSON.stringify(result).includes("12X4"), false);
+  assert.equal(JSON.stringify(result).includes("804921"), false);
 });
 
 test("official human-verification messages collapse to coarse non-PII states", () => {
@@ -57,6 +103,7 @@ test("official human-verification messages collapse to coarse non-PII states", (
 
 test("failed account login never returns raw 12306 message or masked account data", async () => {
   const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ login_check_code: 0 }) },
     { method: "POST", path: "/passport/web/login", response: json({ result_code: 2, result_message: "请用尾号2753手机号发短信666到12306。" }) },
   ]);
   const auth = new Rail12306MobileAccountAuth({ aliasKey: "mobile-alias-key-123456789", transport });
@@ -69,10 +116,11 @@ test("failed account login never returns raw 12306 message or masked account dat
   assert.equal(emitted.includes("fake-password"), false);
 });
 
-test("mobile challenge store retains only opaque metadata, bounds password retries and can observe later app confirmation", async () => {
+test("mobile challenge store retains only opaque metadata, bounds retries and can observe later app confirmation", async () => {
   const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ login_check_code: 0 }) },
     { method: "POST", path: "/passport/web/login", response: json({ result_code: 1, result_message: "用户名或密码输入错误" }) },
-    { method: "POST", path: "/passport/web/login", response: json({ result_code: 2, result_message: "请在十分钟内使用12306APP进行登录核验" }) },
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ result_code: 2, result_message: "请在十分钟内使用12306APP进行登录核验" }) },
     { method: "POST", path: "/otn/login/checkUser", response: ready() },
   ]);
   const auth = new Rail12306MobileAccountAuth({ aliasKey: "mobile-alias-key-123456789", transport });
@@ -91,6 +139,28 @@ test("mobile challenge store retains only opaque metadata, bounds password retri
 
   const refreshed = await store.refresh(challenge.challenge_id);
   assert.equal(refreshed.state, "READY");
+});
+
+test("challenge store supports SMS handoff without persisting ID suffix or SMS code", async () => {
+  const transport = new ScriptedTransport([
+    { method: "POST", path: "/passport/web/checkLoginVerify", response: json({ login_check_code: 3 }) },
+    { method: "POST", path: "/passport/web/getMessageCode", response: json({ result_code: 0, result_message: "获取手机验证码成功" }) },
+    { method: "POST", path: "/passport/web/login", response: json({ result_code: 0 }) },
+    { method: "POST", path: "/passport/web/auth/uamtk", response: json({ result_code: 0, newapptk: "OPAQUE-UAMTK" }) },
+    { method: "POST", path: "/otn/uamauthclient", response: json({ result_code: 0 }) },
+    { method: "POST", path: "/otn/login/checkUser", response: ready() },
+  ]);
+  const auth = new Rail12306MobileAccountAuth({ aliasKey: "mobile-alias-key-123456789", transport });
+  const store = new Mobile12306AuthChallengeStore(auth);
+  const challenge = store.create(60_000);
+
+  assert.equal((await store.submitPassword(challenge.challenge_id, "fake-user", "fake-password")).state, "SMS_REQUIRED");
+  assert.equal((await store.requestSms(challenge.challenge_id, "fake-user", "12X4")).state, "SMS_CODE_SENT");
+  assert.equal((await store.submitSms(challenge.challenge_id, "fake-user", "fake-password", "804921")).state, "READY");
+  const publicState = JSON.stringify(store.status(challenge.challenge_id));
+  assert.equal(publicState.includes("fake-user"), false);
+  assert.equal(publicState.includes("12X4"), false);
+  assert.equal(publicState.includes("804921"), false);
 });
 
 test("mobile transport structurally blocks order, queue-confirm and payment paths", async () => {

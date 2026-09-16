@@ -1,3 +1,4 @@
+import { createCipheriv } from "node:crypto";
 import type { PassengerAlias, ReadOnlySessionState } from "./real12306-readonly.ts";
 import type { PendingOrder } from "../src/ticket/contracts.ts";
 import {
@@ -8,6 +9,7 @@ import {
 
 const KYFW_ORIGIN = "https://kyfw.12306.cn";
 const REFERER = `${KYFW_ORIGIN}/otn/leftTicket/init?linktypeid=dc`;
+const SM4_KEY = Buffer.from("tiekeyuankp12306", "utf8");
 
 const MOBILE_AUTH_GET_PATHS = new Set([
   "/otn/login/conf",
@@ -16,6 +18,9 @@ const MOBILE_AUTH_GET_PATHS = new Set([
 ]);
 
 const MOBILE_AUTH_POST_PATHS = new Set([
+  "/passport/web/checkLoginVerify",
+  "/passport/web/slide-passcode",
+  "/passport/web/getMessageCode",
   "/passport/web/login",
   "/passport/web/auth/uamtk",
   "/otn/uamauthclient",
@@ -36,6 +41,17 @@ export type AccountLoginState =
 export type AccountLoginResult = {
   state: AccountLoginState;
   session_state: ReadOnlySessionState;
+  retryable: boolean;
+};
+
+export type LoginVerificationMode = "sms" | "slide";
+export type LoginVerificationProbe = {
+  state: AccountLoginState;
+  available_verifications: LoginVerificationMode[];
+};
+
+export type SmsCodeRequestResult = {
+  state: "SMS_CODE_SENT" | "HUMAN_ACTION_REQUIRED";
   retryable: boolean;
 };
 
@@ -86,6 +102,15 @@ function resultFor(state: AccountLoginState): AccountLoginResult {
     session_state: state === "READY" ? "READY" : state === "INVALID_CREDENTIALS" ? "AUTH_REQUIRED" : "HUMAN_ACTION_REQUIRED",
     retryable: state === "INVALID_CREDENTIALS",
   };
+}
+
+/** 12306 currently expects password-login payloads to carry SM4-ECB/PKCS#7 ciphertext prefixed with '@'. */
+export function encrypt12306Password(password: string): string {
+  if (!password) throw new Error("RAIL12306_PASSWORD_REQUIRED");
+  const cipher = createCipheriv("sm4-ecb", SM4_KEY, null);
+  cipher.setAutoPadding(true);
+  const encrypted = Buffer.concat([cipher.update(Buffer.from(password.trim(), "utf8")), cipher.final()]);
+  return `@${encrypted.toString("base64")}`;
 }
 
 /**
@@ -156,10 +181,9 @@ export class MobileAccountSessionHttpTransport implements LocalSessionHttpTransp
 }
 
 /**
- * Account/password login for a mobile-only user. Credentials are consumed as
- * transient method arguments and are never stored on the object. JavaScript
- * cannot guarantee deterministic zeroization of immutable strings, so the host
- * must also disable request-body logging and must never persist the form body.
+ * Account/password login for a mobile-only user. Credentials, ID suffixes and
+ * SMS codes are transient method arguments and are never retained on the object.
+ * The host must disable request-body logging and must never persist auth forms.
  */
 export class Rail12306MobileAccountAuth {
   private readonly transport: LocalSessionHttpTransport;
@@ -170,14 +194,72 @@ export class Rail12306MobileAccountAuth {
     this.readOnly = new Rail12306LocalAuthenticatedProvider({ aliasKey: options.aliasKey, transport: this.transport });
   }
 
+  async probeVerification(username: string): Promise<LoginVerificationProbe> {
+    if (!username.trim()) throw new Error("RAIL12306_USERNAME_REQUIRED");
+    const response = await this.transport.request("POST", "/passport/web/checkLoginVerify", {
+      username: username.trim(),
+      appid: "otn",
+    });
+    if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_LOGIN_VERIFY_HTTP_ERROR:${response.status}`);
+    const payload = parseJson(response.body, "RAIL12306_LOGIN_VERIFY_SCHEMA_DRIFT");
+    const code = String(payload.login_check_code ?? payload.result_code ?? "");
+    const classified = classifyAccountLoginResponse(payload);
+
+    if (classified === "APP_CONFIRM_REQUIRED" || classified === "OFFLINE_IDENTITY_REQUIRED") {
+      return { state: classified, available_verifications: [] };
+    }
+    if (code === "0") return { state: "READY", available_verifications: [] };
+    if (code === "1") return { state: "SMS_REQUIRED", available_verifications: ["sms", "slide"] };
+    if (code === "2") return { state: "SLIDER_REQUIRED", available_verifications: ["slide"] };
+    if (code === "3") return { state: "SMS_REQUIRED", available_verifications: ["sms"] };
+    if (classified !== "HUMAN_ACTION_REQUIRED") return { state: classified, available_verifications: [] };
+    return { state: "HUMAN_ACTION_REQUIRED", available_verifications: [] };
+  }
+
   async login(username: string, password: string): Promise<AccountLoginResult> {
     if (!username.trim() || !password) throw new Error("RAIL12306_CREDENTIALS_REQUIRED");
+    const probe = await this.probeVerification(username);
+    if (probe.state !== "READY") return resultFor(probe.state);
+    return this.submitPasswordLogin(username, password);
+  }
 
+  async requestSmsCode(username: string, idSuffix4: string): Promise<SmsCodeRequestResult> {
+    const suffix = idSuffix4.trim();
+    if (!username.trim() || suffix.length !== 4) throw new Error("RAIL12306_SMS_VERIFICATION_INPUT_REQUIRED");
+    const response = await this.transport.request("POST", "/passport/web/getMessageCode", {
+      appid: "otn",
+      username: username.trim(),
+      castNum: suffix,
+    });
+    if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_SMS_CODE_HTTP_ERROR:${response.status}`);
+    const payload = parseJson(response.body, "RAIL12306_SMS_CODE_SCHEMA_DRIFT");
+    const text = responseText(payload);
+    const success = String(payload.result_code ?? "") === "0" || /获取.*验证码成功|验证码.*发送成功/.test(text);
+    return success ? { state: "SMS_CODE_SENT", retryable: false } : { state: "HUMAN_ACTION_REQUIRED", retryable: false };
+  }
+
+  async loginWithSms(username: string, password: string, smsCode: string): Promise<AccountLoginResult> {
+    if (!username.trim() || !password || !smsCode.trim()) throw new Error("RAIL12306_SMS_LOGIN_INPUT_REQUIRED");
+    return this.submitPasswordLogin(username, password, { checkMode: "0", randCode: smsCode.trim() });
+  }
+
+  async refreshSession(): Promise<ReadOnlySessionState> { return this.readOnly.sessionState(); }
+  async readPassengers(): Promise<PassengerAlias[]> { return this.readOnly.readPassengers(); }
+  async readPendingOrders(): Promise<PendingOrder[]> { return this.readOnly.readPendingOrders(); }
+
+  private async submitPasswordLogin(username: string, password: string, verification: Record<string, string> = {}): Promise<AccountLoginResult> {
     const response = await this.transport.request("POST", "/passport/web/login", {
-      username,
-      password,
+      sessionId: "",
+      sig: "",
+      if_check_slide_passcode_token: "",
+      scene: "",
+      checkMode: "",
+      randCode: "",
+      username: username.trim(),
+      password: encrypt12306Password(password),
       appid: "otn",
       _json_att: "",
+      ...verification,
     });
     if (response.status === 401 || response.status === 403) return resultFor("INVALID_CREDENTIALS");
     if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_ACCOUNT_LOGIN_HTTP_ERROR:${response.status}`);
@@ -190,10 +272,6 @@ export class Rail12306MobileAccountAuth {
     const session = await this.readOnly.sessionState();
     return session === "READY" ? resultFor("READY") : resultFor("HUMAN_ACTION_REQUIRED");
   }
-
-  async refreshSession(): Promise<ReadOnlySessionState> { return this.readOnly.sessionState(); }
-  async readPassengers(): Promise<PassengerAlias[]> { return this.readOnly.readPassengers(); }
-  async readPendingOrders(): Promise<PendingOrder[]> { return this.readOnly.readPendingOrders(); }
 
   private async completeLogin() {
     const tokenResponse = await this.transport.request("POST", "/passport/web/auth/uamtk", { appid: "otn" });
@@ -259,14 +337,30 @@ export class Mobile12306AuthChallengeStore {
   async submitPassword(challengeId: string, username: string, password: string): Promise<AccountLoginResult> {
     const record = this.requireRecord(challengeId);
     if (record.state === "LOCKED") throw new Error("RAIL12306_AUTH_CHALLENGE_LOCKED");
-    if (record.state !== "PENDING" && record.state !== "INVALID_CREDENTIALS") throw new Error("RAIL12306_AUTH_CHALLENGE_NOT_ACCEPTING_CREDENTIALS");
-    if (record.attempts >= this.maxAttempts) {
-      record.state = "LOCKED";
-      throw new Error("RAIL12306_AUTH_CHALLENGE_LOCKED");
+    if (!["PENDING", "INVALID_CREDENTIALS", "APP_CONFIRM_REQUIRED", "HUMAN_ACTION_REQUIRED"].includes(record.state)) {
+      throw new Error("RAIL12306_AUTH_CHALLENGE_NOT_ACCEPTING_CREDENTIALS");
     }
+    this.assertAttemptAvailable(record);
 
     record.attempts += 1;
     const result = await this.auth.login(username, password);
+    record.state = result.state;
+    if (result.state === "INVALID_CREDENTIALS" && record.attempts >= this.maxAttempts) record.state = "LOCKED";
+    return result;
+  }
+
+  async requestSms(challengeId: string, username: string, idSuffix4: string): Promise<SmsCodeRequestResult> {
+    const record = this.requireRecord(challengeId);
+    if (record.state !== "SMS_REQUIRED") throw new Error("RAIL12306_AUTH_CHALLENGE_NOT_WAITING_FOR_SMS");
+    return this.auth.requestSmsCode(username, idSuffix4);
+  }
+
+  async submitSms(challengeId: string, username: string, password: string, smsCode: string): Promise<AccountLoginResult> {
+    const record = this.requireRecord(challengeId);
+    if (record.state !== "SMS_REQUIRED") throw new Error("RAIL12306_AUTH_CHALLENGE_NOT_WAITING_FOR_SMS");
+    this.assertAttemptAvailable(record);
+    record.attempts += 1;
+    const result = await this.auth.loginWithSms(username, password, smsCode);
     record.state = result.state;
     if (result.state === "INVALID_CREDENTIALS" && record.attempts >= this.maxAttempts) record.state = "LOCKED";
     return result;
@@ -278,6 +372,13 @@ export class Mobile12306AuthChallengeStore {
       if (await this.auth.refreshSession() === "READY") record.state = "READY";
     }
     return this.publicView(record);
+  }
+
+  private assertAttemptAvailable(record: ChallengeRecord) {
+    if (record.attempts >= this.maxAttempts) {
+      record.state = "LOCKED";
+      throw new Error("RAIL12306_AUTH_CHALLENGE_LOCKED");
+    }
   }
 
   private requireRecord(challengeId: string): ChallengeRecord {

@@ -89,6 +89,13 @@ export type PendingOrder = {
   status: "WAITING_FOR_PAYMENT" | "UNKNOWN";
   travel_date?: string;
   train_code?: string;
+  origin?: string;
+  destination?: string;
+  passenger_refs?: string[];
+  seat_classes?: string[];
+  quantity?: number;
+  amount?: number;
+  payment_deadline?: string;
   redacted: true;
 };
 
@@ -115,8 +122,6 @@ export type ExecutionResult = {
 };
 
 export function targetFingerprint(target: Omit<BoundedTargetSet, "fingerprint">): string {
-  // Deterministic, non-secret binding value. The target itself remains in the
-  // control-plane task; this value is only used to invalidate stale leases.
   return Array.from(new TextEncoder().encode(JSON.stringify(target)))
     .map(byte => byte.toString(16).padStart(2, "0")).join("");
 }

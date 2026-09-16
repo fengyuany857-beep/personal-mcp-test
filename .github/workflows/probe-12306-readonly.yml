@@ -1,0 +1,43 @@
+name: Probe 12306 Read Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: Optional travel date (YYYY-MM-DD); blank means tomorrow in Asia/Shanghai
+        required: false
+        type: string
+      from_station:
+        description: Station name or telecode
+        required: false
+        default: 北京南
+        type: string
+      to_station:
+        description: Station name or telecode
+        required: false
+        default: 上海虹桥
+        type: string
+  push:
+    branches:
+      - feat/12306-ticket-capability
+    paths:
+      - "LIVE_12306_READONLY_TRIGGER"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      RAIL12306_PROBE_DATE: ${{ inputs.date || '' }}
+      RAIL12306_PROBE_FROM: ${{ inputs.from_station || '北京南' }}
+      RAIL12306_PROBE_TO: ${{ inputs.to_station || '上海虹桥' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Run bounded public read-only probe
+        run: node --experimental-strip-types scripts/12306-readonly-probe.ts

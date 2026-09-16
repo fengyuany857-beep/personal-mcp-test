@@ -2,7 +2,18 @@ import { dirname } from "node:path";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { Checkpoint, EffectRecord, EffectState, EffectTransition, ExecutionResult, NotificationResult, PendingOrder, RunnerState, TaskSpec, TicketState } from "../src/ticket/contracts.ts";
 
-export class EffectLedger {
+export interface EffectLedgerProvider {
+  readonly records: EffectRecord[];
+  readonly transitions: EffectTransition[];
+  start(task_id: string, effect: EffectRecord["effect"]): EffectRecord;
+  transition(effect_id: string, to_state: EffectState, reason: string): void;
+  markUnknown(effect_id: string, reason?: string): void;
+  markReconciling(effect_id: string, reason?: string): void;
+  complete(effect_id: string, reason?: string): void;
+  block(effect_id: string, reason?: string): void;
+}
+
+export class EffectLedger implements EffectLedgerProvider {
   readonly records: EffectRecord[] = [];
   readonly transitions: EffectTransition[] = [];
 
@@ -111,7 +122,13 @@ export class OutcomeReconciler {
   }
 }
 
-export class AccountLeaseManager {
+export interface AccountLeaseProvider {
+  acquire(accountRef: string): string;
+  release(leaseHandle: string): void;
+  isHeld(accountRef: string): boolean;
+}
+
+export class AccountLeaseManager implements AccountLeaseProvider {
   private readonly held = new Set<string>();
   acquire(accountRef: string) { const key = `12306-account:${accountRef}`; if (this.held.has(key)) throw new Error("BLOCKED_RESOURCE_BUSY"); this.held.add(key); return key; }
   release(key: string) { this.held.delete(key); }

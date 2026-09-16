@@ -39,5 +39,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Diagnose official-page network reachability
+        continue-on-error: true
+        run: |
+          curl --retry 0 --connect-timeout 10 --max-time 20 --silent --show-error \
+            --output /dev/null \
+            --write-out 'curl_http=%{http_code} remote_ip=%{remote_ip} ssl_verify=%{ssl_verify_result}\n' \
+            'https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc'
       - name: Run bounded public read-only probe
         run: node --experimental-strip-types scripts/12306-readonly-probe.ts

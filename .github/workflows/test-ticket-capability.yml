@@ -14,7 +14,7 @@ on:
       - ".github/workflows/test-ticket-capability.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -22,20 +22,30 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Regenerate lockfile from pinned package.json
+      - name: Validate or regenerate lockfile
+        id: lock
+        shell: bash
         run: |
-          rm -f package-lock.json
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          node -e "const lock=require('./package-lock.json'); if (lock.lockfileVersion < 1) process.exit(1); console.log('lockfileVersion='+lock.lockfileVersion)"
+          if node -e "const fs=require('node:fs'); JSON.parse(fs.readFileSync('package-lock.json','utf8'))" 2>/dev/null; then
+            echo "repaired=false" >> "$GITHUB_OUTPUT"
+          else
+            rm -f package-lock.json
+            npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+            node -e "const lock=require('./package-lock.json'); if (lock.lockfileVersion < 1) process.exit(1); console.log('lockfileVersion='+lock.lockfileVersion)"
+            echo "repaired=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run Phase 3 regression tests
         run: npm test
-      - name: Preserve regenerated lockfile
-        uses: actions/upload-artifact@v4
-        with:
-          name: regenerated-package-lock
-          path: package-lock.json
-          if-no-files-found: error
-          retention-days: 1
+      - name: Commit repaired lockfile after tests pass
+        if: steps.lock.outputs.repaired == 'true' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          git commit -m "chore(ticket): repair generated package lock"
+          git push origin HEAD:feat/12306-ticket-capability

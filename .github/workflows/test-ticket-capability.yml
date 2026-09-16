@@ -33,5 +33,5 @@ jobs:
           node -e "const fs=require('node:fs'); const lock=JSON.parse(fs.readFileSync('package-lock.json','utf8')); if (lock.lockfileVersion < 1) process.exit(1); console.log('lockfileVersion='+lock.lockfileVersion)"
       - name: Clean install from committed lockfile
         run: npm ci
-      - name: Run Phase 3 regression tests
+      - name: Run ticket capability regression tests
         run: npm test

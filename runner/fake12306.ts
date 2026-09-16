@@ -1,24 +1,23 @@
 import { type EffectRecord, type ExecutionResult, type PendingOrder, type TaskSpec, type TicketState } from "../src/ticket/contracts.ts";
 import { TicketControlPlane } from "../src/ticket/control.ts";
-import { AccountLeaseManager, EffectLedger, FakePendingOrderReader, OutcomeReconciler } from "./runtime.ts";
+import { AccountLeaseManager, EffectLedger, FakePendingOrderReader, OutcomeReconciler, type AccountLeaseProvider, type EffectLedgerProvider } from "./runtime.ts";
 
 export type FakeFault = "network_timeout" | "response_loss" | "session_expired" | "challenge" | "notification_failure";
 
 export class Fake12306Adapter {
-  readonly effects: EffectRecord[];
   readonly stateHistory: TicketState[] = [];
   private pending: PendingOrder | undefined;
   private readonly control: TicketControlPlane;
-  private readonly accounts: AccountLeaseManager;
-  private readonly ledger: EffectLedger;
+  private readonly accounts: AccountLeaseProvider;
+  private readonly ledger: EffectLedgerProvider;
 
-  constructor(control: TicketControlPlane, accounts = new AccountLeaseManager(), ledger = new EffectLedger()) {
+  constructor(control: TicketControlPlane, accounts: AccountLeaseProvider = new AccountLeaseManager(), ledger: EffectLedgerProvider = new EffectLedger()) {
     this.control = control;
     this.accounts = accounts;
     this.ledger = ledger;
-    this.effects = this.ledger.records;
   }
 
+  get effects(): EffectRecord[] { return this.ledger.records; }
   get effectTransitions() { return this.ledger.transitions; }
   get accountLeaseManager() { return this.accounts; }
 

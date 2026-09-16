@@ -21,6 +21,19 @@ test("checkpoint survives a fresh store and runner instance through a file backe
   } finally { rmSync(directory,{recursive:true,force:true}); }
 });
 
-test("reconciler matches any bounded authorized candidate and distinguishes no effect or ambiguity", async () => { const multi={...task,target_set:makeTargetSet({target_set_id:"multi",candidates:[...task.target_set.candidates,{candidate_id:"c2",train_code:"G102",seat_classes:["二等座"],quantity:1,priority:2}]})}; assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ order_id:"o", travel_date:task.travel_date, train_code:"G102", status:"WAITING_FOR_PAYMENT", redacted:true }])).reconcile(multi),"ORDER_LOCKED"); assert.equal(await new OutcomeReconciler(new FakePendingOrderReader()).reconcile(task),"NO_EFFECT_VERIFIED"); assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ order_id:"other", status:"UNKNOWN", redacted:true }])).reconcile(task),"BLOCKED"); });
+test("reconciler locks only explicit pending-payment orders with a bounded exact match", async () => {
+  const multi={...task,target_set:makeTargetSet({target_set_id:"multi",candidates:[...task.target_set.candidates,{candidate_id:"c2",train_code:"G102",seat_classes:["二等座"],quantity:1,priority:2}]})};
+  const exact={ order_id:"o", travel_date:task.travel_date, train_code:"G102", origin:task.origin, destination:task.destination, passenger_refs:["psg_self"], seat_classes:["二等座"], quantity:1, status:"WAITING_FOR_PAYMENT" as const, redacted:true as const };
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([exact])).reconcile(multi),"ORDER_LOCKED");
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader()).reconcile(task),"NO_EFFECT_VERIFIED");
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ ...exact, status:"UNKNOWN" }])).reconcile(multi),"BLOCKED");
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ ...exact, passenger_refs:["psg_other"] }])).reconcile(multi),"BLOCKED");
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ order_id:"other", status:"UNKNOWN", redacted:true }])).reconcile(task),"BLOCKED");
+});
+
+test("internal fake task identity can reconcile only when status is explicit pending payment", async () => {
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ order_id:"fake", task_id:task.task_id, status:"WAITING_FOR_PAYMENT", redacted:true }])).reconcile(task),"ORDER_LOCKED");
+  assert.equal(await new OutcomeReconciler(new FakePendingOrderReader([{ order_id:"fake", task_id:task.task_id, status:"UNKNOWN", redacted:true }])).reconcile(task),"BLOCKED");
+});
 
 test("local runner preflight is read-only, can resume a checkpoint and submit stays unavailable", async () => { const store=new CheckpointStore(); store.save(checkpointFor(task,"RECONCILING",["effect-x"])); const runner=new LocalRunner("r", { sessionState:async()=>"READY", readPendingOrders:async()=>[] },store); const result=await runner.readOnlyPreflight(task); assert.equal(result.state,"PROBED"); assert.equal(result.pending_count,0); assert.equal(runner.resume(task.task_id).state,"RECONCILING"); assert.throws(()=>runner.submitOrder(),/CAPABILITY_NOT_AVAILABLE/); });

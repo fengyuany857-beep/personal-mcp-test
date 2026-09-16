@@ -77,15 +77,37 @@ export class FakePendingOrderReader implements PendingOrderReader {
   async readPending() { return this.orders.map(order => ({ ...order, redacted: true as const })); }
 }
 
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const a = [...left].sort();
+  const b = [...right].sort();
+  return a.every((value, index) => value === b[index]);
+}
+
+function verifiedPendingMatch(order: PendingOrder, task: TaskSpec): boolean {
+  if (order.status !== "WAITING_FOR_PAYMENT") return false;
+  if (order.task_id) return order.task_id === task.task_id;
+
+  if (!order.travel_date || !order.train_code || !order.origin || !order.destination ||
+      !order.passenger_refs || !order.seat_classes || typeof order.quantity !== "number") return false;
+  if (order.travel_date !== task.travel_date || order.origin !== task.origin || order.destination !== task.destination) return false;
+  if (!sameStringSet(order.passenger_refs, task.passenger_refs)) return false;
+
+  const candidate = task.target_set.candidates.find(item => item.train_code === order.train_code && item.quantity === order.quantity);
+  if (!candidate) return false;
+  return order.seat_classes.every(seat => candidate.seat_classes.includes(seat));
+}
+
 export class OutcomeReconciler {
   private readonly reader: PendingOrderReader;
   constructor(reader: PendingOrderReader) { this.reader = reader; }
   async reconcile(task: TaskSpec): Promise<"ORDER_LOCKED" | "NO_EFFECT_VERIFIED" | "BLOCKED"> {
     const orders = await this.reader.readPending();
-    const allowedTrains = new Set(task.target_set.candidates.map(candidate => candidate.train_code));
-    const match = orders.find(order => order.task_id === task.task_id || (order.travel_date === task.travel_date && !!order.train_code && allowedTrains.has(order.train_code)));
-    if (match) return "ORDER_LOCKED";
-    return orders.length === 0 ? "NO_EFFECT_VERIFIED" : "BLOCKED";
+    if (orders.some(order => verifiedPendingMatch(order, task))) return "ORDER_LOCKED";
+    if (orders.length === 0) return "NO_EFFECT_VERIFIED";
+    // queryMyOrderNoComplete includes non-payment in-progress orders. Any
+    // unmatched/UNKNOWN row is ambiguity, never proof that the submit had no effect.
+    return "BLOCKED";
   }
 }
 

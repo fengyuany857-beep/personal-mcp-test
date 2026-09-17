@@ -93,30 +93,37 @@ jobs:
             return body.data;
           }
 
-          const tokenInfo = await gql('query { projectToken { projectId environmentId } }');
-          const projectId = tokenInfo.projectToken?.projectId;
-          const environmentId = tokenInfo.projectToken?.environmentId;
-          if (!projectId || !environmentId) throw new Error('RAILWAY_PROJECT_TOKEN_SCOPE_NOT_FOUND');
+          async function main() {
+            const tokenInfo = await gql('query { projectToken { projectId environmentId } }');
+            const projectId = tokenInfo.projectToken?.projectId;
+            const environmentId = tokenInfo.projectToken?.environmentId;
+            if (!projectId || !environmentId) throw new Error('RAILWAY_PROJECT_TOKEN_SCOPE_NOT_FOUND');
 
-          const projectData = await gql(
-            'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }',
-            { id: projectId },
-          );
-          let service = projectData.project.services.edges.map((edge) => edge.node).find((item) => item.name === serviceName);
-          if (!service) {
-            const created = await gql(
-              'mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }',
-              { input: { projectId, environmentId, name: serviceName } },
+            const projectData = await gql(
+              'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }',
+              { id: projectId },
             );
-            service = created.serviceCreate;
-            console.log('service_created=true');
-          } else {
-            console.log('service_exists=true');
-          }
-          if (!service?.id) throw new Error('RAILWAY_SERVICE_ID_NOT_FOUND');
+            let service = projectData.project.services.edges.map((edge) => edge.node).find((item) => item.name === serviceName);
+            if (!service) {
+              const created = await gql(
+                'mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }',
+                { input: { projectId, environmentId, name: serviceName } },
+              );
+              service = created.serviceCreate;
+              console.log('service_created=true');
+            } else {
+              console.log('service_exists=true');
+            }
+            if (!service?.id) throw new Error('RAILWAY_SERVICE_ID_NOT_FOUND');
 
-          fs.appendFileSync(process.env.GITHUB_ENV,
-            `RAILWAY_PROJECT_ID=${projectId}\nRAILWAY_ENVIRONMENT_ID=${environmentId}\nRAILWAY_SERVICE_ID=${service.id}\n`);
+            fs.appendFileSync(process.env.GITHUB_ENV,
+              `RAILWAY_PROJECT_ID=${projectId}\nRAILWAY_ENVIRONMENT_ID=${environmentId}\nRAILWAY_SERVICE_ID=${service.id}\n`);
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
           NODE
 
       - name: Configure runner variables with GraphQL

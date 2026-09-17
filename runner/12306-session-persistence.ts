@@ -13,6 +13,7 @@ const KYFW_ORIGIN = "https://kyfw.12306.cn";
 const REFERER = `${KYFW_ORIGIN}/otn/leftTicket/init?linktypeid=dc`;
 const SESSION_AAD_PREFIX = "personal-mcp:12306-session:v1";
 const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$/;
+const DEFAULT_NETWORK_TIMEOUT_MS = 12_000;
 
 const CLOUD_AUTH_GET_PATHS = new Set([
   "/otn/login/conf",
@@ -72,9 +73,14 @@ function setCookieValues(headers: LocalSessionHttpResponse["headers"]): string[]
 export class Cloud12306SessionTransport implements PersistableLocalSessionTransport {
   private readonly cookies = new Map<string, string>();
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
-  constructor(options: { fetchImpl?: typeof fetch } = {}) {
+  constructor(options: { fetchImpl?: typeof fetch; requestTimeoutMs?: number } = {}) {
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_NETWORK_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.requestTimeoutMs) || this.requestTimeoutMs < 100 || this.requestTimeoutMs > 30_000) {
+      throw new Error("RAIL12306_CLOUD_AUTH_TIMEOUT_INVALID");
+    }
   }
 
   exportSessionCookies(): SessionCookieJar {
@@ -114,9 +120,14 @@ export class Cloud12306SessionTransport implements PersistableLocalSessionTransp
         method,
         headers,
         redirect: "manual",
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
         ...(method === "POST" ? { body: new URLSearchParams(form) } : {}),
       });
     } catch (error) {
+      const name = (error as { name?: unknown }).name;
+      if (name === "TimeoutError" || name === "AbortError") {
+        throw new Error("RAIL12306_CLOUD_AUTH_NETWORK_ERROR:TIMEOUT");
+      }
       const code = (error as { cause?: { code?: unknown } }).cause?.code;
       throw new Error(`RAIL12306_CLOUD_AUTH_NETWORK_ERROR${typeof code === "string" ? `:${code}` : ""}`);
     }
@@ -305,9 +316,7 @@ export class Rail12306CloudSessionController {
   async beginQrLogin(timeoutMs = 120_000): Promise<CloudQrLoginChallenge> {
     const boundedTimeout = Math.min(Math.max(timeoutMs, 5_000), 180_000);
     this.transport.clearSessionCookies();
-    for (const path of CLOUD_AUTH_GET_PATHS) {
-      try { await this.transport.request("GET", path); } catch { /* prefetch is best effort */ }
-    }
+    await Promise.allSettled(Array.from(CLOUD_AUTH_GET_PATHS, path => this.transport.request("GET", path)));
     const response = await this.transport.request("POST", "/passport/web/create-qr64", { appid: "otn" });
     if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_QR_HTTP_ERROR:${response.status}`);
     const payload = parseObject(response.body, "RAIL12306_QR_SCHEMA_DRIFT");

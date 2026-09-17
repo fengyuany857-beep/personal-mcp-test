@@ -2,12 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import {
-  createIphone12306AuthPortal,
-  SharedCookieMobileTransport,
-} from "../runner/12306-iphone-auth-portal.ts";
-import type { MobileAuthChallenge } from "../runner/12306-mobile-auth.ts";
-import type { PersistableLocalSessionTransport, SessionCookieJar } from "../runner/12306-session-persistence.ts";
+import { createIphone12306AuthPortal } from "../runner/12306-iphone-auth-portal.ts";
 
 const ACCESS = "test-access-code-1234567890-safe";
 const ACCESS_HASH = createHash("sha256").update(ACCESS).digest("hex");
@@ -35,86 +30,110 @@ function jsonPost(body: unknown): RequestInit {
   return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
 }
 
-function challenge(state: MobileAuthChallenge["state"] = "PENDING", attempts = 0): MobileAuthChallenge {
-  return { challenge_id: "challenge-opaque", expires_at: "2099-01-01T00:00:00.000Z", state, attempts };
-}
-
-test("iPhone auth page is public but credential API requires the high-entropy access code", async () => {
-  let submitted = false;
+function makePortal(options: {
+  restored?: "READY" | "AUTH_REQUIRED";
+  wait?: "READY" | "TIMEOUT" | "EXPIRED";
+} = {}) {
+  const calls: string[] = [];
   const portal = createIphone12306AuthPortal({
     accessCodeHash: ACCESS_HASH,
-    mobileChallenges: {
-      create: () => challenge(),
-      status: () => challenge("READY", 1),
-      async submitPassword() { submitted = true; return { state: "READY", session_state: "READY", retryable: false }; },
-      async requestSms() { return { state: "SMS_CODE_SENT", retryable: false }; },
-      async submitSms() { return { state: "READY", session_state: "READY", retryable: false }; },
-      async refresh() { return challenge("READY", 1); },
+    async restoreSession() {
+      calls.push("restore");
+      return options.restored ?? "AUTH_REQUIRED";
     },
-    async restoreSession() { return "AUTH_REQUIRED"; },
-    async persistReadySession() { return "READY"; },
-    async readPassengers() { return []; },
-    async readPendingOrders() { return []; },
+    async beginQrLogin(timeoutMs) {
+      calls.push(`begin:${timeoutMs}`);
+      return {
+        challenge_id: "qrc_opaque",
+        qr_image_base64: Buffer.from("png-bytes").toString("base64"),
+        expires_at: "2099-01-01T00:00:00.000Z",
+      };
+    },
+    async waitForQrConfirmation(challengeId, waitOptions) {
+      calls.push(`wait:${challengeId}:${waitOptions?.timeoutMs}:${waitOptions?.pollMs}`);
+      if (options.wait === "TIMEOUT") throw new Error("RAIL12306_QR_TIMEOUT");
+      if (options.wait === "EXPIRED") throw new Error("RAIL12306_QR_EXPIRED");
+      return "READY";
+    },
+    async readPassengers() {
+      calls.push("passengers");
+      return [{ passenger_ref: "opaque-1" }, { passenger_ref: "opaque-2" }];
+    },
+    async readPendingOrders() {
+      calls.push("orders");
+      return [{ order_id: "opaque-order", status: "WAITING_FOR_PAYMENT", redacted: true }];
+    },
   });
+  return { portal, calls };
+}
+
+test("iPhone auth page is QR-first and contains no 12306 credential form", async () => {
+  const { portal } = makePortal();
   const { server, base } = await listen(portal);
   try {
-    const page = await fetch(`${base}/auth`);
-    assert.equal(page.status, 200);
-    const text = await page.text();
-    assert.match(text, /不发送给 ChatGPT/);
-    assert.match(text, /不含下单或支付能力/);
-    assert.equal(page.headers.get("cache-control")?.includes("no-store"), true);
-
-    const denied = await fetch(`${base}/auth/api/start`, jsonPost({
-      access_code: "wrong-access-code-but-long-enough",
-      username: "SHOULD-NOT-BE-USED",
-      password: "SHOULD-NOT-BE-USED",
-    }));
-    assert.equal(denied.status, 401);
-    assert.deepEqual(await denied.json(), { ok: false, error: "UNAUTHORIZED" });
-    assert.equal(submitted, false);
+    const response = await fetch(`${base}/auth`);
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /12306 扫码登录/);
+    assert.match(text, /选择“相册”/);
+    assert.match(text, /无需输入 12306 账号或密码/);
+    assert.equal(text.includes('id="username"'), false);
+    assert.equal(text.includes('id="password"'), false);
+    assert.equal(text.includes('id="smsCode"'), false);
+    assert.equal(response.headers.get("cache-control")?.includes("no-store"), true);
+    assert.match(response.headers.get("content-security-policy") ?? "", /img-src data: blob:/);
   } finally {
     await close(server);
   }
 });
 
-test("READY login persists the shared session then exposes counts only", async () => {
-  let persisted = 0;
-  let cleared = 0;
-  let state: MobileAuthChallenge["state"] = "PENDING";
-  const portal = createIphone12306AuthPortal({
-    accessCodeHash: ACCESS_HASH,
-    clearSession() { cleared += 1; },
-    mobileChallenges: {
-      create: () => challenge(),
-      status: () => challenge(state, 1),
-      async submitPassword(_id, username, password) {
-        assert.equal(username, "PRIVATE-USER");
-        assert.equal(password, "PRIVATE-PASSWORD");
-        state = "READY";
-        return { state: "READY", session_state: "READY", retryable: false };
-      },
-      async requestSms() { return { state: "SMS_CODE_SENT", retryable: false }; },
-      async submitSms() { state = "READY"; return { state: "READY", session_state: "READY", retryable: false }; },
-      async refresh() { return challenge(state, 1); },
-    },
-    async restoreSession() { return "AUTH_REQUIRED"; },
-    async persistReadySession() { persisted += 1; return "READY"; },
-    async readPassengers() { return [{ passenger_ref: "opaque-1" }, { passenger_ref: "opaque-2" }]; },
-    async readPendingOrders() { return [{ order_id: "opaque-order", status: "WAITING_FOR_PAYMENT", redacted: true }]; },
-  });
+test("QR API rejects an invalid access code before contacting 12306", async () => {
+  const { portal, calls } = makePortal();
   const { server, base } = await listen(portal);
   try {
-    const response = await fetch(`${base}/auth/api/start`, jsonPost({
+    const response = await fetch(`${base}/auth/api/qr/start`, jsonPost({ access_code: "wrong-access-code-but-long-enough" }));
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { ok: false, error: "UNAUTHORIZED" });
+    assert.deepEqual(calls, []);
+  } finally {
+    await close(server);
+  }
+});
+
+test("QR start returns only opaque challenge and official image payload", async () => {
+  const { portal, calls } = makePortal();
+  const { server, base } = await listen(portal);
+  try {
+    const response = await fetch(`${base}/auth/api/qr/start`, jsonPost({ access_code: ACCESS }));
+    assert.equal(response.status, 201);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      state: "WAITING",
+      challenge_id: "qrc_opaque",
+      qr_image_base64: Buffer.from("png-bytes").toString("base64"),
+      expires_at: "2099-01-01T00:00:00.000Z",
+      submit_capability: false,
+      payment_capability: false,
+    });
+    assert.deepEqual(calls, ["restore", "begin:180000"]);
+  } finally {
+    await close(server);
+  }
+});
+
+test("confirmed QR session returns redacted counts only", async () => {
+  const { portal, calls } = makePortal({ wait: "READY" });
+  const { server, base } = await listen(portal);
+  try {
+    const response = await fetch(`${base}/auth/api/qr/poll`, jsonPost({
       access_code: ACCESS,
-      username: "PRIVATE-USER",
-      password: "PRIVATE-PASSWORD",
+      challenge_id: "qrc_opaque",
     }));
     assert.equal(response.status, 200);
-    const body = await response.json() as Record<string, unknown>;
+    const body = await response.json();
     assert.deepEqual(body, {
       ok: true,
-      challenge_id: "challenge-opaque",
+      challenge_id: "qrc_opaque",
       state: "READY",
       session_persisted: true,
       passenger_count: 2,
@@ -123,33 +142,47 @@ test("READY login persists the shared session then exposes counts only", async (
       payment_capability: false,
     });
     const emitted = JSON.stringify(body);
-    assert.equal(emitted.includes("PRIVATE-USER"), false);
-    assert.equal(emitted.includes("PRIVATE-PASSWORD"), false);
     assert.equal(emitted.includes("opaque-1"), false);
     assert.equal(emitted.includes("opaque-order"), false);
-    assert.equal(cleared, 1);
-    assert.equal(persisted, 1);
+    assert.deepEqual(calls, ["wait:qrc_opaque:5000:500", "passengers", "orders"]);
   } finally {
     await close(server);
   }
 });
 
-test("shared-cookie mobile transport structurally blocks submit, queue and payment paths before network", async () => {
-  let networkCalls = 0;
-  let cookies: SessionCookieJar = {};
-  const shared: PersistableLocalSessionTransport = {
-    exportSessionCookies: () => ({ ...cookies }),
-    importSessionCookies: next => { cookies = { ...next }; },
-    clearSessionCookies: () => { cookies = {}; },
-    async request() { throw new Error("NOT_USED"); },
-  };
-  const transport = new SharedCookieMobileTransport(shared, async () => {
-    networkCalls += 1;
-    return new Response("{}", { status: 200 });
-  });
+test("QR polling timeout is WAITING and expiry is terminal", async () => {
+  const waiting = makePortal({ wait: "TIMEOUT" });
+  const waitingServer = await listen(waiting.portal);
+  try {
+    const response = await fetch(`${waitingServer.base}/auth/api/qr/poll`, jsonPost({ access_code: ACCESS, challenge_id: "qrc_opaque" }));
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { ok: true, state: "WAITING", challenge_id: "qrc_opaque" });
+  } finally {
+    await close(waitingServer.server);
+  }
 
-  await assert.rejects(() => transport.request("POST", "/otn/leftTicket/submitOrderRequest"), /RAIL12306_IPHONE_AUTH_PATH_BLOCKED/);
-  await assert.rejects(() => transport.request("POST", "/otn/confirmPassenger/confirmSingleForQueue"), /RAIL12306_IPHONE_AUTH_PATH_BLOCKED/);
-  await assert.rejects(() => transport.request("POST", "/otn/payOrder/init"), /RAIL12306_IPHONE_AUTH_PATH_BLOCKED/);
-  assert.equal(networkCalls, 0);
+  const expired = makePortal({ wait: "EXPIRED" });
+  const expiredServer = await listen(expired.portal);
+  try {
+    const response = await fetch(`${expiredServer.base}/auth/api/qr/poll`, jsonPost({ access_code: ACCESS, challenge_id: "qrc_opaque" }));
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), { ok: false, error: "RAIL12306_QR_EXPIRED" });
+  } finally {
+    await close(expiredServer.server);
+  }
+});
+
+test("legacy password and SMS portal endpoints are no longer exposed", async () => {
+  const { portal, calls } = makePortal();
+  const { server, base } = await listen(portal);
+  try {
+    for (const path of ["/auth/api/start", "/auth/api/sms/request", "/auth/api/sms/submit"]) {
+      const response = await fetch(`${base}${path}`, jsonPost({ access_code: ACCESS }));
+      assert.equal(response.status, 404, path);
+      assert.deepEqual(await response.json(), { ok: false, error: "NOT_FOUND" });
+    }
+    assert.deepEqual(calls, []);
+  } finally {
+    await close(server);
+  }
 });

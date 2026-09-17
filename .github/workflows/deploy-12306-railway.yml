@@ -45,21 +45,6 @@ jobs:
           npm install --global --no-audit --no-fund @railway/cli@5.57.7
           railway --version
 
-      - name: Resolve and link the token-scoped Railway project
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway status --json > /tmp/railway-status-before.json
-          jq -e 'type == "object"' /tmp/railway-status-before.json >/dev/null
-          PROJECT_ID="$(jq -r '.project.id // .projectId // .id // empty' /tmp/railway-status-before.json)"
-          test -n "$PROJECT_ID" || { echo "RAILWAY_PROJECT_ID_NOT_FOUND" >&2; jq -r 'keys[]' /tmp/railway-status-before.json >&2; exit 1; }
-          ENVIRONMENT_ID="$(jq -r '.environment.id // .environmentId // ([.. | objects | select((.name? // "") == "production") | .id?] | map(select(. != null)) | .[0]) // empty' /tmp/railway-status-before.json)"
-          if [ -n "$ENVIRONMENT_ID" ]; then
-            railway link --project "$PROJECT_ID" --environment "$ENVIRONMENT_ID" --json > /tmp/railway-link.json
-          else
-            railway link --project "$PROJECT_ID" --environment production --json > /tmp/railway-link.json
-          fi
-
       - name: Derive and mask runner-only secrets
         shell: bash
         run: |
@@ -81,71 +66,197 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_ENV, `RUNNER_ADMIN_TOKEN=${admin}\nRAIL12306_ALIAS_KEY=${alias}\nRAIL12306_SESSION_KEY_B64=${session}\n`);
           NODE
 
-      - name: Ensure bounded Railway service exists
+      - name: Resolve project and ensure bounded service with GraphQL
         shell: bash
         run: |
           set -euo pipefail
-          railway service list --json > /tmp/services.json
-          if jq -e --arg s "$SERVICE_NAME" '.. | objects | select(.name? == $s)' /tmp/services.json >/dev/null; then
-            echo "service_exists=true"
-          else
-            railway add --service "$SERVICE_NAME" --json > /tmp/service-create.json
-            echo "service_created=true"
-          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+          const endpoint = 'https://backboard.railway.com/graphql/v2';
+          const token = process.env.RAILWAY_TOKEN;
+          const serviceName = process.env.SERVICE_NAME;
 
-      - name: Configure runner variables without intermediate deploys
+          async function gql(query, variables = {}) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Project-Access-Token': token,
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) {
+              const messages = (body.errors || []).map((e) => e.message).join(' | ');
+              throw new Error(`RAILWAY_GRAPHQL_ERROR:${response.status}:${messages || 'unknown'}`);
+            }
+            return body.data;
+          }
+
+          const tokenInfo = await gql('query { projectToken { projectId environmentId } }');
+          const projectId = tokenInfo.projectToken?.projectId;
+          const environmentId = tokenInfo.projectToken?.environmentId;
+          if (!projectId || !environmentId) throw new Error('RAILWAY_PROJECT_TOKEN_SCOPE_NOT_FOUND');
+
+          const projectData = await gql(
+            'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }',
+            { id: projectId },
+          );
+          let service = projectData.project.services.edges.map((edge) => edge.node).find((item) => item.name === serviceName);
+          if (!service) {
+            const created = await gql(
+              'mutation($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }',
+              { input: { projectId, environmentId, name: serviceName } },
+            );
+            service = created.serviceCreate;
+            console.log('service_created=true');
+          } else {
+            console.log('service_exists=true');
+          }
+          if (!service?.id) throw new Error('RAILWAY_SERVICE_ID_NOT_FOUND');
+
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            `RAILWAY_PROJECT_ID=${projectId}\nRAILWAY_ENVIRONMENT_ID=${environmentId}\nRAILWAY_SERVICE_ID=${service.id}\n`);
+          NODE
+
+      - name: Configure runner variables with GraphQL
         shell: bash
         run: |
           set -euo pipefail
-          railway variable set --service "$SERVICE_NAME" --skip-deploys \
-            "RUNNER_ADMIN_TOKEN=$RUNNER_ADMIN_TOKEN" \
-            "RAIL12306_ACCOUNT_REF=acct_primary" \
-            "RAIL12306_ALIAS_KEY=$RAIL12306_ALIAS_KEY" \
-            "RAIL12306_SESSION_KEY_B64=$RAIL12306_SESSION_KEY_B64" \
-            "RAIL12306_STATE_DIR=/data" \
-            "RAILWAY_DOCKERFILE_PATH=Dockerfile.railway"
+          node <<'NODE'
+          const endpoint = 'https://backboard.railway.com/graphql/v2';
+          const token = process.env.RAILWAY_TOKEN;
+          async function gql(query, variables) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Project-Access-Token': token,
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) {
+              const messages = (body.errors || []).map((e) => e.message).join(' | ');
+              throw new Error(`RAILWAY_GRAPHQL_ERROR:${response.status}:${messages || 'unknown'}`);
+            }
+            return body.data;
+          }
+
+          const values = {
+            RUNNER_ADMIN_TOKEN: process.env.RUNNER_ADMIN_TOKEN,
+            RAIL12306_ACCOUNT_REF: 'acct_primary',
+            RAIL12306_ALIAS_KEY: process.env.RAIL12306_ALIAS_KEY,
+            RAIL12306_SESSION_KEY_B64: process.env.RAIL12306_SESSION_KEY_B64,
+            RAIL12306_STATE_DIR: '/data',
+            RAILWAY_DOCKERFILE_PATH: 'Dockerfile.railway',
+          };
+          const mutation = 'mutation($input: VariableUpsertInput!) { variableUpsert(input: $input) }';
+          for (const [name, value] of Object.entries(values)) {
+            await gql(mutation, {
+              input: {
+                projectId: process.env.RAILWAY_PROJECT_ID,
+                environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
+                serviceId: process.env.RAILWAY_SERVICE_ID,
+                name,
+                value,
+              },
+            });
+          }
+          console.log('runner_variables_configured=true');
+          NODE
 
       - name: Ensure one persistent /data volume
         shell: bash
         run: |
           set -euo pipefail
-          railway status --json > /tmp/status-with-service.json
-          if jq -e --arg s "$SERVICE_NAME" '.. | objects | select((tostring | contains($s)) and (tostring | contains("/data")))' /tmp/status-with-service.json >/dev/null; then
+          railway volume list \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID" \
+            --json > /tmp/volumes.json
+          if jq -e '.. | objects | select(.mountPath? == "/data")' /tmp/volumes.json >/dev/null; then
             echo "data_volume_exists=true"
           else
-            railway volume add --service "$SERVICE_NAME" --mount-path /data --json > /tmp/volume-create.json
+            railway volume add \
+              --project "$RAILWAY_PROJECT_ID" \
+              --environment "$RAILWAY_ENVIRONMENT_ID" \
+              --service "$RAILWAY_SERVICE_ID" \
+              --mount-path /data \
+              --json > /tmp/volume-create.json
             echo "data_volume_created=true"
           fi
 
-      - name: Configure health and restart policy
+      - name: Configure read-only health, restart and single Singapore replica
         shell: bash
         run: |
           set -euo pipefail
-          railway environment edit --service-config "$SERVICE_NAME" deploy.healthcheckPath /health --message "12306 readonly healthcheck" --json > /tmp/health-config.json
-          railway environment edit --service-config "$SERVICE_NAME" deploy.healthcheckTimeout 120 --message "12306 readonly health timeout" --json > /tmp/health-timeout-config.json
-          railway environment edit --service-config "$SERVICE_NAME" deploy.restartPolicyType ON_FAILURE --message "12306 readonly restart policy" --json > /tmp/restart-config.json
+          node <<'NODE'
+          const endpoint = 'https://backboard.railway.com/graphql/v2';
+          const token = process.env.RAILWAY_TOKEN;
+          async function gql(query, variables) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Project-Access-Token': token,
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) {
+              const messages = (body.errors || []).map((e) => e.message).join(' | ');
+              throw new Error(`RAILWAY_GRAPHQL_ERROR:${response.status}:${messages || 'unknown'}`);
+            }
+            return body.data;
+          }
 
-      - name: Force a single Singapore replica
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway scale --service "$SERVICE_NAME" us-west=0 us-east=0 eu-west=0 southeast-asia=1 --json > /tmp/scale.json
+          const input = {
+            healthcheckPath: '/health',
+            healthcheckTimeout: 120,
+            restartPolicyType: 'ON_FAILURE',
+            multiRegionConfig: {
+              'asia-southeast1-eqsg3a': { numReplicas: 1 },
+            },
+          };
+          await gql(
+            'mutation($environmentId: String!, $serviceId: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(environmentId: $environmentId, serviceId: $serviceId, input: $input) }',
+            {
+              environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
+              serviceId: process.env.RAILWAY_SERVICE_ID,
+              input,
+            },
+          );
+          console.log('service_runtime_configured=true');
+          NODE
 
       - name: Deploy exact repository revision
         shell: bash
         run: |
           set -euo pipefail
-          railway up --service "$SERVICE_NAME" --ci
+          railway up \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID" \
+            --ci
 
       - name: Ensure Railway public domain exists
         id: domain
         shell: bash
         run: |
           set -euo pipefail
-          railway domain list --service "$SERVICE_NAME" --json > /tmp/domains.json || printf '[]' > /tmp/domains.json
+          railway domain list \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID" \
+            --json > /tmp/domains.json || printf '[]' > /tmp/domains.json
           DOMAIN="$(jq -r '.. | strings | select(test("\\.up\\.railway\\.app$"))' /tmp/domains.json | head -n 1)"
           if [ -z "$DOMAIN" ]; then
-            railway domain --service "$SERVICE_NAME" --json > /tmp/domain-create.json
+            railway domain \
+              --project "$RAILWAY_PROJECT_ID" \
+              --environment "$RAILWAY_ENVIRONMENT_ID" \
+              --service "$RAILWAY_SERVICE_ID" \
+              --json > /tmp/domain-create.json
             DOMAIN="$(jq -r '.. | strings | select(test("\\.up\\.railway\\.app$"))' /tmp/domain-create.json | head -n 1)"
           fi
           test -n "$DOMAIN" || { echo "RAILWAY_DOMAIN_NOT_FOUND" >&2; exit 1; }
@@ -168,11 +279,4 @@ jobs:
             sleep 5
           done
           echo "LIVE_READONLY_HEALTH_FAIL" >&2
-          railway service logs --service "$SERVICE_NAME" --deployment --latest --lines 120 || true
           exit 1
-
-      - name: Record final Railway topology
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway status --json | jq '{project: (.project.name // .name // "unknown"), environment: (.environment.name // "production"), resources: (.services // .resources // [])}'

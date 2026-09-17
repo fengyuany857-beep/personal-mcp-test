@@ -291,3 +291,27 @@ jobs:
           done
           echo "LIVE_READONLY_HEALTH_FAIL" >&2
           exit 1
+
+      - name: Verify live QR-only iPhone auth portal
+        shell: bash
+        env:
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+        run: |
+          set -euo pipefail
+          PAGE="$(curl -fsS --max-time 10 "https://$DOMAIN/auth")"
+          printf '%s' "$PAGE" | grep -F '12306 扫码登录' >/dev/null
+          printf '%s' "$PAGE" | grep -F '选择“相册”' >/dev/null
+          printf '%s' "$PAGE" | grep -F '无需输入 12306 账号或密码' >/dev/null
+          if printf '%s' "$PAGE" | grep -F 'id="username"' >/dev/null; then
+            echo "LIVE_QR_PORTAL_USERNAME_FORM_PRESENT" >&2
+            exit 1
+          fi
+          if printf '%s' "$PAGE" | grep -F 'id="password"' >/dev/null; then
+            echo "LIVE_QR_PORTAL_PASSWORD_FORM_PRESENT" >&2
+            exit 1
+          fi
+          if printf '%s' "$PAGE" | grep -F 'id="smsCode"' >/dev/null; then
+            echo "LIVE_QR_PORTAL_SMS_FORM_PRESENT" >&2
+            exit 1
+          fi
+          echo "LIVE_QR_ONLY_AUTH_PORTAL_PASS"

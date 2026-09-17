@@ -298,10 +298,17 @@ jobs:
           DOMAIN: ${{ steps.domain.outputs.domain }}
         run: |
           set -euo pipefail
-          PAGE="$(curl -fsS --max-time 10 "https://$DOMAIN/auth")"
+          curl -fsS --max-time 10 -D /tmp/auth-headers.txt "https://$DOMAIN/auth" -o /tmp/auth-page.html
+          PAGE="$(cat /tmp/auth-page.html)"
           printf '%s' "$PAGE" | grep -F '12306 扫码登录' >/dev/null
           printf '%s' "$PAGE" | grep -F '选择“相册”' >/dev/null
           printf '%s' "$PAGE" | grep -F '无需输入 12306 账号或密码' >/dev/null
+          printf '%s' "$PAGE" | grep -F '<script src="/auth/app.js" defer></script>' >/dev/null
+          tr -d '\r' < /tmp/auth-headers.txt | grep -i '^content-security-policy:' | grep -F "script-src 'self'" >/dev/null
+          if tr -d '\r' < /tmp/auth-headers.txt | grep -i '^content-security-policy:' | grep -F "script-src 'unsafe-inline'" >/dev/null; then
+            echo "LIVE_QR_PORTAL_INLINE_SCRIPT_CSP_PRESENT" >&2
+            exit 1
+          fi
           if printf '%s' "$PAGE" | grep -F 'id="username"' >/dev/null; then
             echo "LIVE_QR_PORTAL_USERNAME_FORM_PRESENT" >&2
             exit 1
@@ -314,4 +321,8 @@ jobs:
             echo "LIVE_QR_PORTAL_SMS_FORM_PRESENT" >&2
             exit 1
           fi
+          curl -fsS --max-time 10 "https://$DOMAIN/auth/app.js" -o /tmp/auth-app.js
+          grep -F '__RAIL12306_AUTH_APP_BOOT' /tmp/auth-app.js >/dev/null
+          grep -F 'storageGet' /tmp/auth-app.js >/dev/null
+          node --check /tmp/auth-app.js
           echo "LIVE_QR_ONLY_AUTH_PORTAL_PASS"

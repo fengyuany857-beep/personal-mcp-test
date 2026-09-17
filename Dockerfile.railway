@@ -9,4 +9,4 @@ COPY src ./src
 
 EXPOSE 3000
 
-CMD ["node", "--experimental-strip-types", "runner/12306-cloud-runner-server.ts"]
+CMD ["node", "--experimental-strip-types", "runner/12306-iphone-cloud-runner.ts"]

@@ -38,6 +38,7 @@ type JsonObject = Record<string, unknown>;
 
 type MobileChallengeLike = {
   create(ttlMs?: number): MobileAuthChallenge;
+  status(challengeId: string): MobileAuthChallenge;
   submitPassword(challengeId: string, username: string, password: string): Promise<AccountLoginResult>;
   requestSms(challengeId: string, username: string, idSuffix4: string): Promise<SmsCodeRequestResult>;
   submitSms(challengeId: string, username: string, password: string, smsCode: string): Promise<AccountLoginResult>;
@@ -130,7 +131,7 @@ function accessAuthorized(body: JsonObject, expectedHash: Buffer): boolean {
 
 function safeError(error: unknown): string {
   const code = error instanceof Error ? error.message : "INTERNAL_ERROR";
-  if (/^(?:RAIL12306_[A-Z0-9_]+|AUTH_REQUIRED|INVALID_[A-Z0-9_]+|REQUEST_BODY_TOO_LARGE)$/.test(code)) return code;
+  if (/^(?:RAIL12306_[A-Z0-9_]+|AUTH_REQUIRED|INVALID_[A-Z0-9_]+|REQUEST_BODY_TOO_LARGE)(?::[A-Z0-9_.-]+)?$/.test(code)) return code;
   return "INTERNAL_ERROR";
 }
 
@@ -152,9 +153,9 @@ function captureCookies(headers: LocalSessionHttpResponse["headers"], target: Pe
 }
 
 /**
- * Mobile-login transport that has no cookie jar of its own. Every request reads
- * from and writes back to the canonical cloud transport, so a successful mobile
- * login can be persisted by the existing AES-256-GCM session controller.
+ * Mobile-login transport with no independent cookie jar. Every request reads
+ * from and writes back to the canonical cloud transport, so the existing
+ * AES-256-GCM session controller persists the exact authenticated cookie state.
  */
 export class SharedCookieMobileTransport implements LocalSessionHttpTransport {
   private readonly shared: PersistableLocalSessionTransport;
@@ -291,12 +292,17 @@ export function createIphone12306AuthPortal(options: IphoneAuthPortalOptions): I
         }
 
         if (path === "/auth/api/start") {
+          const restored = await options.restoreSession();
+          if (restored === "READY") {
+            json(res, 200, { ok: true, ...(await readySummary(options)) });
+            return true;
+          }
           const username = requiredString(body, "username", 128);
           const password = secretString(body, "password", 256);
           options.clearSession?.();
           const challenge = challenges!.create(5 * 60_000);
           const result = await challenges!.submitPassword(challenge.challenge_id, username, password);
-          json(res, 200, await finish(result, challenges!.refresh ? challenges!.status?.(challenge.challenge_id) ?? challenge : challenge));
+          json(res, 200, await finish(result, challenges!.status(challenge.challenge_id)));
           return true;
         }
 
@@ -313,8 +319,7 @@ export function createIphone12306AuthPortal(options: IphoneAuthPortalOptions): I
           const password = secretString(body, "password", 256);
           const smsCode = requiredString(body, "sms_code", 16);
           const result = await challenges!.submitSms(challengeId, username, password, smsCode);
-          const challenge = result.state === "READY" ? { challenge_id: challengeId, expires_at: new Date().toISOString(), state: "READY", attempts: 0 } as MobileAuthChallenge : await challenges!.refresh(challengeId);
-          json(res, 200, await finish(result, challenge));
+          json(res, 200, await finish(result, challenges!.status(challengeId)));
           return true;
         }
         if (path === "/auth/api/refresh") {

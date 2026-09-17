@@ -9,6 +9,7 @@ on:
       - "src/ticket/**"
       - "runner/**"
       - "tests/**"
+      - "Dockerfile.railway"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/test-ticket-capability.yml"
@@ -35,3 +36,30 @@ jobs:
         run: npm ci
       - name: Run ticket capability regression tests
         run: npm test
+      - name: Build and smoke test Railway runner image
+        run: |
+          set -euo pipefail
+          image="personal-mcp-ticket-runner:ci"
+          container="personal-mcp-ticket-runner-ci"
+          docker build -f Dockerfile.railway -t "$image" .
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker run --rm -d --name "$container" \
+            -p 127.0.0.1:18080:3000 \
+            -e PORT=3000 \
+            -e RUNNER_ADMIN_TOKEN=ci-runner-admin-token-1234567890-abcdef \
+            -e RAIL12306_ACCOUNT_REF=acct_ci \
+            -e RAIL12306_ALIAS_KEY=ci-alias-key-1234567890 \
+            -e RAIL12306_SESSION_KEY_B64=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            "$image"
+          healthy=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health > /tmp/runner-health.json; then
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          test "$healthy" = "1"
+          node -e "const fs=require('node:fs'); const x=JSON.parse(fs.readFileSync('/tmp/runner-health.json','utf8')); if (!x.ok || x.mode !== 'READ_ONLY' || x.submit_capability !== false || x.payment_capability !== false) process.exit(1);"
+          status=$(curl -sS -o /tmp/runner-unauthorized.json -w '%{http_code}' http://127.0.0.1:18080/v1/session/status)
+          test "$status" = "401"

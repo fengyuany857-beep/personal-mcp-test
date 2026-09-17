@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
+import { runInNewContext } from "node:vm";
 import { createIphone12306AuthPortal } from "../runner/12306-iphone-auth-portal.ts";
+import { IPHONE_AUTH_APP_JS } from "../runner/12306-iphone-auth-app.ts";
 
 const ACCESS = "test-access-code-1234567890-safe";
 const ACCESS_HASH = createHash("sha256").update(ACCESS).digest("hex");
@@ -67,7 +69,7 @@ function makePortal(options: {
   return { portal, calls };
 }
 
-test("iPhone auth page is QR-first and contains no 12306 credential form", async () => {
+test("iPhone auth page uses same-origin external script and contains no credential form", async () => {
   const { portal } = makePortal();
   const { server, base } = await listen(portal);
   try {
@@ -77,14 +79,125 @@ test("iPhone auth page is QR-first and contains no 12306 credential form", async
     assert.match(text, /12306 扫码登录/);
     assert.match(text, /选择“相册”/);
     assert.match(text, /无需输入 12306 账号或密码/);
+    assert.match(text, /<script src="\/auth\/app\.js" defer><\/script>/);
     assert.equal(text.includes('id="username"'), false);
     assert.equal(text.includes('id="password"'), false);
     assert.equal(text.includes('id="smsCode"'), false);
     assert.equal(response.headers.get("cache-control")?.includes("no-store"), true);
-    assert.match(response.headers.get("content-security-policy") ?? "", /img-src data: blob:/);
+    const csp = response.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /script-src 'self'/);
+    assert.doesNotMatch(csp, /script-src 'unsafe-inline'/);
+    assert.match(csp, /img-src data: blob:/);
+
+    const scriptResponse = await fetch(`${base}/auth/app.js`);
+    assert.equal(scriptResponse.status, 200);
+    assert.match(scriptResponse.headers.get("content-type") ?? "", /^application\/javascript/);
+    assert.equal(scriptResponse.headers.get("cache-control")?.includes("no-store"), true);
+    assert.match(await scriptResponse.text(), /__RAIL12306_AUTH_APP_BOOT/);
   } finally {
     await close(server);
   }
+});
+
+test("auth app still boots from URL fragment when Safari storage and history APIs throw", async () => {
+  type FakeElement = {
+    textContent: string;
+    className: string;
+    value: string;
+    src: string;
+    onclick?: () => void;
+    classList: { toggle(name: string, force?: boolean): void };
+  };
+
+  const fakeElement = (): FakeElement => ({
+    textContent: "",
+    className: "",
+    value: "",
+    src: "",
+    classList: { toggle() {} },
+  });
+  const elements = new Map<string, FakeElement>([
+    ["status", fakeElement()],
+    ["accessBox", fakeElement()],
+    ["access", fakeElement()],
+    ["unlock", fakeElement()],
+    ["qrArea", fakeElement()],
+    ["qr", fakeElement()],
+    ["share", fakeElement()],
+    ["regen", fakeElement()],
+  ]);
+
+  let storageAccesses = 0;
+  const windowObject: Record<string, unknown> = {
+    location: { hash: `#code=${ACCESS}`, pathname: "/auth", search: "" },
+    history: { replaceState() { throw new Error("HISTORY_BLOCKED"); } },
+  };
+  Object.defineProperty(windowObject, "sessionStorage", {
+    configurable: true,
+    get() {
+      storageAccesses += 1;
+      throw new Error("STORAGE_BLOCKED");
+    },
+  });
+
+  const requests: string[] = [];
+  const fetchMock = async (input: string): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }> => {
+    requests.push(input);
+    if (input === "/auth/api/qr/start") {
+      return {
+        ok: true,
+        status: 201,
+        async json() {
+          return {
+            ok: true,
+            state: "WAITING",
+            challenge_id: "qrc_vm",
+            qr_image_base64: Buffer.from("vm-png").toString("base64"),
+            expires_at: "2099-01-01T00:00:00.000Z",
+          };
+        },
+      };
+    }
+    if (input === "/auth/api/qr/poll") {
+      return {
+        ok: true,
+        status: 202,
+        async json() { return { ok: true, state: "WAITING", challenge_id: "qrc_vm" }; },
+      };
+    }
+    throw new Error(`UNEXPECTED_FETCH:${input}`);
+  };
+
+  const scheduled: Array<() => void> = [];
+  runInNewContext(IPHONE_AUTH_APP_JS, {
+    window: windowObject,
+    document: {
+      readyState: "complete",
+      getElementById(id: string) { return elements.get(id) ?? null; },
+      addEventListener() {},
+      createElement() { return { href: "", download: "", click() {}, remove() {} }; },
+      body: { appendChild() {} },
+    },
+    URLSearchParams,
+    AbortController,
+    fetch: fetchMock,
+    setTimeout(callback: () => void) { scheduled.push(callback); return scheduled.length; },
+    clearTimeout() {},
+    atob(value: string) { return Buffer.from(value, "base64").toString("binary"); },
+    Uint8Array,
+    navigator: {},
+    File: class {},
+    console,
+  });
+
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(windowObject.__RAIL12306_AUTH_APP_BOOT, true);
+  assert.ok(storageAccesses >= 2);
+  assert.equal(requests[0], "/auth/api/qr/start");
+  assert.equal(elements.get("qr")?.src, `data:image/png;base64,${Buffer.from("vm-png").toString("base64")}`);
+  assert.match(elements.get("status")?.textContent ?? "", /二维码已生成|等待你在 12306 App/);
 });
 
 test("QR API rejects an invalid access code before contacting 12306", async () => {

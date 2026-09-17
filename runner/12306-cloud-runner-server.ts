@@ -6,6 +6,7 @@ import type { PendingOrder } from "../src/ticket/contracts.ts";
 import type { PassengerAlias, ReadOnlySessionState } from "./real12306-readonly.ts";
 import { createRail12306CloudSessionRuntime } from "./12306-cloud-session-runtime.ts";
 import type { CloudQrLoginChallenge } from "./12306-session-persistence.ts";
+import { ensurePersistenceMarker } from "./persistence-marker.ts";
 
 const SERVICE_NAME = "rail12306-cloud-readonly";
 const MAX_JSON_BODY_BYTES = 8 * 1024;
@@ -30,6 +31,7 @@ export interface CloudRunnerRuntimeLike {
 export type CloudRunnerServerOptions = {
   adminToken: string;
   runtime: CloudRunnerRuntimeLike;
+  persistenceMarkerHash?: string;
 };
 
 export type CloudRunnerEnvConfig = {
@@ -37,6 +39,7 @@ export type CloudRunnerEnvConfig = {
   accountRef: string;
   aliasKey: string;
   sessionKey: Buffer;
+  stateDir: string;
   databasePath: string;
   port: number;
 };
@@ -123,6 +126,7 @@ export function createCloudRunnerHttpServer(options: CloudRunnerServerOptions): 
         mode: "READ_ONLY",
         submit_capability: false,
         payment_capability: false,
+        ...(options.persistenceMarkerHash ? { persistence_marker_hash: options.persistenceMarkerHash } : {}),
       });
       return;
     }
@@ -220,6 +224,7 @@ export function loadCloudRunnerEnv(env: NodeJS.ProcessEnv = process.env): CloudR
     accountRef,
     aliasKey,
     sessionKey,
+    stateDir,
     databasePath: join(stateDir, "12306-session.sqlite"),
     port,
   };
@@ -236,8 +241,13 @@ export function createCloudRunnerRuntimeFromEnv(config: CloudRunnerEnvConfig): C
 
 export function startCloudRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): { server: Server; runtime: CloudRunnerRuntimeLike } {
   const config = loadCloudRunnerEnv(env);
+  const persistenceMarkerHash = ensurePersistenceMarker(config.stateDir);
   const runtime = createCloudRunnerRuntimeFromEnv(config);
-  const server = createCloudRunnerHttpServer({ adminToken: config.adminToken, runtime });
+  const server = createCloudRunnerHttpServer({
+    adminToken: config.adminToken,
+    runtime,
+    persistenceMarkerHash,
+  });
 
   server.listen(config.port, "0.0.0.0", () => {
     console.log(JSON.stringify({ service: SERVICE_NAME, event: "listening", port: config.port, mode: "READ_ONLY" }));

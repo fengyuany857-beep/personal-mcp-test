@@ -177,18 +177,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          railway volume list \
+          railway volume \
             --project "$RAILWAY_PROJECT_ID" \
             --environment "$RAILWAY_ENVIRONMENT_ID" \
             --service "$RAILWAY_SERVICE_ID" \
+            list \
             --json > /tmp/volumes.json
           if jq -e '.. | objects | select(.mountPath? == "/data")' /tmp/volumes.json >/dev/null; then
             echo "data_volume_exists=true"
           else
-            railway volume add \
+            railway volume \
               --project "$RAILWAY_PROJECT_ID" \
               --environment "$RAILWAY_ENVIRONMENT_ID" \
               --service "$RAILWAY_SERVICE_ID" \
+              add \
               --mount-path /data \
               --json > /tmp/volume-create.json
             echo "data_volume_created=true"

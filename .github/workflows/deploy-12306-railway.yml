@@ -315,3 +315,25 @@ jobs:
             exit 1
           fi
           echo "LIVE_QR_ONLY_AUTH_PORTAL_PASS"
+
+      - name: One-shot live Railway to 12306 QR creation probe
+        shell: bash
+        env:
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+        run: |
+          set -euo pipefail
+          STATUS="$(curl -sS --max-time 35 \
+            --output /tmp/qr-start.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data '{"timeout_ms":5000}' \
+            "https://$DOMAIN/v1/session/qr")"
+          if [ "$STATUS" != "201" ]; then
+            ERROR="$(jq -r '.error // "UNKNOWN"' /tmp/qr-start.json 2>/dev/null || printf 'INVALID_RESPONSE')"
+            echo "LIVE_QR_CREATE_FAIL status=$STATUS error=$ERROR" >&2
+            exit 1
+          fi
+          jq -e '.ok == true and (.challenge_id | type == "string" and length > 8) and (.qr_image_base64 | type == "string" and length > 100) and (.expires_at | type == "string" and length > 10)' /tmp/qr-start.json >/dev/null
+          echo "LIVE_QR_CREATE_PASS"

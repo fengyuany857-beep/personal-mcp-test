@@ -45,12 +45,20 @@ jobs:
           npm install --global --no-audit --no-fund @railway/cli@5.57.7
           railway --version
 
-      - name: Verify token can see the intended Railway project
+      - name: Resolve and link the token-scoped Railway project
         shell: bash
         run: |
           set -euo pipefail
           railway status --json > /tmp/railway-status-before.json
           jq -e 'type == "object"' /tmp/railway-status-before.json >/dev/null
+          PROJECT_ID="$(jq -r '.project.id // .projectId // .id // empty' /tmp/railway-status-before.json)"
+          test -n "$PROJECT_ID" || { echo "RAILWAY_PROJECT_ID_NOT_FOUND" >&2; jq -r 'keys[]' /tmp/railway-status-before.json >&2; exit 1; }
+          ENVIRONMENT_ID="$(jq -r '.environment.id // .environmentId // ([.. | objects | select((.name? // "") == "production") | .id?] | map(select(. != null)) | .[0]) // empty' /tmp/railway-status-before.json)"
+          if [ -n "$ENVIRONMENT_ID" ]; then
+            railway link --project "$PROJECT_ID" --environment "$ENVIRONMENT_ID" --json > /tmp/railway-link.json
+          else
+            railway link --project "$PROJECT_ID" --environment production --json > /tmp/railway-link.json
+          fi
 
       - name: Derive and mask runner-only secrets
         shell: bash

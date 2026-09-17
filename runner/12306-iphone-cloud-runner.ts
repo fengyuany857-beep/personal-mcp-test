@@ -6,7 +6,7 @@ import { createIphone12306AuthPortal } from "./12306-iphone-auth-portal.ts";
 import { ensurePersistenceMarker } from "./persistence-marker.ts";
 
 const SERVICE_NAME = "rail12306-cloud-readonly";
-const IPHONE_AUTH_ACCESS_SHA256 = "75725791c9e2f8dea2eefa758f78cdb3d5a90c7e3253eccd8f8adeb301af05e8";
+const IPHONE_AUTH_ACCESS_SHA256 = "8737334cae4569a4b958f57e0279d3dee5df48effd5168cad317e63b77987315";
 
 function requestPath(url = "/"): string {
   return new URL(url, "http://runner.invalid").pathname;
@@ -27,11 +27,9 @@ export function startIphoneCloudRunnerFromEnv(env: NodeJS.ProcessEnv = process.e
 
   const authPortal = createIphone12306AuthPortal({
     accessCodeHash: IPHONE_AUTH_ACCESS_SHA256,
-    aliasKey: config.aliasKey,
-    transport: runtime.transport,
-    clearSession: () => runtime.transport.clearSessionCookies(),
     restoreSession: () => runtime.controller.restore(),
-    persistReadySession: () => runtime.controller.persistCurrentReadySession(),
+    beginQrLogin: timeoutMs => runtime.controller.beginQrLogin(timeoutMs),
+    waitForQrConfirmation: (challengeId, options) => runtime.controller.waitForQrConfirmation(challengeId, options),
     readPassengers: () => runtime.provider.readPassengers(),
     readPendingOrders: () => runtime.provider.readPendingOrders(),
   });
@@ -49,7 +47,7 @@ export function startIphoneCloudRunnerFromEnv(env: NodeJS.ProcessEnv = process.e
   });
 
   server.listen(config.port, "0.0.0.0", () => {
-    console.log(JSON.stringify({ service: SERVICE_NAME, event: "listening", port: config.port, mode: "READ_ONLY", iphone_auth_portal: true }));
+    console.log(JSON.stringify({ service: SERVICE_NAME, event: "listening", port: config.port, mode: "READ_ONLY", iphone_auth_portal: true, auth_mode: "QR_ONLY" }));
   });
 
   const shutdown = () => {

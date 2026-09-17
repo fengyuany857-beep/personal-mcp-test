@@ -1,0 +1,12 @@
+FROM node:24.20.0-bookworm-slim
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY package.json ./package.json
+COPY runner ./runner
+COPY src ./src
+
+EXPOSE 3000
+
+CMD ["node", "--experimental-strip-types", "runner/12306-cloud-runner-server.ts"]

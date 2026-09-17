@@ -87,11 +87,13 @@ test("account lease excludes a separate OS process using the same durable databa
 
 test("expired holder cannot release a newer fenced lease", async () => {
   await withTempDb(async path => {
-    const stale = new SqliteAccountLeaseManager(path, { holderId: "runner-stale", leaseTtlMs: 30 });
+    // Keep a wide margin between the first immediate assertion and expiry so
+    // loaded CI runners cannot let a valid lease expire before it is observed.
+    const stale = new SqliteAccountLeaseManager(path, { holderId: "runner-stale", leaseTtlMs: 1_000 });
     const staleHandle = stale.acquire("acct-fence");
     assert.equal(stale.current("acct-fence")?.fencing_token, 1);
 
-    await delay(80);
+    await delay(1_200);
     const current = new SqliteAccountLeaseManager(path, { holderId: "runner-current", leaseTtlMs: 5_000 });
     try {
       const currentHandle = current.acquire("acct-fence");

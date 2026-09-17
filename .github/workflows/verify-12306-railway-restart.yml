@@ -1,0 +1,172 @@
+name: Verify 12306 Railway Restart Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/12306-ticket-capability
+    paths:
+      - RAILWAY_12306_RESTART_VERIFY_TRIGGER
+
+permissions:
+  contents: read
+
+concurrency:
+  group: railway-12306-readonly-production
+  cancel-in-progress: false
+
+jobs:
+  restart-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SERVICE_NAME: rail12306-readonly
+
+    steps:
+      - name: Checkout exact triggering revision
+        uses: actions/checkout@v6
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Verify Railway project token is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_TOKEN:-}" || { echo "RAILWAY_TOKEN secret is missing" >&2; exit 1; }
+
+      - name: Install pinned Railway CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --no-audit --no-fund @railway/cli@5.57.7
+          railway --version
+          railway restart --help >/tmp/railway-restart-help.txt
+          grep -q -- '--project' /tmp/railway-restart-help.txt
+          grep -q -- '--environment' /tmp/railway-restart-help.txt
+          grep -q -- '--service' /tmp/railway-restart-help.txt
+
+      - name: Resolve bounded Railway target
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const endpoint = 'https://backboard.railway.com/graphql/v2';
+          const token = process.env.RAILWAY_TOKEN;
+          const serviceName = process.env.SERVICE_NAME;
+
+          async function gql(query, variables = {}) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Project-Access-Token': token,
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) {
+              const messages = (body.errors || []).map((e) => e.message).join(' | ');
+              throw new Error(`RAILWAY_GRAPHQL_ERROR:${response.status}:${messages || 'unknown'}`);
+            }
+            return body.data;
+          }
+
+          async function main() {
+            const tokenInfo = await gql('query { projectToken { projectId environmentId } }');
+            const projectId = tokenInfo.projectToken?.projectId;
+            const environmentId = tokenInfo.projectToken?.environmentId;
+            if (!projectId || !environmentId) throw new Error('RAILWAY_PROJECT_TOKEN_SCOPE_NOT_FOUND');
+
+            const projectData = await gql(
+              'query($id: String!) { project(id: $id) { services { edges { node { id name } } } } }',
+              { id: projectId },
+            );
+            const service = projectData.project.services.edges
+              .map((edge) => edge.node)
+              .find((item) => item.name === serviceName);
+            if (!service?.id) throw new Error('RAILWAY_SERVICE_ID_NOT_FOUND');
+
+            fs.appendFileSync(process.env.GITHUB_ENV,
+              `RAILWAY_PROJECT_ID=${projectId}\nRAILWAY_ENVIRONMENT_ID=${environmentId}\nRAILWAY_SERVICE_ID=${service.id}\n`);
+            console.log('bounded_service_resolved=true');
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Resolve current public domain
+        id: domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway domain list \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID" \
+            --json > /tmp/domains.json
+          DOMAIN="$(jq -r '.. | strings | select(test("\\.up\\.railway\\.app$"))' /tmp/domains.json | head -n 1)"
+          DOMAIN="${DOMAIN#https://}"
+          DOMAIN="${DOMAIN#http://}"
+          test -n "$DOMAIN" || { echo "RAILWAY_DOMAIN_NOT_FOUND" >&2; exit 1; }
+          echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "bounded_domain_resolved=true"
+
+      - name: Freeze live pre-restart marker
+        id: before
+        shell: bash
+        env:
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+        run: |
+          set -euo pipefail
+          BODY="$(curl -fsS --max-time 10 "https://$DOMAIN/health")"
+          printf '%s' "$BODY" | jq -e '.ok == true and .mode == "READ_ONLY" and .submit_capability == false and .payment_capability == false' >/dev/null
+          HASH="$(printf '%s' "$BODY" | jq -r '.persistence_marker_hash // empty')"
+          [[ "$HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "PERSISTENCE_MARKER_HASH_INVALID" >&2; exit 1; }
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "PRE_RESTART_HEALTH_PASS"
+          echo "pre_restart_marker_hash=$HASH"
+
+      - name: Restart exact Railway service without rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway restart \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID" \
+            --yes \
+            --json
+          echo "RAILWAY_NATIVE_RESTART_ACCEPTED"
+
+      - name: Verify recovery and marker continuity
+        shell: bash
+        env:
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+          EXPECTED_HASH: ${{ steps.before.outputs.hash }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 36); do
+            if BODY="$(curl -fsS --max-time 10 "https://$DOMAIN/health" 2>/dev/null)" && \
+               printf '%s' "$BODY" | jq -e '.ok == true and .mode == "READ_ONLY" and .submit_capability == false and .payment_capability == false' >/dev/null; then
+              HASH="$(printf '%s' "$BODY" | jq -r '.persistence_marker_hash // empty')"
+              if [ "$HASH" = "$EXPECTED_HASH" ]; then
+                printf '%s\n' "$BODY" | jq .
+                echo "POST_RESTART_HEALTH_PASS"
+                echo "PERSISTENCE_MARKER_CONTINUITY_PASS"
+                exit 0
+              fi
+              echo "PERSISTENCE_MARKER_CHANGED" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "POST_RESTART_HEALTH_TIMEOUT" >&2
+          exit 1

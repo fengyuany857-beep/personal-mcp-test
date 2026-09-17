@@ -1,0 +1,170 @@
+name: Deploy 12306 Readonly Runner to Railway
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/12306-ticket-capability
+    paths:
+      - RAILWAY_12306_DEPLOY_TRIGGER
+
+permissions:
+  contents: read
+
+concurrency:
+  group: railway-12306-readonly-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SERVICE_NAME: rail12306-readonly
+
+    steps:
+      - name: Checkout exact triggering revision
+        uses: actions/checkout@v6
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Verify Railway project token is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_TOKEN:-}" || { echo "RAILWAY_TOKEN secret is missing" >&2; exit 1; }
+
+      - name: Install pinned Railway CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --no-audit --no-fund @railway/cli@5.57.7
+          railway --version
+
+      - name: Verify token can see the intended Railway project
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json > /tmp/railway-status-before.json
+          jq -e 'type == "object"' /tmp/railway-status-before.json >/dev/null
+
+      - name: Derive and mask runner-only secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { hkdfSync } = require('node:crypto');
+
+          const token = process.env.RAILWAY_TOKEN;
+          if (!token) throw new Error('RAILWAY_TOKEN_MISSING');
+          const salt = Buffer.from('personal-mcp-12306-railway-v1', 'utf8');
+          const derive = (info) => Buffer.from(hkdfSync('sha256', Buffer.from(token, 'utf8'), salt, Buffer.from(info, 'utf8'), 32));
+
+          const admin = derive('runner-admin-token').toString('base64url');
+          const alias = derive('passenger-alias-key').toString('base64url');
+          const session = derive('session-aes-256-gcm-key').toString('base64');
+
+          for (const value of [admin, alias, session]) process.stdout.write(`::add-mask::${value}\n`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `RUNNER_ADMIN_TOKEN=${admin}\nRAIL12306_ALIAS_KEY=${alias}\nRAIL12306_SESSION_KEY_B64=${session}\n`);
+          NODE
+
+      - name: Ensure bounded Railway service exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway service list --json > /tmp/services.json
+          if jq -e --arg s "$SERVICE_NAME" '.. | objects | select(.name? == $s)' /tmp/services.json >/dev/null; then
+            echo "service_exists=true"
+          else
+            railway add --service "$SERVICE_NAME" --json > /tmp/service-create.json
+            echo "service_created=true"
+          fi
+
+      - name: Configure runner variables without intermediate deploys
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable set --service "$SERVICE_NAME" --skip-deploys \
+            "RUNNER_ADMIN_TOKEN=$RUNNER_ADMIN_TOKEN" \
+            "RAIL12306_ACCOUNT_REF=acct_primary" \
+            "RAIL12306_ALIAS_KEY=$RAIL12306_ALIAS_KEY" \
+            "RAIL12306_SESSION_KEY_B64=$RAIL12306_SESSION_KEY_B64" \
+            "RAIL12306_STATE_DIR=/data" \
+            "RAILWAY_DOCKERFILE_PATH=Dockerfile.railway"
+
+      - name: Ensure one persistent /data volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json > /tmp/status-with-service.json
+          if jq -e --arg s "$SERVICE_NAME" '.. | objects | select((tostring | contains($s)) and (tostring | contains("/data")))' /tmp/status-with-service.json >/dev/null; then
+            echo "data_volume_exists=true"
+          else
+            railway volume add --service "$SERVICE_NAME" --mount-path /data --json > /tmp/volume-create.json
+            echo "data_volume_created=true"
+          fi
+
+      - name: Configure health and restart policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway environment edit --service-config "$SERVICE_NAME" deploy.healthcheckPath /health --message "12306 readonly healthcheck" --json > /tmp/health-config.json
+          railway environment edit --service-config "$SERVICE_NAME" deploy.healthcheckTimeout 120 --message "12306 readonly health timeout" --json > /tmp/health-timeout-config.json
+          railway environment edit --service-config "$SERVICE_NAME" deploy.restartPolicyType ON_FAILURE --message "12306 readonly restart policy" --json > /tmp/restart-config.json
+
+      - name: Force a single Singapore replica
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway scale --service "$SERVICE_NAME" us-west=0 us-east=0 eu-west=0 southeast-asia=1 --json > /tmp/scale.json
+
+      - name: Deploy exact repository revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up --service "$SERVICE_NAME" --ci
+
+      - name: Ensure Railway public domain exists
+        id: domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway domain list --service "$SERVICE_NAME" --json > /tmp/domains.json || printf '[]' > /tmp/domains.json
+          DOMAIN="$(jq -r '.. | strings | select(test("\\.up\\.railway\\.app$"))' /tmp/domains.json | head -n 1)"
+          if [ -z "$DOMAIN" ]; then
+            railway domain --service "$SERVICE_NAME" --json > /tmp/domain-create.json
+            DOMAIN="$(jq -r '.. | strings | select(test("\\.up\\.railway\\.app$"))' /tmp/domain-create.json | head -n 1)"
+          fi
+          test -n "$DOMAIN" || { echo "RAILWAY_DOMAIN_NOT_FOUND" >&2; exit 1; }
+          echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "Railway domain: https://$DOMAIN"
+
+      - name: Verify live read-only health contract
+        shell: bash
+        env:
+          DOMAIN: ${{ steps.domain.outputs.domain }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if BODY="$(curl -fsS --max-time 10 "https://$DOMAIN/health" 2>/dev/null)" && \
+               printf '%s' "$BODY" | jq -e '.ok == true and .mode == "READ_ONLY" and .submit_capability == false and .payment_capability == false' >/dev/null; then
+              printf '%s\n' "$BODY" | jq .
+              echo "LIVE_READONLY_HEALTH_PASS"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "LIVE_READONLY_HEALTH_FAIL" >&2
+          railway service logs --service "$SERVICE_NAME" --deployment --latest --lines 120 || true
+          exit 1
+
+      - name: Record final Railway topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json | jq '{project: (.project.name // .name // "unknown"), environment: (.environment.name // "production"), resources: (.services // .resources // [])}'

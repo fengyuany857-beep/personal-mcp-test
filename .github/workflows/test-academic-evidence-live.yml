@@ -1,0 +1,55 @@
+name: Live Verify Academic Evidence
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/test-academic-evidence-live.yml
+      - scripts/research-live-smoke.mjs
+      - scripts/research-mcp-live-smoke.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  live-readonly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
+      OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+      CONTACT_EMAIL: ${{ secrets.RESEARCH_CONTACT_EMAIL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Direct live provider smoke
+        run: node --experimental-strip-types scripts/research-live-smoke.mjs
+
+      - name: Local Worker MCP live smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler dev --local --ip 127.0.0.1 --port 8788 > /tmp/research-worker.log 2>&1 &
+          worker_pid=$!
+          cleanup() {
+            kill "$worker_pid" 2>/dev/null || true
+            wait "$worker_pid" 2>/dev/null || true
+            echo "----- wrangler local log -----"
+            cat /tmp/research-worker.log || true
+          }
+          trap cleanup EXIT
+
+          MCP_ENDPOINT=http://127.0.0.1:8788/mcp \
+            node scripts/research-mcp-live-smoke.mjs

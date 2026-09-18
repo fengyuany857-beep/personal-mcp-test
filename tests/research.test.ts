@@ -222,3 +222,36 @@ test("public research surface registers exactly the five stable tools", () => {
     "research.source_status",
   ]);
 });
+
+
+test("ResearchRuntime invokes injected fetch without rebinding its receiver", async () => {
+  function receiverSensitiveFetch(this: unknown, _input: RequestInfo | URL) {
+    assert.equal(this, undefined);
+    return Promise.resolve(
+      responseJson({
+        message: {
+          items: [
+            {
+              DOI: "10.1000/binding",
+              title: ["Binding-safe fetch"],
+              issued: { "date-parts": [[2026]] },
+            },
+          ],
+        },
+      }),
+    );
+  }
+
+  const result = await searchPapers(
+    new ResearchRuntime({}, receiverSensitiveFetch as typeof fetch),
+    {
+      queries: ["binding"],
+      maxResults: 5,
+      perProvider: 5,
+      sources: ["crossref"],
+    },
+  );
+
+  assert.equal(result.status, "complete");
+  assert.equal(result.papers[0].doi, "10.1000/binding");
+});

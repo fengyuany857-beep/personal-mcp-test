@@ -127,7 +127,7 @@ console.log(
   `MCP_SOURCE_STATUS=${String(status.status).toUpperCase()} observations=${JSON.stringify(status.observations)} failures=${JSON.stringify(status.failures)}`,
 );
 
-const s2Seed = firstDoi ?? "10.1016/s0028-3932(00)00079-8";
+const s2Seed = "10.1016/s0028-3932(00)00079-8";
 
 const similarCall = await mcpFetch("tools/call", {
   name: "research.find_similar",

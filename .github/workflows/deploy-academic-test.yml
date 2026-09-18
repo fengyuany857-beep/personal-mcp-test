@@ -1,0 +1,54 @@
+name: Deploy Academic Test Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/deploy-academic-test.yml
+      - wrangler.academic-test.jsonc
+      - ACADEMIC_DEPLOY_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Deploy isolated academic test Worker
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.131.2"
+          command: deploy --config wrangler.academic-test.jsonc
+
+      - name: Show isolated deployment URL
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          test -n "$DEPLOYMENT_URL"
+          echo "ACADEMIC_TEST_DEPLOYMENT_URL=$DEPLOYMENT_URL"
+
+      - name: Remote MCP academic smoke
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          set -euo pipefail
+          MCP_ENDPOINT="${DEPLOYMENT_URL%/}/mcp" node scripts/research-mcp-live-smoke.mjs

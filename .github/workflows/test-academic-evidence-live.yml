@@ -9,6 +9,8 @@ on:
       - .github/workflows/test-academic-evidence-live.yml
       - scripts/research-live-smoke.mjs
       - scripts/research-mcp-live-smoke.mjs
+      - src/research/**
+      - src/index.ts
 
 permissions:
   contents: read

@@ -13,14 +13,21 @@ const MAX_BACKOFF_MS = 2_000;
 type FetchLike = typeof fetch;
 
 export class ResearchProviderError extends Error {
+  readonly provider: ProviderName;
+  readonly code: ProviderFailure["code"];
+  readonly httpStatus?: number;
+
   constructor(
-    public readonly provider: ProviderName,
-    public readonly code: ProviderFailure["code"],
+    provider: ProviderName,
+    code: ProviderFailure["code"],
     message: string,
-    public readonly httpStatus?: number,
+    httpStatus?: number,
   ) {
     super(message);
     this.name = "ResearchProviderError";
+    this.provider = provider;
+    this.code = code;
+    this.httpStatus = httpStatus;
   }
 }
 
@@ -43,14 +50,16 @@ export function toProviderFailure(provider: ProviderName, error: unknown): Provi
 }
 
 export class ResearchRuntime {
+  readonly env: ResearchEnv;
+  private readonly fetchImpl: FetchLike;
   private readonly observations = new Map<ProviderName, ProviderObservation>();
   private readonly providerChains = new Map<ProviderName, Promise<void>>();
   private readonly providerLastStart = new Map<ProviderName, number>();
 
-  constructor(
-    public readonly env: ResearchEnv,
-    private readonly fetchImpl: FetchLike = fetch,
-  ) {}
+  constructor(env: ResearchEnv, fetchImpl: FetchLike = fetch) {
+    this.env = env;
+    this.fetchImpl = fetchImpl;
+  }
 
   async getJson<T>(
     provider: ProviderName,

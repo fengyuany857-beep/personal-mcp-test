@@ -58,7 +58,10 @@ export class ResearchRuntime {
 
   constructor(env: ResearchEnv, fetchImpl: FetchLike = fetch) {
     this.env = env;
-    this.fetchImpl = fetchImpl;
+    // Cloudflare's global fetch must not be invoked with ResearchRuntime as its
+    // `this` receiver. Wrap the injected function so the captured callable is
+    // always invoked as a plain function, while keeping test injection intact.
+    this.fetchImpl = (input, init) => fetchImpl(input, init);
   }
 
   async getJson<T>(

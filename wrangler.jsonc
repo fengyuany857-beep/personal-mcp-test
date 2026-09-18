@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "personal-mcp-test",
+  "name": "lattice-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-15",
   "vars": {

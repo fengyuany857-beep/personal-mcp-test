@@ -60,6 +60,15 @@ export type SearchResult = {
   status: ResearchStatus;
   queries: string[];
   papers: Paper[];
+  coverage: {
+    requestedProviders: ProviderName[];
+    successfulProviders: ProviderName[];
+    failedProviders: ProviderName[];
+    queryCount: number;
+    providerQueryAttempts: number;
+    providerQuerySuccesses: number;
+    returnedPapers: number;
+  };
   providersUsed: ProviderName[];
   providersFailed: ProviderFailure[];
   warnings: string[];

@@ -39,10 +39,10 @@ function requiredString(value: unknown, code: string): string {
  * QR-first cloud session controller.
  *
  * Important protocol detail: a confirmed /passport/web/checkqr response carries
- * the one-time uamtk produced by the user's official 12306 App confirmation.
- * Consume that token directly at /otn/uamauthclient instead of making a second
- * /passport/web/auth/uamtk request. The token is process-local only and is never
- * logged, returned to the browser, or persisted.
+ * a uamtk value that must first be bound into the current cookie jar. The QR
+ * flow then exchanges that authenticated context at /passport/web/auth/uamtk
+ * for newapptk, and only newapptk is sent to /otn/uamauthclient. Both bridge
+ * tokens remain process-local and are never logged or returned to the browser.
  */
 export class Rail12306QrFirstCloudSessionController {
   private readonly accountRef: string;
@@ -166,10 +166,36 @@ export class Rail12306QrFirstCloudSessionController {
     throw new Error("RAIL12306_QR_TIMEOUT");
   }
 
-  private async completeLoginFromQrToken(token: string): Promise<void> {
+  private mergeProcessCookie(name: string, value: string): void {
+    const cookies = this.transport.exportSessionCookies();
+    cookies[name] = value;
+    this.transport.importSessionCookies(cookies);
+  }
+
+  private async completeLoginFromQrToken(qrUamtk: string): Promise<void> {
+    // checkqr's uamtk is authentication context, not the final OTN app token.
+    this.mergeProcessCookie("uamtk", qrUamtk);
+
+    let tokenResponse;
+    try {
+      tokenResponse = await this.transport.request("POST", "/passport/web/auth/uamtk", { appid: "otn" });
+    } catch (error) {
+      if (error instanceof Error && error.message === "RAIL12306_CLOUD_AUTH_UNEXPECTED_REDIRECT_BLOCKED") {
+        throw new Error("RAIL12306_QR_UAMTK_REDIRECT_BLOCKED");
+      }
+      throw error;
+    }
+    if (tokenResponse.status < 200 || tokenResponse.status >= 300) {
+      throw new Error(`RAIL12306_UAMTK_HTTP_ERROR:${tokenResponse.status}`);
+    }
+    const tokenPayload = parseObject(tokenResponse.body, "RAIL12306_UAMTK_SCHEMA_DRIFT");
+    if (String(tokenPayload.result_code ?? "") !== "0") throw new Error("RAIL12306_UAMTK_REJECTED");
+    const newapptk = requiredString(tokenPayload.newapptk, "RAIL12306_UAMTK_SCHEMA_DRIFT");
+    this.mergeProcessCookie("tk", newapptk);
+
     let clientResponse;
     try {
-      clientResponse = await this.transport.request("POST", "/otn/uamauthclient", { tk: token });
+      clientResponse = await this.transport.request("POST", "/otn/uamauthclient", { tk: newapptk });
     } catch (error) {
       if (error instanceof Error && error.message === "RAIL12306_CLOUD_AUTH_UNEXPECTED_REDIRECT_BLOCKED") {
         throw new Error("RAIL12306_QR_UAMAUTH_REDIRECT_BLOCKED");

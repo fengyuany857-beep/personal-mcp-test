@@ -9,6 +9,7 @@ on:
       - .github/workflows/deploy-academic-test.yml
       - wrangler.academic-test.jsonc
       - ACADEMIC_DEPLOY_TRIGGER
+      - scripts/research-mcp-live-smoke.mjs
 
 permissions:
   contents: read

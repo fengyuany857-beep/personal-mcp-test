@@ -98,6 +98,9 @@ test("search returns PARTIAL when one provider fails and preserves successful ev
   assert.equal(result.status, "partial");
   assert.equal(result.papers.length, 1);
   assert.equal(result.papers[0].sourceCount, 2);
+  assert.equal(result.coverage.providerQueryAttempts, 3);
+  assert.equal(result.coverage.providerQuerySuccesses, 2);
+  assert.deepEqual(result.coverage.failedProviders, ["crossref"]);
   assert.ok(result.providersFailed.some((failure) => failure.provider === "crossref"));
 });
 

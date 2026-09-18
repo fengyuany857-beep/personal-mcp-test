@@ -35,3 +35,24 @@ test("cloud auth transport rejects unsafe timeout configuration", () => {
     /RAIL12306_CLOUD_AUTH_TIMEOUT_INVALID/,
   );
 });
+
+
+test("cloud auth transport honors a shorter per-request timeout override", async () => {
+  const fetchImpl = (async (_input: URL | RequestInfo, init?: RequestInit) => {
+    return await new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return;
+      const abort = () => reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  }) as typeof fetch;
+
+  const transport = new Cloud12306SessionTransport({ fetchImpl, requestTimeoutMs: 1_000 });
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => transport.request("GET", "/otn/login/conf", {}, { timeoutMs: 100 }),
+    /RAIL12306_CLOUD_AUTH_NETWORK_ERROR:TIMEOUT/,
+  );
+  assert.ok(Date.now() - startedAt < 700, "per-request override must shorten the bound");
+});

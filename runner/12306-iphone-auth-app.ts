@@ -69,7 +69,7 @@ export const IPHONE_AUTH_APP_JS = String.raw`(() => {
 
   async function post(path, payload) {
     const controller = typeof AbortController === "function" ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 35000) : null;
     try {
       const response = await fetch(path, {
         method: "POST",

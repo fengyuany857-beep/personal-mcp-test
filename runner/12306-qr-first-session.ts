@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ReadOnlySessionState } from "./real12306-readonly.ts";
-import { Rail12306LocalAuthenticatedProvider } from "./12306-local-auth-readonly.ts";
+import { Rail12306LocalAuthenticatedProvider, type LocalSessionHttpResponse } from "./12306-local-auth-readonly.ts";
 import {
   SqliteEncrypted12306SessionStore,
   type CloudQrLoginChallenge,
@@ -12,6 +12,10 @@ const CLOUD_AUTH_GET_PATHS = new Set([
   "/otn/index12306/getLoginBanner",
   "/passport/web/auth/uamtk-static",
 ]);
+const QR_PREWARM_TIMEOUT_MS = 2_500;
+const QR_CREATE_TIMEOUT_MS = 10_000;
+const QR_CREATE_ATTEMPTS = 2;
+const QR_CREATE_RETRY_DELAY_MS = 300;
 
 type InternalQrChallenge = { uuid: string; expires_at_ms: number };
 type JsonObject = Record<string, unknown>;
@@ -81,8 +85,30 @@ export class Rail12306QrFirstCloudSessionController {
   async beginQrLogin(timeoutMs = 120_000): Promise<CloudQrLoginChallenge> {
     const boundedTimeout = Math.min(Math.max(timeoutMs, 5_000), 180_000);
     this.transport.clearSessionCookies();
-    await Promise.allSettled(Array.from(CLOUD_AUTH_GET_PATHS, path => this.transport.request("GET", path)));
-    const response = await this.transport.request("POST", "/passport/web/create-qr64", { appid: "otn" });
+
+    await Promise.allSettled(Array.from(
+      CLOUD_AUTH_GET_PATHS,
+      path => this.transport.request("GET", path, {}, { timeoutMs: QR_PREWARM_TIMEOUT_MS }),
+    ));
+
+    let response: LocalSessionHttpResponse | undefined;
+    for (let attempt = 1; attempt <= QR_CREATE_ATTEMPTS; attempt += 1) {
+      try {
+        response = await this.transport.request(
+          "POST",
+          "/passport/web/create-qr64",
+          { appid: "otn" },
+          { timeoutMs: QR_CREATE_TIMEOUT_MS },
+        );
+        break;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const retryable = message.startsWith("RAIL12306_CLOUD_AUTH_NETWORK_ERROR");
+        if (!retryable || attempt === QR_CREATE_ATTEMPTS) throw error;
+        await new Promise(resolve => setTimeout(resolve, QR_CREATE_RETRY_DELAY_MS));
+      }
+    }
+    if (!response) throw new Error("RAIL12306_QR_CREATE_RETRY_EXHAUSTED");
     if (response.status < 200 || response.status >= 300) throw new Error(`RAIL12306_QR_HTTP_ERROR:${response.status}`);
     const payload = parseObject(response.body, "RAIL12306_QR_SCHEMA_DRIFT");
     if (String(payload.result_code ?? "") !== "0") throw new Error("RAIL12306_QR_CREATE_REJECTED");

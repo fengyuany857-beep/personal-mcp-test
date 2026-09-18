@@ -144,3 +144,51 @@ test("uamauth redirect remains blocked and is reported with QR-specific context"
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+
+test("QR bootstrap bounds warm-up and retries one transient create network failure", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "rail12306-qr-retry-"));
+  const path = join(directory, "session.sqlite");
+  const transport = new ScriptedTransport([
+    { method: "GET", path: "/otn/login/conf", response: json({ ok: true }) },
+    { method: "GET", path: "/otn/index12306/getLoginBanner", response: json({ ok: true }) },
+    { method: "GET", path: "/passport/web/auth/uamtk-static", response: json({ ok: true }) },
+    { method: "POST", path: "/passport/web/create-qr64", error: new Error("RAIL12306_CLOUD_AUTH_NETWORK_ERROR:ETIMEDOUT") },
+    { method: "POST", path: "/passport/web/create-qr64", response: json({
+      result_code: "0",
+      image: Buffer.from("retry-png").toString("base64"),
+      uuid: "RETRY-UUID",
+    }) },
+  ]);
+
+  const { controller, store } = makeController(transport, path);
+  try {
+    const challenge = await controller.beginQrLogin(30_000);
+    assert.match(challenge.challenge_id, /^qrc_/);
+    assert.equal(challenge.qr_image_base64, Buffer.from("retry-png").toString("base64"));
+    assert.equal(transport.calls.filter(call => call.path === "/passport/web/create-qr64").length, 2);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("QR bootstrap does not retry non-network create failures", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "rail12306-qr-no-retry-"));
+  const path = join(directory, "session.sqlite");
+  const transport = new ScriptedTransport([
+    { method: "GET", path: "/otn/login/conf", response: json({ ok: true }) },
+    { method: "GET", path: "/otn/index12306/getLoginBanner", response: json({ ok: true }) },
+    { method: "GET", path: "/passport/web/auth/uamtk-static", response: json({ ok: true }) },
+    { method: "POST", path: "/passport/web/create-qr64", error: new Error("RAIL12306_CLOUD_AUTH_PATH_BLOCKED") },
+  ]);
+
+  const { controller, store } = makeController(transport, path);
+  try {
+    await assert.rejects(() => controller.beginQrLogin(30_000), /RAIL12306_CLOUD_AUTH_PATH_BLOCKED/);
+    assert.equal(transport.calls.filter(call => call.path === "/passport/web/create-qr64").length, 1);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -33,7 +33,15 @@ const CLOUD_AUTH_POST_PATHS = new Set([
 
 export type SessionCookieJar = Record<string, string>;
 
+export type CloudSessionRequestOptions = { timeoutMs?: number };
+
 export interface PersistableLocalSessionTransport extends LocalSessionHttpTransport {
+  request(
+    method: "GET" | "POST",
+    path: string,
+    form?: Record<string, string>,
+    options?: CloudSessionRequestOptions,
+  ): Promise<LocalSessionHttpResponse>;
   exportSessionCookies(): SessionCookieJar;
   importSessionCookies(cookies: SessionCookieJar): void;
   clearSessionCookies(): void;
@@ -97,9 +105,19 @@ export class Cloud12306SessionTransport implements PersistableLocalSessionTransp
     this.cookies.clear();
   }
 
-  async request(method: "GET" | "POST", path: string, form: Record<string, string> = {}): Promise<LocalSessionHttpResponse> {
+  async request(
+    method: "GET" | "POST",
+    path: string,
+    form: Record<string, string> = {},
+    options: CloudSessionRequestOptions = {},
+  ): Promise<LocalSessionHttpResponse> {
     const allowed = method === "GET" ? CLOUD_AUTH_GET_PATHS : CLOUD_AUTH_POST_PATHS;
     if (!allowed.has(path)) throw new Error("RAIL12306_CLOUD_AUTH_PATH_BLOCKED");
+
+    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) {
+      throw new Error("RAIL12306_CLOUD_AUTH_TIMEOUT_INVALID");
+    }
 
     const url = new URL(path, KYFW_ORIGIN);
     if (url.origin !== KYFW_ORIGIN) throw new Error("RAIL12306_CLOUD_AUTH_ORIGIN_BLOCKED");
@@ -120,7 +138,7 @@ export class Cloud12306SessionTransport implements PersistableLocalSessionTransp
         method,
         headers,
         redirect: "manual",
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
         ...(method === "POST" ? { body: new URLSearchParams(form) } : {}),
       });
     } catch (error) {

@@ -5,7 +5,7 @@ import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
 import { registerResearchTools } from "./research/tools.ts";
 import type { ResearchEnv } from "./research/types.ts";
 
-const SERVER_NAME = "personal-mcp-test" as const;
+const SERVER_NAME = "lattice-mcp" as const;
 const SERVER_VERSION = "1.4.0" as const;
 const EXA_TOOL = "web_search_exa" as const;
 const EXA_ENDPOINT = `https://mcp.exa.ai/mcp?tools=${EXA_TOOL}`;
@@ -78,8 +78,8 @@ function createExaUpstream(env: Env) {
     url: EXA_ENDPOINT,
     timeoutMs: 15_000,
     headers: {
-      "User-Agent": "Personal-MCP-Hub/1.0",
-      "x-exa-source": "personal-mcp-hub",
+      "User-Agent": "Lattice-MCP/1.0",
+      "x-exa-source": "lattice-mcp",
       ...(env.EXA_API_KEY ? { "x-api-key": env.EXA_API_KEY } : {}),
     },
   };

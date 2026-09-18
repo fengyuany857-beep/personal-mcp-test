@@ -7,6 +7,7 @@ import {
   searchPapers,
 } from "../src/research/providers.ts";
 import { ResearchRuntime } from "../src/research/runtime.ts";
+import { registerResearchTools } from "../src/research/tools.ts";
 import type { Paper } from "../src/research/types.ts";
 
 function responseJson(value: unknown, init: ResponseInit = {}) {
@@ -198,4 +199,23 @@ test("citation graph emits correctly directed cites edges", async () => {
   assert.equal(result.status, "complete");
   assert.ok(result.edges.some((edge) => edge.from === "root" && edge.to === "ref-1"));
   assert.ok(result.edges.some((edge) => edge.from === "cite-1" && edge.to === "root"));
+});
+
+
+test("public research surface registers exactly the five stable tools", () => {
+  const names: string[] = [];
+  const fakeServer = {
+    registerTool(name: string) {
+      names.push(name);
+    },
+  };
+
+  registerResearchTools(fakeServer as never, {});
+  assert.deepEqual(names.sort(), [
+    "research.citation_graph",
+    "research.find_similar",
+    "research.get_paper",
+    "research.search_papers",
+    "research.source_status",
+  ]);
 });

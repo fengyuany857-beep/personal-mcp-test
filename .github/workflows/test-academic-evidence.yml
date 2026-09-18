@@ -1,0 +1,32 @@
+name: Verify Academic Evidence Capability
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run academic evidence contract tests
+        run: npm test
+
+      - name: Dry-run Worker build
+        run: npm run build

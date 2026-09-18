@@ -108,7 +108,7 @@ const init = await mcpFetch("initialize", {
   capabilities: {},
   clientInfo: { name: "personal-mcp-independent-test", version: "1.3.0" },
 });
-if (init?.serverInfo?.name !== "personal-mcp-test") {
+if (init?.serverInfo?.name !== "lattice-mcp") {
   throw new Error(`Unexpected serverInfo: ${JSON.stringify(init?.serverInfo)}`);
 }
 console.log(`INITIALIZE=PASS ${JSON.stringify(init)}`);
@@ -138,7 +138,7 @@ const pingResult = getStructured(
 );
 assertEqual(
   pingResult,
-  { ok: true, message: nonce, server: "personal-mcp-test" },
+  { ok: true, message: nonce, server: "lattice-mcp" },
   "ping result",
 );
 console.log(`PING=PASS ${JSON.stringify(pingResult)}`);

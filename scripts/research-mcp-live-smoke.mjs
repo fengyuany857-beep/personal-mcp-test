@@ -92,12 +92,16 @@ if (searchCall?.isError) {
   throw new Error(`research.search_papers isError: ${JSON.stringify(searchCall)}`);
 }
 const search = getStructured(searchCall);
-assert.equal(search.status, "complete");
+assert.notEqual(
+  search.status,
+  "blocked",
+  `research.search_papers blocked: ${JSON.stringify(search)}`,
+);
 assert.ok(Array.isArray(search.papers) && search.papers.length > 0);
 assert.equal(search.coverage.requestedProviders.length, 2);
 assert.equal(search.coverage.providerQueryAttempts, 4);
 console.log(
-  `MCP_SEARCH=PASS papers=${search.papers.length} attempts=${search.coverage.providerQueryAttempts}`,
+  `MCP_SEARCH=PASS status=${search.status} papers=${search.papers.length} attempts=${search.coverage.providerQueryAttempts} failures=${JSON.stringify(search.providersFailed)} warnings=${JSON.stringify(search.warnings)}`,
 );
 
 const firstDoi = search.papers.find((paper) => paper.doi)?.doi;

@@ -677,8 +677,8 @@ function applyOpenAlexAuth(runtime: ResearchRuntime, params: URLSearchParams): v
 
 function crossrefUserAgent(runtime: ResearchRuntime): string {
   return runtime.env.CONTACT_EMAIL
-    ? `Personal-MCP-Hub/1.0 (mailto:${runtime.env.CONTACT_EMAIL})`
-    : "Personal-MCP-Hub/1.0";
+    ? `Lattice-MCP/1.0 (mailto:${runtime.env.CONTACT_EMAIL})`
+    : "Lattice-MCP/1.0";
 }
 
 function sanitizeS2Query(query: string): string {

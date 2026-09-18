@@ -18,7 +18,7 @@ The deployment workflow:
 
 will:
 
-1. deploy the isolated `personal-mcp-academic-test` Worker,
+1. deploy the isolated `lattice-mcp-academic-test` Worker,
 2. report only whether each credential is configured,
 3. conditionally sync configured values to Cloudflare Worker secrets,
 4. never print credential values,

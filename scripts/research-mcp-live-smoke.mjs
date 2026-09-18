@@ -123,54 +123,42 @@ console.log(
   `MCP_SOURCE_STATUS=${String(status.status).toUpperCase()} observations=${JSON.stringify(status.observations)} failures=${JSON.stringify(status.failures)}`,
 );
 
-if (status.observations?.find((item) => item.provider === "semantic_scholar")?.state === "AVAILABLE") {
-  const s2SearchCall = await mcpFetch("tools/call", {
-    name: "research.search_papers",
-    arguments: {
-      query: "music auditory imagery training",
-      maxResults: 5,
-      perProvider: 5,
-      sources: ["semantic_scholar"],
-    },
-  });
-  const s2Search = getStructured(s2SearchCall);
-  const seed = s2Search.papers?.find((paper) => paper.semanticScholarId)?.semanticScholarId;
+const s2Seed = firstDoi ?? "10.1016/s0028-3932(00)00079-8";
 
-  if (seed) {
-    const similarCall = await mcpFetch("tools/call", {
-      name: "research.find_similar",
-      arguments: { identifier: seed, maxResults: 5, pool: "recent" },
-    });
-    const similar = getStructured(similarCall);
-    if (similar.status === "complete") {
-      assert.ok(Array.isArray(similar.papers));
-      console.log(`MCP_FIND_SIMILAR=PASS seed=${seed} papers=${similar.papers.length}`);
-    } else {
-      console.log(`MCP_FIND_SIMILAR=DEGRADED ${JSON.stringify(similar.warnings)}`);
-    }
-
-    const graphCall = await mcpFetch("tools/call", {
-      name: "research.citation_graph",
-      arguments: {
-        identifier: seed,
-        direction: "references",
-        depth: 1,
-        perPaperLimit: 3,
-        maxNodes: 10,
-      },
-    });
-    const graph = getStructured(graphCall);
-    if (graph.status !== "blocked") {
-      assert.ok(Array.isArray(graph.edges));
-      console.log(`MCP_CITATION_GRAPH=PASS seed=${seed} nodes=${graph.papers.length} edges=${graph.edges.length}`);
-    } else {
-      console.log(`MCP_CITATION_GRAPH=DEGRADED ${JSON.stringify(graph.warnings)}`);
-    }
-  } else {
-    console.log("MCP_S2_ADVANCED=SKIP no Semantic Scholar seed returned");
-  }
+const similarCall = await mcpFetch("tools/call", {
+  name: "research.find_similar",
+  arguments: { identifier: s2Seed, maxResults: 5, pool: "recent" },
+});
+const similar = getStructured(similarCall);
+assert.ok(["complete", "blocked"].includes(similar.status));
+if (similar.status === "complete") {
+  assert.ok(Array.isArray(similar.papers));
+  console.log(`MCP_FIND_SIMILAR=PASS seed=${s2Seed} papers=${similar.papers.length}`);
 } else {
-  console.log("MCP_S2_ADVANCED=SKIP Semantic Scholar is not AVAILABLE in this live run");
+  assert.equal(similarCall?.isError, true);
+  assert.ok(Array.isArray(similar.warnings) && similar.warnings.length > 0);
+  console.log(`MCP_FIND_SIMILAR=DEGRADED seed=${s2Seed} warnings=${JSON.stringify(similar.warnings)}`);
+}
+
+const graphCall = await mcpFetch("tools/call", {
+  name: "research.citation_graph",
+  arguments: {
+    identifier: s2Seed,
+    direction: "references",
+    depth: 1,
+    perPaperLimit: 3,
+    maxNodes: 10,
+  },
+});
+const graph = getStructured(graphCall);
+assert.ok(["complete", "partial", "blocked"].includes(graph.status));
+if (graph.status === "blocked") {
+  assert.equal(graphCall?.isError, true);
+  assert.ok(Array.isArray(graph.warnings) && graph.warnings.length > 0);
+  console.log(`MCP_CITATION_GRAPH=DEGRADED seed=${s2Seed} warnings=${JSON.stringify(graph.warnings)}`);
+} else {
+  assert.ok(Array.isArray(graph.edges));
+  console.log(`MCP_CITATION_GRAPH=PASS seed=${s2Seed} nodes=${graph.papers.length} edges=${graph.edges.length}`);
 }
 
 console.log("LOCAL_MCP_LIVE=PASS");

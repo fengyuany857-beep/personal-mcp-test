@@ -1,0 +1,80 @@
+name: Deploy Lattice MCP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/deploy-lattice-mcp.yml
+      - LATTICE_DEPLOY_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+      OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+      SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
+      RESEARCH_CONTACT_EMAIL: ${{ secrets.RESEARCH_CONTACT_EMAIL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Sync relay secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          test -n "$HUB_RELAY_TOKEN"
+          printf '%s' "$HUB_RELAY_TOKEN" | npx wrangler secret put HUB_RELAY_TOKEN --config wrangler.jsonc
+
+      - name: Sync OpenAlex API key
+        if: ${{ env.OPENALEX_API_KEY != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: printf '%s' "$OPENALEX_API_KEY" | npx wrangler secret put OPENALEX_API_KEY --config wrangler.jsonc
+
+      - name: Sync Semantic Scholar API key
+        if: ${{ env.SEMANTIC_SCHOLAR_API_KEY != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: printf '%s' "$SEMANTIC_SCHOLAR_API_KEY" | npx wrangler secret put SEMANTIC_SCHOLAR_API_KEY --config wrangler.jsonc
+
+      - name: Sync research contact email
+        if: ${{ env.RESEARCH_CONTACT_EMAIL != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: printf '%s' "$RESEARCH_CONTACT_EMAIL" | npx wrangler secret put CONTACT_EMAIL --config wrangler.jsonc
+
+      - name: Deploy Lattice MCP Worker
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.131.2"
+          command: deploy --config wrangler.jsonc
+
+      - name: Show deployment URL
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          test -n "$DEPLOYMENT_URL"
+          echo "LATTICE_MCP_DEPLOYMENT_URL=$DEPLOYMENT_URL"

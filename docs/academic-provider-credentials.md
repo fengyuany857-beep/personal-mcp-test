@@ -113,4 +113,4 @@ Expected verification target:
 
 The test Worker endpoint remains:
 
-https://personal-mcp-academic-test.3254849126a.workers.dev/mcp
+https://lattice-mcp-academic-test.3254849126a.workers.dev/mcp

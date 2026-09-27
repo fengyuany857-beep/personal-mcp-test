@@ -1,6 +1,6 @@
 # HDS Interlude 部署教程
 
-适用版本：`1.0.1-beta6-rebuild`
+适用版本：`1.0.1-rc24`
 
 > 写给第一次把 HDSI 接到 QQ 上、并希望角色能长期生活下去的人。
 
@@ -47,7 +47,7 @@ Koishi 第一次启动会准备运行环境，耐心等待即可。
 
 ```powershell
 cd C:\Users\你的用户名\AppData\Roaming\Koishi\Desktop\data\instances\default
-npm install --save-exact C:\路径\koishi-plugin-hds-interlude-1.0.1-beta6-rebuild.tgz
+npm install --save-exact C:\路径\koishi-plugin-hds-interlude-1.0.1-rc24.tgz
 ```
 
 安装完成后回到 Koishi Console，添加或启用 `hds-interlude`。

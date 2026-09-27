@@ -1,5 +1,290 @@
 # 版本记录
 
+## 1.0.1-rc24：播种器配置并入模型用途勾选（2026-09-27）
+
+- 世界播种器的模型选择从独立提供商配置块（worldSeeder.provider 整套表单）改为**模型中心连接行的"用于世界播种"复选框**（`useForWorldSeeding`，与 useForCompaction/useForStickers 并列）：勾选的第一个启用连接即为播种器模型，无勾选连接时总开关无效（功能关闭）。播种器分区仅保留节律参数（间隔/挂起上限/每日上限/最远时限/温度/预算/超时），Console 不再复制一份提供商表单。
+- 实现侧：`ProviderConfig` 与 ProviderAssignments 新增 `useForWorldSeeding`；`resolveWorldSeederRuntime(config, provider)` 改为接收服务侧从 `config.model.providers` 解析出的连接；`world-seeder.ts` 移除配置对象内嵌 provider 的解析。请求链不变（仍走 `narrator.customSideTask` 复用侧任务机制）。
+- rc23 的播种器独立提供商配置如有填写将随本版失效——升级后在模型中心连接行勾选"用于世界播种"即可，行为参数无需改动。
+
+## 1.0.1-rc23：世界播种器、意愿档位、全量审计修复与主提示词入口（2026-09-26）
+
+- **世界事件播种器（M1+M2）**：新增 `src/world-seeder.ts` 与 `interlude_seeded_event` 表——后台侧模型低频生成与她有关的外部事件（线下通道、NPC，注册参与者严格拉黑），经六道校验闸（时间窗/拉黑/深夜high/bigram 去重/频控）入库排期，到点以 `world-event` 条目（`[世界事件]` 前缀）注入剧本；主提示词新增 WORLD EVENTS / LITE_WORLD_EVENTS 常设块（事实权威、反应自由）。Console 新增【扩展 15】独立提供商配置块（复用主 Provider 设计，未选模型即关闭）；`narrator.customSideTask` 让独立配置块复用侧任务请求链。设计见 [WORLD_EVENT_SEEDER_DESIGN.md](WORLD_EVENT_SEEDER_DESIGN.md)。
+- **群聊意愿档位化 + auto 档**：五档预设（quiet/reserved/normal/active/eager，normal 基线约每 4~5 条普通消息一次调用）+ auto 档——压缩器附带返回 `lifeStatus: busy|asleep|idle`（无额外模型调用），三态各可配档位；asleep 态 @ 不再直通且概率 ×0.2；旧数值门自动按 custom 兼容。见 [GROUP_WILLINGNESS_TIERS.md](GROUP_WILLINGNESS_TIERS.md)。
+- **全量审计修复（7 项）**：Fix#10 守卫回归（committed 标志移到持久化成功后）；群消息桥接重放去重（与私聊对齐）；用户回合成功后取消遗留 narrative-retry（杜绝重复回复）；due 路径参与者状态检查 + 暂停不再反向排重试；due 批次失败整批退避一个扫描周期（无界烧 token 防线）；空白 delayed content 丢弃消息事件而非拒绝整个 commit；Anthropic SSE 坏帧容错。
+- **Console 主提示词入口**：配置页最底部新增主提示词编辑框（留空=内置默认，⚠️ 警示非必要不修改）；模型中心旧字段隐藏但保留旧配置兼容。
+- 测试：新增 world-seeder（6）、group-willingness-tiers（8）、audit-regression（2）、typing-floor（3）、repetition-guard（8）、participantless-interaction（4）、turn-engine（5）。主仓 402 通过 / cev 393 通过。
+
+## 1.0.1-rc22：群聊 interaction 形态回复容错（2026-09-24）
+
+- 修复 rc19 起的群聊主叙事整回合失败（`ScriptCommit structural validation failed: message event … has no participant` → 保持静默）：简洁传输协议把 interaction 形态写在最前，gemini-3-flash 等弱模型在群聊回合常照抄私聊形态返回 `interaction.reply` 而非顶层 `groupReply`；commit-builder 会为这个无 participant 的回复生成 `outgoing-message` 事件，结构校验拒绝整个提交。旧提示词强推 groupReply，故此前从未触发。
+- 新增 `hoistParticipantlessInteraction`：无 participant 回合统一容错——群聊回合（user-message 且无 participant）把 immediate 的 interaction 回复提升为 `groupReply` 参与提交与投递（replyTo 一并保留）；delayed 与其余无 participant 相位（advance 等本无回复通道）的携带内容 interaction 一律剥离并记录日志。既有 groupReply 优先，不被回退覆盖。
+- 新增 `participantless-interaction.test.ts` 4 用例：提升、既有 groupReply 优先、delayed/advance 剥离、interaction-only 群聊提交通过结构校验且只产生 group-message 事件。
+
+## 1.0.1-rc21：首条发言打字时间下限（2026-09-24）
+
+- 私聊对话回合（含流式早发路径）为首条消息增加打字时间下限：以叙事请求发起时刻为基准，模型耗时不足 `typingDelay(首条字数)`（沿用既有 typingBaseDelay/CharactersPerSecond/MaxDelay/Jitter 参数与后续分段同一算法）时补足等待后再发送首条；耗时已超过则立即发送。
+- 实现位于 `sendOutgoingMessages` 新增可选 `requestStartedAt` 参数：仅对当前对话参与者的首条生效、每次调用至多应用一次；等待期间到达的新用户消息仍可经 shouldCancel 打断。拆条后续分段、定时意图（delayed sendAt）、跨参与者/跨群与推进回合消息不接管——它们已有各自的时间语义。
+- 防御：elapsed 以 0 为下限，起点时间戳异常（时钟偏差）不会反向放大等待；新增 `typing-floor.test.ts` 3 用例（补足等待、慢返回立即发、maxDelay 截断与防御边界）。
+
+## 1.0.1-rc20：严谨性清理 P0/P1（2026-09-24）
+
+- 死代码删除（全仓零引用 5 处）：`resolveBlackBoxConfig` 弃用别名、`proactiveOriginBypassesOrdinaryInterval`、`alterAnalysisCoolingDown`、`InterludeLogFormat`、`LIVED_COLD_START_PROMPT`。
+- 命名对齐现状（行为零变化）：`scriptFirstTransportInstruction`→`transportInstruction`（doc 注释重写为现行 JSON 协议描述）、`resolveAuthoredActions`→`reconcileTransportReferences`、`findOutgoingScriptEvent`→`findPrivateOutgoingMessageEvent`（名实相符：仅匹配私聊投递事件）、`normalizeVisibleMessageContent`→`sanitizeAndClampVisibleContent`（名实相符：有损过滤+截断）。
+- 传输协议句去重：`LITE_TRANSPORT_BODY` 并入 `CONTENT_ONLY_TRANSPORT`，lite/standard 组装共用同一常量（lite 档措辞获得 "separate" 一词，无行为影响）。
+- Console 特化档位描述修正：full 档不再声称 "say 锚点协议"（该协议已在 rc16 移除）。
+- TurnEngine 回流主仓：`turn-engine.ts`（缓冲回合容器 + narrating 标记）自主仓 service.ts 抽出、与 cev 对齐；`shouldSupersedeNarrativeRequest` 委托单一实现；`clearDatabase` 的 `(this as any).turnEngine?.turns ?? bufferedNarrativeTurns` 双形态探测改为类型化单路径；新增 turn-engine.test.ts（5 用例）。主仓测试 383 项全绿。
+- 打包防线：新增 `scripts/ensure-fresh-bundle.mjs` 并接入 `prepack`——lib/index.js 落后于 src 时拒绝 `npm pack`，杜绝 rc16/rc17 式旧 bundle 空版本。
+
+## 1.0.1-rc19：守卫默认值收紧与桌面实例部署修复（2026-09-23）
+
+- REPETITION GUARD 段结尾追加 "When unsure, make this reply a single bubble."：弱模型对"单句/碎片/长块三选一"执行差，给出单一明确默认值。
+- 修正部署目标：确认实际运行的 Koishi Desktop 实例位于 `AppData/Roaming/Koishi/Desktop/data/instances/default`，以 `corepack yarn add file:…tgz --exact` 安装 rc19 与 cev.13；此前 rc16~rc18 误装入 typ-0 开发壳与 dev workspace，从未到达该实例。
+
+## 1.0.1-rc18：连发同条数守卫与构建链修复（2026-09-23）
+
+- 新增 Repetition Guard：`detectMessageRepetition` 对 recentScript 倒序归批统计她每批回复的气泡数（批次首领的投递元数据 `bubbleIndex/bubbleCount` 为权威，无元数据条目回退为连续 `character-message` 归批、被其他条目类型截断）。尾部连续 ≥2 批同为 x 条（x≥2）时判定为条数锚定。
+- 命中时仅在私聊对话回合（user-message / conversation-follow-up）通过 `writingOptions.messageRepetition` 注入英文守卫段（渲染于 `writingAffordances` 尾部，full/standard/lite 三档均生效）；advance 推进回合与群聊不注入，x=1（单条习惯）不触发。
+- 新增 `test/repetition-guard.test.ts` 8 项用例（元数据归批、typing 中途批次、无元数据回退、断续不触发、弱信号拒绝、双档渲染）。
+- 构建链修复：插件 tsconfig 为 `emitDeclarationOnly`，`tsc` 只更新 `.d.ts`；可执行 bundle 必须用 `yakumo build`（esbuild）。**rc16/rc17 打包时未跑 yakumo，tarball 内 `lib/index.js` 仍是 rc15 旧代码，两版全部变更实际自 rc18 起才进入可执行包**。打包流程固定为 `yakumo build` → `npm pack`。
+
+## 1.0.1-rc17：气泡分隔符负向规则（2026-09-23）
+
+- 针对弱模型"换行不换条"复发：`LITE_TRANSPORT_BODY`、`CONTENT_ONLY_TRANSPORT`、full 档私聊协议行三处追加 "Line breaks never separate bubbles; only `<sep/>` does."——直接写在弱模型照抄的协议行位置，同时中和其自身历史中换行模板的锚定。
+- 因上述构建链问题，本版 tarball 未实际包含该变更（自 rc18 生效）。
+
+## 1.0.1-rc16：传输协议回退 0.1.x 简洁形态（2026-09-23）
+
+- `scriptFirstTransportInstruction` 非流式分支整体替换为 0.1.1 的简单协议定义（"When interaction is permitted, its shape is {…}"），移除 SCRIPT-FIRST 镜像教学中诱发条数锚定的 `<say>` 标记教学与逐字镜像措辞；流式分支保留镜像（既有 opt-in 路径）。
+- `clearDatabase` 增加 30 秒在途屏障：等待进行中的模型回合落库后再清库，修复"清库重载后仍记得旧对话"的竞态（在途回合把旧上下文写进新库）。
+- 清理 `scriptFirstTransportInstruction` 死代码（`separator`/`bubbleRule` 残留）及随之失效的 `writingOptions` 参数与两处调用点。
+- cev 仓同步修复 `beta6-handoff` 测试（dbSet mock 表名未加 `cev_` 前缀导致误报）。
+- 因构建链问题，本版 tarball 未实际包含上述变更（自 rc18 生效）。
+
+## 1.0.1-rc15：Gemini 兼容与提示词中性化（2026-09-23）
+
+- `normalizeInteraction` 宽容化：`reply.mode` 为 `"text"`/`"send"`/`"reply"` 或缺失但带 content 时按 immediate 处理，修复 Gemini Flash 特化块下高频无回复/回复格式错误循环。
+- 私聊协议行补充 mode 枚举约束（"must be exactly none/immediate/delayed — never text, send…"）。
+- 提示词措辞向 0.1.1-beta6 中性口径靠拢，去除单侧偏向表述；`TYPED_MESSAGES` 精简至约 300 字符并加入反锚定句（"Each reply is an independent choice — the number of messages in previous replies does not constrain this one"）。
+
+## 1.0.1-rc14：模型特化合约（2026-09-23）
+
+- 新增 `specialization.ts`：三档合约（lite/standard/full）与家族特化块（gemini-flash/gemini/claude/gpt/glm/kimi/deepseek/grok/generic）。
+- Console 新增 `specialization` / `specializationFamily` 配置；auto 档按模型名推断（flash/lite/mini → lite；claude/gpt → full；已知家族 → standard；未识别保守回退 full），`off` 保持 rc12 原样（full+generic 字节一致）。
+- 家族块仅做最小偏移：长度块/打字块替换 + 至多一条新增行；lite 档为 15 块核心合约（`LITE_*` 系列），standard 档非流式使用 content-only 协议块。
+- 新增 `interlude.reset` 命令，并与清库指令的描述明确区分。
+
+### 同期 cev 分支参考（cev.1 ~ cev.13）
+
+主线的 rc14~rc19 期间，cev 实验分支（`koishi-plugin-hds-interlude-cev`，表前缀 `cev_`）并行演进：共创作系统（works，版本化提案 + 异步生成）、TurnEngine P0 抽取（缓冲回合/请求取代从 service.ts 拆出为闭包工厂）、用户侧人格档案演化（compaction 期 userProfilePatch 追加至 profileOverlay）、环境实感注入（open-meteo 天气，30 分钟缓存 + 地理编码 24h 缓存）、语义分析桥命令（emotion×scene、事实图谱 PCA、叙事连贯度、压缩健康度，供桌面端分析面板调用）。以上模块仅存在于 cev 仓。
+
+## 未发布：功能合作边界修复（2026-09-17）
+
+- 群聊在首个异步等待前占用共享写作标记并保证释放；捕获当前批次会话，避免后续消息改变正在生成回合的发送通道。
+- 群聊回合提交后的跨会话消息接入现有共享投递器；本群 groupReply 仍走原专用路径，不重复发送。
+- 群聊 currentEvent 补齐当前批次内容和原生附件数量，两种 payload 顺序一致。
+- 群聊提交时检查缓冲对象是否已被清空/替换，防止在途旧草稿复活；清理时不误删新的缓冲。
+- 类型检查通过，346 项测试通过、4 项跳过。未打包/部署。风险与后续大项见 [功能冲突检查](development/FUNCTION_CONFLICT_AUDIT_2026-09-17.md)。
+
+## 未发布：时间导演错误分类与独立冷却（2026-09-17）
+
+- 请求超时/网络异常保留原始错误，交由服务层统一记录及计数；不再转换成空返回后误报“不是 JSON 对象”。已收到文本但 JSON 无法解析时单独标记解析失败；账本节点校验仍沿用原规则。
+- 导演重试冷却改为按服务健康状态判断，不随剧本游标前移而清除；不再阻止主叙事调度，也不修改 `nextAdvanceAt`。失败时仍允许主叙事无账本推进。
+- 冷却时间与失败计数随故事状态保存，重载后可恢复；成功后清除并保存故障状态。新增可选状态字段使用防御性归一，旧数据无需迁移；保存失败时保留内存冷却。
+- 不改写提示词、不增加超时重试、不改变现有超时配置；独立超时配置及额外重试暂不引入。未打包、未部署。
+
+## 1.0.1-rc13：11 项缺陷修复（2026-09-21）
+
+- 修复旧版共享迁移在 Schedule Preplan 表上必然抛错（主键不可 update），导致 participantId 回填被跳过、隐私脱敏失效；改为读旧行→建新行→删旧行。
+- 管理员清除剧本/平台数据后同步失效历史向量缓存，语义召回不再注入已删除内容。
+- 命令识别正则支持点分子命令（`interlude.status` 等），盲区与关闭合作创作时不再把命令文本写进剧本。
+- 中文时间解析修复"八点半"（此前解析为 8:00）。
+- `<say>` 内容含边缘空白时不再丢失 immediate 回复（过滤改为精确优先、trim 容忍兜底）。
+- `narrative-retry` 意图不再被用户回合提前完成，流式恢复路径恢复正常。
+- Schedule Preplan 物化滞后时窗口不再静默变空：缺失 [今天,明天] 槽位时本地重物化。
+- 桌面时间线分页游标改为 occurredAt+id 双键（与排序一致），回填历史不再漏行；旧游标继续兼容。
+- 合并写作持久化抛错不再静默吞批：未 committed 的回合自动排一次 narrative-retry。
+- interruptedTyping 标志在取消异常后无条件清理，不再永久卡死分段投递。
+
+## 1.0.1-rc12：Anthropic Messages 与群音频写作接入（2026-09-15）
+
+- 群聊收到可提取的音频文件/语音时，绕过意愿、仅 @ 响应与群冷却，沿既有短时消息合并队列触发主叙事；原生音频随本批消息进入模型，不强制发言。音频来源及适配器会话只暂存在当前批次，不入库，不从历史反复加载。仍保留群白名单、原生音频总开关、单消息数量和文件大小限制；未载入音频会明确记录警告。Messages 本身不支持原生音频，仍需要音频兼容的 Chat Completions 提供商及故障转移配置。
+- 自定义提供商增加 `protocol`：`chat-completions`（旧配置默认）或 `anthropic-messages`；标准 `/chat/completions` 与 `/messages` 路径随选项匹配，保留中转站前缀和查询参数。官方预设仍使用其原有协议。
+- 共用原有主叙事、压缩、时间导演、预排、Overlay、Alter、图片/贴纸描述链路，转换 system、认证头、图片块和文字响应；不改写主提示词、剧本字段或投递结构。Messages 使用现有提示词 JSON 合约，不发送 OpenAI `response_format`。
+- 支持 Anthropic SSE 与既有实验首泡流程；只读取 text delta，thinking 不进入剧本；断流、错误事件与 max_tokens 截断判为未完成，累计 usage 只汇总一次。
+- `anthropicCache` 默认关闭。开启后标记 system；cache-first 额外在历史前缀结束处标记，逐字保留完整 payload。Token 输入统计包含普通输入、缓存读取及写入；当前费用估算未单列缓存写入加价。
+- 原生语音与 Embedding 不使用 Messages；原生语音会明确报告协议不支持并允许既有提供商故障转移，向量使用独立 Chat Completions/Embedding 连接。
+- 实现与验证边界见 [Anthropic 适配说明](development/ANTHROPIC_MESSAGES_RC12.md)。
+
+## 1.0.1-rc11：跨群目标交接与投递闭环修复（2026-09-15）
+
+- 主模型上下文新增 `ongoingThreads.availableGroupTargets`：仅传递当前可用群的 ID 与名称，不复制群历史。普通及 cache-first 路径均保留该字段；不扩大既有自动联系与 Agency 权限。
+- 私聊合约明确 interaction 只对应当前私聊，跨群实际行动使用独立 crossConversationActions；私聊答应不等于群发送成功，群友反应以事件与回执为据。保留群目标不明确时不猜测的边界。
+
+- 修复 `interlude.timeline` / `interlude.script` 将历史原文作为消息元素重新解析的问题；改为纯文本展示，历史 @、图片等不会成为新的平台动作。日志中 15:26:47 的私聊 1400 错误来自含 @ 元素的历史展示请求；同时段主叙事超时是另一类故障。
+- 移除独立 `groupMessages` 临时投递数组，跨群行动复用通用待投递队列，避免后台推进丢弃群消息。群目标在传输处分流，不走私聊参与者查找或私聊 session.send。
+- 跨群消息保留原始剧本事件引用，逐段写入投递结果，只将实际成功段记为群发言；发送前复查群白名单，跨群失败不阻断后续私聊，不自动重发不确定投递。
+- 私聊/群聊适配器返回空消息 ID 数组时不再计作成功。新增隔离投递回归，未向真实账号发送测试消息，未迁移数据库。
+
+## 1.0.1-rc10：私聊回合跨群投递（2026-09-15）
+
+- 支持在同一轮决策中同时保留当前私聊 `interaction` 和启用 QQ 群的跨会话消息。
+- 群目标使用受控的 `group:<QQ群号>` 标识，仅允许配置中启用的群；群投递失败不会影响私聊回复。
+- 重新生成 bundled 构建，确保桌面实例使用最新投递逻辑。
+
+## 1.0.1-rc9：群聊异常修复实际打包（2026-09-15）
+
+- 修复上一版源码已更新但 bundled `lib/index.js` 未重新生成的问题；rc9 安装包实际包含群聊不完整 `interaction` 结构的安全处理。
+- 同步收紧主叙事其它 `interaction.reply` 可选链读取，避免兼容结构再次触发未定义属性异常。
+
+## 1.0.1-rc8：群聊不完整回复结构兼容（2026-09-15）
+
+- 修复群聊模型返回不完整 `interaction` 对象（例如只有 `interaction:{}`，同时正常返回顶层 `groupReply`）时，后处理读取 `reply.mode` 抛异常并导致整轮静默的问题。
+- 群聊动作和可见回复归一化现在会安全忽略缺失的 `interaction.reply`，保留有效的 `groupReply`。
+
+## 1.0.1-rc7：线上视觉表达提示词（2026-09-15）
+
+- 主写作提示词补充线上表情包/视觉反应的元语言规则：根据画面、上下文、选择、时机与重复行为理解态度和信息状态，不把表情停留在字面图像描述。
+
+## 1.0.1-rc6：QQ 合并转发读取（2026-09-14）
+
+- 私聊与群聊识别 QQ `forward` segment，并通过 SnowLuma `get_forward_msg` 读取节点正文。
+- 支持文本、@、回复、图片/语音/视频/文件占位及嵌套转发；节点数、字符数和嵌套深度均有预算。
+- 转发读取失败时保留明确占位，不影响普通文本、图片和语音消息路径；新增阶段 1/2 回归测试。
+
+## 1.0.1-rc5：线上打字表达参照（2026-09-14）
+
+- 主写作提示词加入面向作者的简短英文 `WRITING BELIEVABLE TYPED MESSAGES`：指导作者描写人物真实的线上文字表达，区分打字与当面说话，以共同语境、用词和发送分条承担表意；热情不等于冗长，思考时间不等于发送长度。
+- 仅引导实际发送文字，不压缩剧本文字，不增加二次改写、字数硬限制或固定分条；保留原有剧本、感知、消息事件与投递合约。
+- 增加私聊、自动推进与群聊提示词覆盖回归；对话拟真效果仍需实机观察。
+
+## 1.0.1-rc4：rc3 审计六项修复（2026-09-13）
+
+1. **P0 补充事实 lastSeenAt**：创建时补填 `lastSeenAt`；`factScore` 排序对空值回退（updatedAt→createdAt）；创建故事后回填 rc2/rc3 已写入的空时间记录。此前检索排序会因 `fact.lastSeenAt.getTime()` 空值直接崩溃——普通对话可能报错。
+2. **P1 proactive-check Commit 闭环**：intent-due/proactive-check 相位的 interaction 合成前移到 `decisionToScriptCommit` 之前（与 advance 的合成预检对称），commit-builder 为合成消息生成完整事件绑定。此前 proactive-check 分支的合成消息仍不进投递账本。
+3. **P1 admin-note 预算上限**：保护改为最多 3 条最新注记、每条截断至 2,000 字、总占预算 ≤6,000 字（或预算 50%）；超限注记保留前缀+截断标记而非完整保留。确保原始剧本始终有 ≥50% 预算——两条 7K 注记不再把最新剧本挤出窗口。
+4. **P2 侧端健康上报真正接通**：`onSideTaskHealth` 调用移到 `sideTaskJson` 内部（不依赖调用方改用新入口）；reporter 注册移到 narrator/compactor 创建之后（此前 `this.narrator` 尚未创建导致条件分支不执行）；参数签名修正为 `(task, ok)`；narrator 和 compactor 均注册（此前只覆盖 narrator）。
+5. **P2 主动联系计数移到投递结果后**：删除入列时的 `recordProactive(true)`，改用 `pendingProactiveCount` + `sendOutgoingMessages` 返回后按 `delivered.length > 0` 计数——加入数组不等于发送成功。
+6. **P3 幻觉检测拓宽 + Token 归属**：模型行为测试新增"编造第三方发言"检查（`X说/X问/X回复` 但 X 不在已知消息中）；`lastActiveStoryId` 文档标注初始化时机。
+- 312 项回归；严格类型检查通过。
+
+## 1.0.1-rc3：管理员注记语义修复（2026-09-13）
+
+- 修复 `interlude.script.note` 对模型无实际效果的问题。**不是 rc2 回归**——从 0.1.5 起就存在的功能不完整：admin-note 数据链路（写入→recentEntries→recentScript→模型可见）一直通畅，但主提示词从未说明 `[管理员注记]` 的语义权重，模型只把它当作普通 system-event 忽略。
+- **主提示词新增 ADMIN NOTES 指令**：`[管理员注记]` 条目是管理员注入的权威事实/指令，权重高于普通系统事件，在其所述主题上覆盖叙事即兴，主角已内化（不需要看到或提及注记本身）。
+- **compactPromptEntries 保护 admin-note 不截断**：admin-note kind 加入受保护集合，即使超出字符预算也保留完整内容——截断半句管理员指导比丢弃更危险。
+- 312 项回归（含 admin-note 语义断言 + 截断保护测试）；严格类型检查通过。
+
+## 1.0.1-rc2：社区审计七项修复（2026-09-12）
+
+社区逐项审计发现的全部确认 bug 修复（详见验证报告）：
+
+1. **补充事实入库修复**：去掉字符串 ID（改用自增主键）、补 `status:'active'`、`knowledge.mode` 改为合法的 `'confirmed'`、`.catch(()=>undefined)` 改为有日志的 catch——创建失败不再静默。
+2. **合成主动联系多行动保守**：`synthesizeCrossActionFromScript` 在 `authoredActions.length !== 1` 时返回 undefined——多行动无法确定接收者归属，不猜"最后一条"；单行动无歧义照常合成。
+3. **合成行动前移到 Commit 构建前**：advance 相位在 `decisionToScriptCommit` 之前做合成预检，把合成的 crossConversationAction 注入 decision，让 commit-builder 正常生成 outgoing-message 事件和投递账本绑定。此前合成发生在 Commit 后导致账本缺记录（deliveryReality 下一轮报 no-outgoing-action-recorded）。
+4. **群聊空行转换加拆条开关**：`normalizeGroupVisibleReply` 增加 `splitEnabled` 参数（默认 true），关闭拆条时不再改写空行——保持原始段落格式。
+5. **健康指标修正**：`recordStructureMissing` 在首稿计数、`recordRecoverySaved` 在恢复稿通过后才计数（拆分此前混在一起的 else-if 分支）；侧端任务 `recordSideTask` 通过 narrator 健康报告器接线；主动联系 `recordProactive` 在 crossActions 投递点接线；`test:model` 命令加入 package.json scripts。
+6. **模型行为测试改生产提示词**：`makeSystemPrompt` 改为调用生产 `systemPrompt()` 函数（全参数）；气泡断言改为"不应恒定同一非零值"（允许全单条/全沉默）；幻觉检测改为只查"未被提供的电话号码"（不再误判正常描写当前消息到达）。
+7. **Schema 默认值对齐**：`contextEntryLimit` 50→35、`contextTimeWindowMinutes` 60→45，与服务层 fallback 一致（消除 Schema 50 覆盖服务层 35 的不一致）。
+- 311 项回归（4 项模型行为待真实 API）；严格类型检查通过。
+
+## 1.0.1-rc1：稳定性基建——模型行为回归测试 + 健康面板（2026-09-12，预发布）
+
+- **P0 模型行为回归测试**（`test/model-behavior.test.ts`）：用真实模型 API 跑固定合成场景，断言传输层契约（interaction 字段完整性、群聊 groupReply 存在性、气泡段数分布、无自造消息）。需设 `HDSI_TEST_*` 环境变量，未设时自动跳过。每次发布前跑 `npm run test:model`。
+- **P3 健康诊断面板**（`src/health.ts` + `interlude.status` 命令增强）：内存滚动指标——主叙事成功率、结构化回复缺失/挽回次数、回复模式分布（immediate/none/delayed/无投递）、前缀缓存命中率、中位延迟。重载后归零（since 时间戳标注）。在 `interlude.status` 输出尾部追加健康段。
+- **P1 群聊协议 content-only**：确认已在 beta8-9 中实现（群协议行零 actionId 教学），本轮验证后无改动。
+- **P2 跨会话归一化**：确认已在 beta4 中实现（normalizeConversationAction 走 normalizeVisibleMessageContent），本轮验证后无改动。
+- 稳定性路线图文档：`docs/plans/2026-09-12-stability-roadmap.md`。
+- 311 项回归（4 项模型行为测试待真实 API 环境）；严格类型检查通过。
+
+## 1.0.1-beta16-tuned：多条视角与补充事实（2026-09-12）
+
+- **storyDefaults.perspectives**：新增多条独立主角视角/价值观（`string[]`，最多 12 条，每条 ≤800 字符）。与单条 `perspective` 并存：`perspective` 是总述，`perspectives` 是多条独立条目，进入提示词时保持数组形态不合并，提示词明确说明它们同等权威且可以互相矛盾。已有故事的 `perspective` 字段不受影响。
+- **storyDefaults.supplementaryFacts**：新增补充事实栏（`string[]`，最多 20 条，每条 ≤800 字符），用于注入界限不明显的世界/人物/关系复杂事实。创建故事时自动写入初始长期事实（`interlude_fact`），scope 按内容推断（人物→character、关系→relationship、其余→world），importance 0.6 / confidence 0.95（配置的既定事实）。
+- Console 配置项在【必填 1】故事档案内新增 `perspectives` 和 `supplementaryFacts` 两个数组字段。
+- 307 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta15-ostt：主动联系传输合成修复（2026-09-12）
+
+- 修复主动联系全链路断裂：模型输出 `proactiveContact(send-now)` 且 Agency 判断通过（willingness 0.90、capacity-available），但不返回 `crossConversationActions` 行动字段——消息发不出去（实测 471 次 Urge 调度 0 次主动联系的根因）。
+- **advance 相位合成**：Agency 通过且 crossActions 为空时，从剧本的 `<say>` 行动中提取实际消息内容构造合成 crossConversationAction——剧本里写了她发什么，宿主补上传输信封，绝不发明剧本里没有的词。
+- **proactive-check 相位对称修复**：Agency 通过但模型没输出 `interaction.reply` 时，同样从剧本 say 行动合成——与私聊 beta9 的 content-only 契约同思路："写了就发，不要求模型再填一个字段"。
+- 合成时打 standard 级日志"已从剧本 say 行动合成"便于观测。
+- 307 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta14-ostt：群聊崩溃与嵌套 groupReply 修复（2026-09-12，社区反馈）
+
+- **修复 soleActionReply 空值崩溃**（beta9 引入的回归）：`decision.interaction.reply` 为 undefined 时 `soleActionReply(undefined)` 直接读 `reply.mode` 抛 `Cannot read properties of undefined`，被 failover 当成 provider 失败重试再崩 → `All narrative providers failed`。补上 `!reply || typeof reply !== 'object'` 空值保护（兄弟函数 resolve/rescueSilentActionReference 均已有此保护，唯独此函数漏了）。
+- **修复群聊嵌套 groupReply 不识别**：部分模型（实测 Gemini 3.7 Flash 群聊 mention-only）把群回复嵌套在 `interaction.groupReply` 而不是顶层 `decision.groupReply`，导致 `hasStructuredGroupReply` 判 false → `no usable script` 整轮失败。现在 `resolveAuthoredActions` 在入口将嵌套 `interaction.groupReply` 提权到顶层（顶层已有时不覆盖）。
+- 感谢社区用户逐行定位并提供本地补丁验证（两个补丁均与官方修复方向一致）。
+- 305 项回归通过；严格类型检查通过。
+
+## 1.0.1-alphatest2：跟进意愿、主动联系动机、降级提交、预算与缓存（2026-09-12）
+
+- **跟进补写意愿引导**（conversation-follow-up 相位提示词）：刚结束的对话涉及她真正在意的——想继续吐槽、想分享、突然想补充——她此刻更愿意主动发言；不要让热络话题只因对方停手就断掉。
+- **主动联系动机放宽**（agencyInstruction separation）：她刚经历的生活本身可作为动机来源——想到对方、发生好笑的事、想继续话题、对对方在做什么的好奇都是合法的 life-grounded motive（原先只允许 life-event/promise/practical-update/relationship-follow-up，实测 471 次 Urge 调度 0 次主动联系）。
+- **结构化回复两稿均缺失时降级提交**：剧本非空则以无可见回复提交（生活继续走），不再硬失败进重试队列（弱模型下避免失败循环）。
+- **原始剧本预算缩减**：recentScript 字符预算 24,000→12,000，条目数下限 50→35，时间窗默认 60→45 分钟。预期中位输入 25k→18-20k tokens。
+- **cache-first 默认开启**：mainPayloadOrder 默认值 legacy→cache-first；已有实例需手动切换或由本次安装自动写入。
+- 303 项回归通过；严格类型检查通过。
+
+## 1.0.1-alphatest：0.1.5 写作引导旧版嵌入实验（2026-09-11）
+
+- 应用户要求做 A/B 对照实验：核心写作指导逐字替换为 0.1.5-beta3 的英文写作引导（写作基调 + 篇幅行），用户手作中文写作观快照保留于 docs/experiments/。v2 功能合约全部保留；仅装桌面实例，不作为发布版本传播。
+- 303 项回归通过；严格类型检查通过。
+
+
+## 1.0.1-beta13-ostt：用户手作连续生活写作观（2026-09-11）
+
+- 核心写作指导替换为用户手改原文（1248 字符，逐字保留），集中在 `src/script/lived-writing.ts`：承接经历而非历史句式，以当下注意与具体关系推动叙事，允许有依据的小幅偶然与未完成结尾；功能合约（相位、时间、证据、消息感知、传输镜像、Alter、Agency、Preplan、Urge 与自定义提示词入口）保持原样，不改解析器、调度、数据库与历史文本。
+- 替换原篇幅/气泡文风/冷启动写作段；取消默认短气泡和跨轮强制变形暗示，保留实际发送时刻对应分隔符的协议（协议行"单条为默认+反定式"仍在）。
+- 验证：303 项回归通过；完整提示词 19,844 字符（较 beta12 再 -5.5%）；真实模型（gemini-3-flash-preview）四场景探针 4/4 合法 immediate+content，气泡形态自然分布。完整文本与修改前快照见 `docs/experiments/2026-09-11-user-authored-writing.md` 与 `2026-09-11-lived-writing.md`。
+
+## 1.0.1-beta12-ostt：两段式定式修复（2026-09-11）
+
+- 确诊"每回合恰好两条消息"定式：24/24 回合精确 2.0 段，剧本叙述层同步固化（"敲出两行"+`<sep/>`）。机理为上下文自我模仿正反馈——输出进入可见历史后偏置下一次输出，任何稳定的每回合形态都会锁死；v2 的三个放大器：beta10 协议行新教 `<sep/>` 被弱模型过度采用、换行→分隔符转换机械制造两段、剧本对形态的双重编码（台词+叙述）。
+- 修复：协议行气泡规则改为"单条为默认，时刻真的发送两次才用分隔符，绝不固化固定段数"；节奏行新增"跨回合变化气泡数量与形态，重复的两段式是模板不是节奏"；换行转换收窄为空行（段落）边界——单个换行留在一条消息内，不再机械制造两段式。
+- 真实模型（gemini-3-flash-preview）实测四场景：气泡数 1/2/2 分布，两段均为语境合理（安慰+建议），契约 3/4 immediate+content（1 次合法沉默）。
+- 301 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta11-ostt：系统提示词保守压缩（2026-09-11）
+
+- 针对弱模型的指令负载税做保守压缩：系统提示词 23,051 → 20,819 字符（**-9.7%，约 700 tokens**），落在预期的 10-20% 区间下沿。
+- 压缩原则：只删修辞复述（同一约束的第二次措辞、装饰性从句、流式专属文本无条件出现等），全部语义约束保留——共涉及 14 条指令行（台词节奏/消息感知/剧本引导/篇幅/lifeHandoff/时间时钟/EVIDENCE/intents/timelinePlan/防虚构 incoming/未决联系/打断草稿/webContext/协议行）。
+- 真实模型（gemini-3-flash-preview + 完整压缩提示词）实测 4/4 产出合法 `immediate+content`，其中 2 次主动正确使用 `<sep/>` 分隔符。
+- 同步 6 处测试断言至压缩后措辞（语义不变）。
+- 301 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta10-ostt：气泡分隔符修复（2026-09-11）
+
+- 弱模型把多气泡间隔写成换行（而非 `<sep/>` 分隔符），导致整段作为一条多行消息发出。两层修复：
+  - 协议行（弱模型真正照抄的位置）直接教学分隔符字面量："join them inside content with the exact literal token `<sep/>` between bubbles - never line breaks"（拆条关闭时不出现该句）；
+  - 防御性转换：拆条开启（`splitReplyMessages` 未关闭）且内容未用分隔符时，非空行之间的换行归一为分隔符（私聊与群聊同合约）；已用分隔符或拆条关闭的内容不受影响。
+- 澄清分条投递身份：多气泡共用同一 outgoing-message 事件，由 `bubbleIndex/bubbleCount` 区分（delivery.ts prepareOutgoingDelivery），账本按 (事件, 段序) 记账，承诺结算等待全部气泡确认——不存在共用 ID 导致的投递失败。
+- 301 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta9-ostt：传输契约 content-only 化（弱模型实测驱动，2026-09-11）
+
+- 用真实模型（gemini-3-flash-preview）对真实完整提示词做逐句二分定位，找到两个毒点：**顶层 JSON 形状句从不点名 `interaction` 字段**（弱模型整字段丢弃的根因）；**契约中的 actionId 教学**诱发"抄引用、不写 say 标记"的自造 id 形态（`reply_20260911_01` 等，解析失败即静默丢弃）。
+- 传输契约改为 **content-only**：私聊/群协议示例即完整的 `{"mode":"immediate","content":"…"}`，用户消息相位的完整提示词中 actionId 零出现；多泡格式说明改为"reply.content 含完整分隔块"。实测同一模型：改前 4/4 自造 actionId，改后 **4/4 完美 immediate+content**。
+- 代码侧 say/actionId 解析、唯一行动兜底、矛盾救援全部保留（强模型与历史输出兼容）。
+- 顶层形状句现显式点名 `interaction (groupReply in group turns)`。
+- 300 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta8-ostt：弱模型传输合约重构（2026-09-11）
+
+- beta7 实测教训：mode=none+actionId 矛盾触发"重写→仍矛盾→硬失败"在弱模型（gemini-3-flash-preview 连续两稿同形态）下演变为整回合失败循环，比静默不发更糟。矛盾处理改为**就地救援**：actionId 锚定到剧本 say 行动则直接翻转 immediate 投递（不重写、不失败），锚定不到按合法沉默放行并留 standard 诊断。
+- 私聊协议示例改为弱模型无法弄错的单步形态：示例本身就是一个完整的 `{"seen":true,"reply":{"mode":"immediate","content":"the exact words she sends now"}}`——发送的话就在字段里，不再要求"剧本标记+字段引用"两步一致；say/actionId 引用降级为正文描述的可选优化（强模型仍可用），content 镜像声明为始终合法。
+- "剧本里写了发送就必须 immediate；沉默回合不携带 actionId 或 content"的约束保留。
+- 300 项回归通过；严格类型检查通过。
+
+## 1.0.1-beta7-ostt：弱模型传输合约修复（2026-09-11）
+
+- 修复 beta4-ostt 引入的弱模型回归：私聊协议示例从具体值 `"seen":false` 改为模板占位符 `<true|false>` 后，弱指令模型（实测 gemini-3-flash-preview）出现整字段丢弃或字面照抄——同模型对照实测：结构化回复缺失重写率从 1.7%（1.0.0 时代，5/296）升至 23%（10/44），个别恢复稿落入 `mode=none + actionId` 的自相矛盾形态，表现为「剧本里回复了、实际没发消息」。示例已恢复为可直接照抄的合法 JSON 值（1.0.0 实证形态），独立性/已读不回/content 直传等语义说明全部保留。
+- 新增矛盾检测：mode=none 却携带 actionId 的输出（合规合约里沉默从不引用发送行动）视为结构缺失，触发一次恢复重写而非放行——与合法沉默（无 actionId 的 none）严格区分。
+- OUTPUT RECOVERY 指令收束：剧本写了发送就必须 immediate，沉默回合不携带 actionId。
+- `本回合无可见回复 interaction=…` 诊断从 diagnostic 升至 standard 级，文件日志可直接看到，远程排查无需改配置。
+- 299 项回归通过；严格类型检查通过。
+
 ## 1.0.1-beta6-rebuild：Console 配置分组重组（2026-09-10）
 
 - Console 配置页按【必填 → 结构 → 节奏 → 表达 → 内在 → 扩展 → 维护】重新分组编号：必填三项（故事档案/模型中心/QQ 接入）置顶，节奏类（运行时/Urge/日程预排/时间导演/行动窗口）集中，表达/内在/扩展/维护依次排列，弃用项（chatRhythm）移至末尾隐藏；修复了旧编号 12/13 重复冲突的问题。

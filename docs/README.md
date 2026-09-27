@@ -1,6 +1,6 @@
 # HDS Interlude 文档索引
 
-当前发布基线为 `1.0.1-beta6-rebuild`。根目录 README、新手指南、配置指南和命令文档面向使用者；本目录保存当前架构、设计依据、发布增量与维护记录。判断当前行为优先阅读“当前实现”，历史报告只用于追溯，不覆盖源码与当前架构。
+当前发布基线为 `1.0.1-rc24`。根目录 README、新手指南、配置指南和命令文档面向使用者；本目录保存当前架构、设计依据、发布增量与维护记录。判断当前行为优先阅读“当前实现”，历史报告只用于追溯，不覆盖源码与当前架构。
 
 ## 当前实现
 
@@ -8,10 +8,15 @@
 - [V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md](V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md)：V2 原位迁移、当前完成度和验证门槛。
 - [V2_VS_BETA10_COMPARISON.md](V2_VS_BETA10_COMPARISON.md)：beta10 与当前 V2 架构的对照及拟真性收益。
 - [ALTER_SYSTEM.md](ALTER_SYSTEM.md)、[AGENCY_WINDOW.md](AGENCY_WINDOW.md)、[SCHEDULE_PREPLAN.md](SCHEDULE_PREPLAN.md)：当前次级系统边界。
+- [FORWARD_MESSAGE_READING_DESIGN.md](FORWARD_MESSAGE_READING_DESIGN.md)：QQ 合并转发读取现状、SnowLuma 接口依据与 HDSI 接入方案。
+- [WORLD_EVENT_SEEDER_DESIGN.md](WORLD_EVENT_SEEDER_DESIGN.md)：世界事件播种器（已随 rc23 发布；rc24 起模型选择为用途勾选）——外部事件源、事实权威/反应自由语义、生成回路与注入管线。
+- [GROUP_WILLINGNESS_TIERS.md](GROUP_WILLINGNESS_TIERS.md)：群聊意愿档位化与 auto 档（已随 rc23 发布）。
 
-## beta10 发布增量
+## 发布增量与维护记录
 
-- [CHANGELOG.md](CHANGELOG.md)：beta10 的生活剧本展开与消息感知提示词，以及此前发布记录。
+- [rc12 Anthropic Messages 适配](development/ANTHROPIC_MESSAGES_RC12.md)：双协议选择、cache-first、流式、群音频写作与兼容边界。
+
+- [CHANGELOG.md](CHANGELOG.md)：rc12 双协议与群音频接入，以及此前发布记录。
 - [EVENT_LED_SCRIPT_REPAIR.md](development/EVENT_LED_SCRIPT_REPAIR.md)：事件优先续写、Alter 收束与关系学习证据边界。
 
 - [URGE_SYSTEM_PROPOSAL.md](development/URGE_SYSTEM_PROPOSAL.md)：可选 Urge 自动推进设计；源码已实现，默认关闭。

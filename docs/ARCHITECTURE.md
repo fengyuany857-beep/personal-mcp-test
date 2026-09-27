@@ -1,6 +1,6 @@
 # 当前架构
 
-适用版本：`1.0.1-beta6-rebuild`
+适用版本：`1.0.1-rc24`
 
 当前增量：事实/工作细节使用 knowledge 保存认知主体、证据角色与条件来源；contactThreads 给主叙事和时间导演提供同事项原始联系链。派生记录、主角相信的事与实际沟通结果分开解释，原文不裁写为第二份剧本。发送端将同一动作的完整分隔块映射至原有逐段回执链。详见 [实现报告](development/BETA6_EVIDENCE_DELIVERY_REPAIR.md)。
 
@@ -97,4 +97,4 @@ Perspective 是独立于 Canon 的外壳人格层，基础文本与 overlay 分�
 
 Schedule Preplan 使用独立的单行表，避免频繁故事状态写入覆盖日程。它与场景压缩共用模型；没有新证据且覆盖充足时由程序直接完成每日检查。
 
-实时 recentScript 使用“条目下限 + 时间窗口”并集。默认至少读取 20 条，同时保留最近 60 分钟内的真实收发消息；较长 narrator prose 仍受字符预算约束。Fact 检索为最近 resolved event 与 unresolved promise 分别保留固定通道，防止开放事项把刚完成的重要事件挤出上下文。
+实时 recentScript 使用“条目下限 + 时间窗口”并集。默认至少读取 35 条，同时保留最近 45 分钟内的真实收发消息；较长 narrator prose 仍受字符预算约束。Fact 检索为最近 resolved event 与 unresolved promise 分别保留固定通道，防止开放事项把刚完成的重要事件挤出上下文。

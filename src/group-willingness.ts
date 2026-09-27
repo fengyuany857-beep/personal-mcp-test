@@ -22,7 +22,7 @@ export interface GroupWillingnessState {
   updatedAt: number
 }
 
-export type GroupWillingnessReason = 'disabled' | 'forced-mention' | 'below-threshold' | 'probability-roll'
+export type GroupWillingnessReason = 'disabled' | 'forced-mention' | 'below-threshold' | 'probability-roll' | 'asleep'
 
 export interface GroupWillingnessDecision {
   state: GroupWillingnessState
@@ -98,4 +98,147 @@ function decay(previous: GroupWillingnessState | undefined, config: GroupWilling
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
+}
+
+// ── 档位化（preset）：数值参数收进预设表，Console 只选档位 ──────────────────
+
+export type WillingnessTier = 'quiet' | 'reserved' | 'normal' | 'active' | 'eager'
+export type WillingnessPreset = 'off' | WillingnessTier | 'auto' | 'custom'
+export type LifeStatusValue = 'busy' | 'asleep' | 'idle'
+
+/** 档位参数表。基线：normal 约每 4~5 条普通群消息触发一次模型调用
+ * （单条批次连续到达、随机数公平时的期望值；密集批次会更快）。 */
+export const WILLINGNESS_TIERS: Record<WillingnessTier, GroupWillingnessConfig> = {
+  quiet: { enabled: true, maxScore: 2, threshold: 0.80, probabilityAmplifier: 1.1, decayHalfLifeSeconds: 150, replyCost: 0.85, baseGain: 0.12, quoteGain: 0.08, keywordGain: 0.12, keywords: [] },
+  reserved: { enabled: true, maxScore: 2, threshold: 0.75, probabilityAmplifier: 1.25, decayHalfLifeSeconds: 200, replyCost: 0.85, baseGain: 0.17, quoteGain: 0.12, keywordGain: 0.16, keywords: [] },
+  normal: { enabled: true, maxScore: 2, threshold: 0.62, probabilityAmplifier: 1.4, decayHalfLifeSeconds: 240, replyCost: 0.80, baseGain: 0.25, quoteGain: 0.15, keywordGain: 0.20, keywords: [] },
+  active: { enabled: true, maxScore: 2, threshold: 0.30, probabilityAmplifier: 1.6, decayHalfLifeSeconds: 300, replyCost: 0.60, baseGain: 0.34, quoteGain: 0.20, keywordGain: 0.25, keywords: [] },
+  eager: { enabled: true, maxScore: 2, threshold: 0.10, probabilityAmplifier: 1.8, decayHalfLifeSeconds: 360, replyCost: 0.50, baseGain: 0.45, quoteGain: 0.28, keywordGain: 0.30, keywords: [] },
+}
+
+export interface AutoWillingnessConfig {
+  busy: WillingnessTier
+  idle: WillingnessTier
+  asleep: WillingnessTier
+}
+
+export const DEFAULT_AUTO_WILLINGNESS: AutoWillingnessConfig = { busy: 'quiet', idle: 'active', asleep: 'quiet' }
+
+/** 睡眠态安全余量：概率乘数（对压缩器状态过期/误判的兜底）。 */
+export const ASLEEP_PROBABILITY_MULTIPLIER = 0.2
+
+/** lifeStatus 超过该时长未刷新时，auto 档回退 normal。 */
+export const LIFE_STATUS_STALE_MS = 6 * 60 * 60 * 1_000
+
+export function normalizeLifeStatusDraft(value: unknown): LifeStatusValue | undefined {
+  return value === 'busy' || value === 'asleep' || value === 'idle' ? value : undefined
+}
+
+function normalizeTier(value: unknown): WillingnessTier | undefined {
+  return value === 'quiet' || value === 'reserved' || value === 'normal' || value === 'active' || value === 'eager' ? value : undefined
+}
+
+export function resolveAutoWillingness(value: unknown): AutoWillingnessConfig {
+  const record = !!value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  return {
+    busy: normalizeTier(record.busy) ?? DEFAULT_AUTO_WILLINGNESS.busy,
+    idle: normalizeTier(record.idle) ?? DEFAULT_AUTO_WILLINGNESS.idle,
+    asleep: normalizeTier(record.asleep) ?? DEFAULT_AUTO_WILLINGNESS.asleep,
+  }
+}
+
+export interface WillingnessGateDiagnosis {
+  preset: WillingnessPreset
+  tier?: WillingnessTier
+  /** auto 档命中的生活状态；缺失或过期回退 normal 时无。 */
+  lifeStatus?: LifeStatusValue
+  /** lifeStatus 存在但已过期或无效（已回退 normal）。 */
+  stale?: boolean
+  asleep: boolean
+}
+
+interface ResolvedWillingnessLayers {
+  preset: WillingnessPreset
+  /** off/custom 用旧数值参数；tier 用档位表（keywords 恒取旧配置——内容维度与档位正交）。 */
+  config: Partial<GroupWillingnessConfig>
+  diagnosis: WillingnessGateDiagnosis
+}
+
+function resolveWillingnessLayers(
+  preset: unknown,
+  autoInput: unknown,
+  lifeStatus: { status: unknown, updatedAt: string } | undefined,
+  now: number,
+  legacyInput: Partial<GroupWillingnessConfig> | undefined,
+): ResolvedWillingnessLayers {
+  const rawPreset = typeof preset === 'string' ? preset : ''
+  const legacyEnabled = legacyInput?.enabled === true
+  // 兼容：未设置档位（或显式 off）但旧数值门已启用 → 按存量数值继续（custom）。
+  const resolved = legacyEnabled && (rawPreset === '' || rawPreset === 'off')
+    ? 'custom' as const
+    : rawPreset === 'quiet' || rawPreset === 'reserved' || rawPreset === 'normal' || rawPreset === 'active' || rawPreset === 'eager' || rawPreset === 'auto' || rawPreset === 'custom'
+      ? rawPreset
+      : 'off' as const
+  const diagnosis: WillingnessGateDiagnosis = { preset: resolved, asleep: false }
+  if (resolved === 'off' || resolved === 'custom') {
+    return { preset: resolved, config: resolved === 'off' ? { ...legacyInput, enabled: false } : legacyInput ?? {}, diagnosis }
+  }
+  let tier: WillingnessTier
+  if (resolved === 'auto') {
+    const status = lifeStatus ? normalizeLifeStatusDraft(lifeStatus.status) : undefined
+    const updatedAt = lifeStatus ? Date.parse(lifeStatus.updatedAt) : Number.NaN
+    if (!status || !Number.isFinite(updatedAt) || now - updatedAt > LIFE_STATUS_STALE_MS) {
+      tier = 'normal'
+      if (lifeStatus) diagnosis.stale = true
+    } else {
+      tier = resolveAutoWillingness(autoInput)[status]
+      diagnosis.lifeStatus = status
+      diagnosis.asleep = status === 'asleep'
+    }
+  } else {
+    tier = resolved
+  }
+  diagnosis.tier = tier
+  return { preset: resolved, config: { ...WILLINGNESS_TIERS[tier], keywords: legacyInput?.keywords ?? [] }, diagnosis }
+}
+
+export interface WillingnessGateDecision extends GroupWillingnessDecision {
+  diagnosis: WillingnessGateDiagnosis
+}
+
+/** 档位统一评估门：按 preset 解析参数后走核心打分。auto 档按压缩器写入的
+ * lifeStatus 切换档位（三态各可配档位）；asleep 态概率 ×0.2 且 @ 不再直通
+ * （她在睡觉，主模型会写她没看手机）。旧配置兼容：preset 为 off 但旧数值门
+ * enabled=true 时按 custom 处理，存量行为不变。 */
+export function evaluateWillingnessGate(
+  previous: GroupWillingnessState | undefined,
+  preset: unknown,
+  autoInput: unknown,
+  lifeStatus: { status: unknown, updatedAt: string } | undefined,
+  legacyInput: Partial<GroupWillingnessConfig> | undefined,
+  input: { now: number, messageCount: number, content: string, quotedBot: boolean, mentionedBot: boolean, random?: number },
+): WillingnessGateDecision {
+  const layers = resolveWillingnessLayers(preset, autoInput, lifeStatus, input.now, legacyInput)
+  if (layers.diagnosis.asleep) {
+    // 概率乘数独立于档位：先取未乘的概率（random=1 阻断核心掷骰），再手动掷。
+    const base = evaluateGroupWillingness(previous, layers.config, { ...input, mentionedBot: false, random: 1 })
+    const probability = clamp(base.probability * ASLEEP_PROBABILITY_MULTIPLIER, 0, 1)
+    const shouldCall = (input.random ?? Math.random()) < probability
+    return { state: base.state, shouldCall, probability, reason: shouldCall ? 'probability-roll' : 'asleep', diagnosis: layers.diagnosis }
+  }
+  const decision = evaluateGroupWillingness(previous, layers.config, input)
+  return { ...decision, diagnosis: layers.diagnosis }
+}
+
+/** 她在群内成功发言后的意愿扣减，与评估门使用同一档位解析（replyCost 对齐）。 */
+export function consumeWillingnessGate(
+  previous: GroupWillingnessState | undefined,
+  preset: unknown,
+  autoInput: unknown,
+  lifeStatus: { status: unknown, updatedAt: string } | undefined,
+  legacyInput: Partial<GroupWillingnessConfig> | undefined,
+  now: number,
+): GroupWillingnessState {
+  const layers = resolveWillingnessLayers(preset, autoInput, lifeStatus, now, legacyInput)
+  return consumeGroupWillingness(previous, layers.config, now)
 }

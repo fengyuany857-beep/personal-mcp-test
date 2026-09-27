@@ -1,6 +1,6 @@
 # HDS Interlude 高度剧本化架构重设计
 
-状态：历史目标架构提案，已分阶段实施；并非所有目标均已验收。当前 `1.0.0-beta16` 的实际边界以 [当前架构](ARCHITECTURE.md)、[V2 实施表](V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md)、[更新记录](CHANGELOG.md) 和 [beta7 证据关系与分段修复报告](development/BETA6_EVIDENCE_DELIVERY_REPAIR.md) 为准。  
+状态：历史目标架构提案，已分阶段实施；并非所有目标均已验收。当前 `1.0.1-rc6` 的实际边界以 [当前架构](ARCHITECTURE.md)、[V2 实施表](V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md)、[更新记录](CHANGELOG.md) 和 [beta7 证据关系与分段修复报告](development/BETA6_EVIDENCE_DELIVERY_REPAIR.md) 为准。  
 基线版本：`0.1.5-beta10-foresight`  
 目标：在不削弱 HDSI 剧本中心思想的前提下，解决当前真实感提升不明显、功能链路失效、状态学习停滞和主提示词负担过重的问题。
 

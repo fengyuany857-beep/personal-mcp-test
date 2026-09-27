@@ -6,7 +6,7 @@
 
 HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
-当前版本：`1.0.1-beta6-rebuild`。高度剧本化核心与完整原文保持不变：正文行动引用连接实际发言，时间导演只提供窗口建议，原文引用交接当前生活。beta14 修复 OneBot 账号过滤默认值：未配置时不再被空默认白名单拒收全部私聊（typ-0 桌面剧本实测发现）；启用过滤仍须显式配置白名单；其余行为不变。详见 [更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
+当前版本：`1.0.1-rc24`（11 项缺陷修复：迁移/压缩缓存/命令识别/时间解析/协议救援/日程窗口/分页游标/失败重试等；见 [更新记录](docs/CHANGELOG.md)）。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
 
 ## 文档导航
 
@@ -15,6 +15,7 @@ HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙�
 - 逐项配置说明：[CONFIGURATION_GUIDE.md](CONFIGURATION_GUIDE.md)
 - 管理员命令：[command.md](command.md)
 - 当前架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- QQ 合并转发读取设计：[docs/FORWARD_MESSAGE_READING_DESIGN.md](docs/FORWARD_MESSAGE_READING_DESIGN.md)
 - Alter System 设计与运行规则：[docs/ALTER_SYSTEM.md](docs/ALTER_SYSTEM.md)
 - Agency Window 设计与运行规则：[docs/AGENCY_WINDOW.md](docs/AGENCY_WINDOW.md)
 - Schedule Preplan 近期日程层：[docs/SCHEDULE_PREPLAN.md](docs/SCHEDULE_PREPLAN.md)
@@ -126,7 +127,7 @@ flowchart TD
 
 ### 主叙事 payload 顺序与前缀缓存
 
-`model.mainPayloadOrder=cache-first` 会把用户 payload 的对话历史与低频记忆层前置、每轮变化字段（当前事件、时钟、状态）后置。对支持自动前缀缓存的服务商（DeepSeek、GLM、Kimi 等），连续对话轮可以命中长长的稳定前缀，输入成本与 prefill 延迟显著下降；payload 末尾附带 `recentExchange` 最近交换块，把最后几条交互重新锚定在生成点旁，维持语境显著性。默认 `legacy` 保持历史顺序。开启后建议先在沙盒观察若干轮回复质量与 `回复模式` 分布，不适配可随时切回。
+`model.mainPayloadOrder=cache-first` 会把用户 payload 的对话历史与低频记忆层前置、每轮变化字段（当前事件、时钟、状态）后置。对支持自动前缀缓存的服务商（DeepSeek、GLM、Kimi 等），连续对话轮可以命中长长的稳定前缀，输入成本与 prefill 延迟显著下降；payload 末尾附带 `recentExchange` 最近交换块，把最后几条交互重新锚定在生成点旁，维持语境显著性。当前默认就是 `cache-first`；遇到服务商兼容性或上下文质量问题时可切回 `legacy`。开启后建议先在沙盒观察若干轮回复质量与 `回复模式` 分布。
 
 自动推进不把 cache-first 当作世界时间来源：时间导演提供当前窗口内的推进建议，主叙事写出实际生活，宿主约束时间端点。beta6 不再把新计划自动当作完成事实；旧自动条目仍保留原账本解释。`recentExchange` 只含真实收发消息，不复制上一段剧本文字。实际是否复写仍需模型实机观察，不能仅凭缓存模式保证。
 
@@ -162,7 +163,7 @@ HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同
 
 较早的场景和 Overlay 会在后台分档压缩：保留因果、承诺、大事件与关系变化，减少重复性叙述。压缩以异步整理的方式运行，与用户回合的主叙事调用保持轻量协作。
 
-近期上下文同时使用条目下限与时间窗口：默认至少保留 50 条，并保护最近 60 分钟的真实收发消息。长期事实检索分别为最近已完成事件和未完成承诺保留位置；承诺兑现后可显式关闭旧 fact，并促使 continuity 提前刷新。Continuity 不再保存容易过期的自由文本未来计划，未来安排由 intent 与 Schedule Preplan 提供。
+近期上下文同时使用条目下限与时间窗口：默认至少保留 35 条，并保护最近 45 分钟的真实收发消息。长期事实检索分别为最近已完成事件和未完成承诺保留位置；承诺兑现后可显式关闭旧 fact，并促使 continuity 提前刷新。Continuity 不再保存容易过期的自由文本未来计划，未来安排由 intent 与 Schedule Preplan 提供。
 
 ### 修改设定时的建议
 
@@ -266,6 +267,10 @@ OneBot 模式采用显式白名单：启用后，绑定的机器人 QQ 账号和
 
 开启 `onebot.voiceTranscription.enabled` 后，SnowLuma 的私聊 `record` 语音会先通过 `fetch_ptt_text` 转为文字，再与同一条消息中的文字、图片合并为一个用户事件。转写失败、语音未进入 SnowLuma 缓存或当前 OneBot 实现不支持该动作时，插件仍会记录“收到未转写语音”的事实并继续处理；音频二进制与转写请求不会写入 HDSI 数据库。
 
+### 原生音频理解
+
+`model.audio.enabled` 是另一条路径：它不做文字转写，而是让 SnowLuma 将 QQ SILK 语音转码后作为原生音频输入交给支持音频的主模型（例如 Gemini）。可通过 `model.audio.outFormat`、`maxFileSizeMB` 和 `maxPerMessage` 限制转码格式、单文件大小和单条消息附件数。模型不支持音频、转码失败或超过限制时，插件保留“收到语音/音频”的事实并继续处理其它内容。两条路径可按模型能力二选一，原生音频理解不会自动回退为文字转写。
+
 ### 网页观察
 
 可选 Puppeteer 服务允许角色在剧情确有需要时请求有限的网页观察。插件通过协议、页面数量、内容长度与超时边界，提取公开页面文本作为本轮写作参考；网页观察聚焦于安全、有限的公开信息读取。
@@ -287,19 +292,19 @@ npm install koishi-plugin-hds-interlude@beta
 使用本地预发布包时，可在 Koishi 实例目录执行：
 
 ```bash
-npm install /absolute/path/to/koishi-plugin-hds-interlude-1.0.1-beta6-rebuild.tgz
+npm install /absolute/path/to/koishi-plugin-hds-interlude-1.0.1-rc24.tgz
 ```
 
 Windows 示例：
 
 ```powershell
-npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-1.0.1-beta6-rebuild.tgz
+npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-1.0.1-rc24.tgz
 ```
 
 Koishi Desktop 的实例使用 Yarn 4。请在实例目录执行以下命令，并在完成后重载插件或重启 Desktop：
 
 ```powershell
-corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-beta6-rebuild.tgz" --exact
+corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc24.tgz" --exact
 ```
 
 安装后重新加载 Koishi，再在 Console 启用插件。

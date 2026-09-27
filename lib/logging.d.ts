@@ -1,6 +1,5 @@
 import { NarrativePhase } from './types';
 export type InterludeLogLevel = 'error' | 'warn' | 'info' | 'debug';
-export type InterludeLogFormat = 'compact' | 'detailed' | 'layered';
 export type InterludeLogColorTheme = 'dark' | 'light';
 export type InterludeLogAction = 'receive' | 'send' | 'processing' | 'complete' | 'trigger' | 'emotion' | 'memory' | 'advance' | 'agency' | 'group' | 'error' | 'retry' | 'warning' | 'waiting' | 'system';
 export interface LayeredLogInput {

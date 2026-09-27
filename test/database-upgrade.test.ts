@@ -23,7 +23,15 @@ test('existing installations extend raw script entries with persistent embedding
     },
   } as any
   registerTables(ctx)
-  assert.deepEqual(calls, [{ name: 'interlude_script_entry', fields: { embedding: 'json' } }])
+  assert.deepEqual(calls, [
+    { name: 'interlude_script_entry', fields: { embedding: 'json' } },
+    { name: 'interlude_seeded_event', fields: {
+      id: 'unsigned', storyId: 'string(255)', summary: 'text', importance: 'string(16)',
+      occursAt: 'timestamp', expiresAt: 'timestamp', status: 'string(16)',
+      subjects: 'json', sourcePayload: 'json', injectedEntryId: 'unsigned',
+      createdAt: 'timestamp', updatedAt: 'timestamp',
+    } },
+  ])
 })
 
 test('knowledge evidence is an additive nullable field and reload does not rebuild it', () => {
@@ -34,9 +42,17 @@ test('knowledge evidence is an additive nullable field and reload does not rebui
     interlude_web_observation: {}, interlude_overlay_snapshot: {}, interlude_sticker: {}, interlude_schedule_preplan: {},
   }
   const ctx = { model: { tables, extend(name: string, fields: any) {
-    calls.push({ name, fields }); Object.assign(tables[name].fields, fields)
+    calls.push({ name, fields }); tables[name] ??= { fields: {} }; Object.assign(tables[name].fields, fields)
   } } } as any
   registerTables(ctx)
   registerTables(ctx)
-  assert.deepEqual(calls, [{ name: 'interlude_fact', fields: { knowledge: 'json' } }])
+  assert.deepEqual(calls, [
+    { name: 'interlude_fact', fields: { knowledge: 'json' } },
+    { name: 'interlude_seeded_event', fields: {
+      id: 'unsigned', storyId: 'string(255)', summary: 'text', importance: 'string(16)',
+      occursAt: 'timestamp', expiresAt: 'timestamp', status: 'string(16)',
+      subjects: 'json', sourcePayload: 'json', injectedEntryId: 'unsigned',
+      createdAt: 'timestamp', updatedAt: 'timestamp',
+    } },
+  ])
 })

@@ -1,7 +1,7 @@
 import { Context } from 'koishi'
 import {
   InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent,
-  NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, StatePatchProposal, StickerAsset, WebObservation,
+  NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, SeededWorldEvent, StatePatchProposal, StickerAsset, WebObservation,
 } from './types'
 
 declare module 'koishi' {
@@ -19,6 +19,7 @@ declare module 'koishi' {
     interlude_sticker: StickerAsset
     interlude_web_observation: WebObservation
     interlude_schedule_preplan: SchedulePreplanRecord
+    interlude_seeded_event: SeededWorldEvent
   }
 }
 
@@ -39,6 +40,7 @@ export function registerTables(ctx: Context) {
     if (!existingTables.interlude_overlay_snapshot) registerOverlaySnapshotTable(ctx)
     if (!existingTables.interlude_sticker) registerStickerTable(ctx)
     if (!existingTables.interlude_schedule_preplan) registerSchedulePreplanTable(ctx)
+    if (!existingTables.interlude_seeded_event) registerSeededEventTable(ctx)
     return
   }
 
@@ -109,6 +111,7 @@ export function registerTables(ctx: Context) {
   registerOverlaySnapshotTable(ctx)
   registerStickerTable(ctx)
   registerSchedulePreplanTable(ctx)
+  registerSeededEventTable(ctx)
 }
 
 function registerScriptEntryEmbedding(ctx: Context, tables = (ctx.model as any).tables ?? {}) {
@@ -146,6 +149,16 @@ function registerStickerTable(ctx: Context) {
     embedding: 'json',
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, { primary: 'id', autoInc: true, unique: ['assetId'], indexes: ['status', 'group', 'updatedAt'] })
+}
+
+function registerSeededEventTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_seeded_event) return
+  ctx.model.extend('interlude_seeded_event', {
+    id: 'unsigned', storyId: 'string(255)', summary: 'text', importance: 'string(16)',
+    occursAt: 'timestamp', expiresAt: 'timestamp', status: 'string(16)',
+    subjects: 'json', sourcePayload: 'json', injectedEntryId: 'unsigned',
+    createdAt: 'timestamp', updatedAt: 'timestamp',
+  }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'occursAt'] })
 }
 
 function registerSchedulePreplanTable(ctx: Context) {

@@ -47,6 +47,7 @@ export function compileNarrativeContext(
       state: payload.state,
       currentParticipant: payload.currentParticipant,
       participants: payload.participants,
+      availableGroupTargets: payload.availableGroupTargets,
       activeConsequences: payload.activeConsequences,
       followUpCommitments: payload.followUpCommitments,
       contactThreads: payload.contactThreads,

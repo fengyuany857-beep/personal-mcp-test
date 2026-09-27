@@ -23,8 +23,14 @@ export function readAuthoredActions(script: string) {
 /** Resolve the same authored words before any transport normalization. Legacy
  * content remains compatible; a broken explicit reference cannot send another
  * independently authored answer. Delayed drafts retain their existing path. */
-export function resolveAuthoredActions(decision: NarrativeDecision, alreadySent = false, separator = '<sep/>'): NarrativeDecision {
+export function reconcileTransportReferences(decision: NarrativeDecision, alreadySent = false, separator = '<sep/>'): NarrativeDecision {
   if (typeof decision?.script !== 'string') return decision
+  // 群聊回合兼容：部分模型把群回复嵌套在 interaction.groupReply 而不是
+  // 顶层 groupReply——提权到顶层让 hasStructuredGroupReply / normalizeGroupVisibleReply
+  // / resolve 都能正常处理（实测 Gemini 3.7 Flash 群聊 mention-only 必现）。
+  if (!decision.groupReply && decision.interaction && typeof (decision.interaction as any).groupReply === 'object' && (decision.interaction as any).groupReply !== null) {
+    decision = { ...decision, groupReply: (decision.interaction as any).groupReply }
+  }
   const parsed = readAuthoredActions(decision.script)
   const leading = parsed.prose.length - parsed.prose.trimStart().length
   const prose = parsed.prose.trim()
@@ -32,7 +38,22 @@ export function resolveAuthoredActions(decision: NarrativeDecision, alreadySent 
   alreadySent ||= deliveredActions.has(inherited)
   const actions = (parsed.actions.length ? parsed.actions : inherited).map(action => ({
     ...action, start: action.start - leading, end: action.end - leading,
-  })).filter(action => action.start >= 0 && action.end <= prose.length && prose.slice(action.start, action.end) === action.content)
+  })).filter(action => {
+    if (action.start >= 0 && action.end <= prose.length && prose.slice(action.start, action.end) === action.content) return true
+    // Fix#6: 容忍 say 内容两端的空白（闭合标签前的尾随空格很常见）——
+    // prose 双侧 trim 后 end 可能越界或切片不等。兜底用夹紧切片做双侧 trim 比较，
+    // 命中后回写 content 为切片本身，让镜像/救援路径拿到的是 prose 实际文字。
+    const start = Math.max(0, action.start)
+    const end = Math.min(Math.max(action.end, start), prose.length)
+    const slice = prose.slice(start, end)
+    if (slice && slice.trim() === action.content.trim()) {
+      action.start = start
+      action.end = end
+      action.content = slice
+      return true
+    }
+    return false
+  })
   const privateReply = decision.interaction?.reply
   const onePrivateRecipient = (!decision.groupReply || decision.groupReply.mode === 'none') && !decision.crossConversationActions?.length
   if (!alreadySent && onePrivateRecipient && actions.length === 1 && privateReply?.mode === 'immediate'
@@ -50,12 +71,22 @@ export function resolveAuthoredActions(decision: NarrativeDecision, alreadySent 
       && prose.slice(item.start, item.end) === item.content && item.content.trim())
     return action ? { ...reply, content: action.content } : { ...reply, mode: 'none', content: undefined }
   }
+  // 弱模型矛盾形态的就地救援：reply.mode=none 却携带 actionId（合规合约里沉默
+  // 从不引用发送行动）。若该 id 确实锚定剧本里的 say 行动，发送意图无歧义，
+  // 直接翻转成 immediate 投递——不重写、不失败；解析不到则维持 none（同旧版
+  // 行为），由 standard 级诊断日志留痕。
+  const rescueSilentActionReference = (reply: NonNullable<typeof privateReply>) => {
+    if (alreadySent || !reply || reply.mode !== 'none' || !reply.actionId?.trim()) return reply
+    const action = actions.find(item => item.id === reply.actionId
+      && prose.slice(item.start, item.end) === item.content && item.content.trim())
+    return action ? { ...reply, mode: 'immediate' as const, content: action.content } : reply
+  }
   // 引用失配的保守兜底：整份剧本只有一个已授权 say 行动、本回合只有一个私聊
   // 接收者、且回复没有可用 content 时，该行动就是这条回复的本体——模型常照抄
   // 协议示例里的 id 字面量导致引用对不上。零行动、重复 id、伪造继承与已提前
   // 流式发送的情况都不适用，保持原有的 none 语义。
   const soleActionReply = (reply: NonNullable<typeof privateReply>) => {
-    if (alreadySent || !onePrivateRecipient || reply.mode !== 'immediate' || reply.content || actions.length !== 1) return reply
+    if (alreadySent || !reply || typeof reply !== 'object' || !onePrivateRecipient || reply.mode !== 'immediate' || reply.content || actions.length !== 1) return reply
     const only = actions[0]
     if (!only.content.trim() || prose.slice(only.start, only.end) !== only.content) return reply
     return { ...reply, actionId: only.id, content: only.content }
@@ -69,8 +100,8 @@ export function resolveAuthoredActions(decision: NarrativeDecision, alreadySent 
   if (alreadySent) deliveredActions.add(actions)
   return {
     ...decision, script: prose, authoredActions: actions,
-    ...(decision.interaction ? { interaction: { ...decision.interaction, reply: resolve(legacyTail
-      ? { ...decision.interaction.reply, content: legacyTail } : soleActionReply(decision.interaction.reply)) } } : {}),
+    ...(decision.interaction ? { interaction: { ...decision.interaction, reply: resolve(rescueSilentActionReference(legacyTail
+      ? { ...decision.interaction.reply, content: legacyTail } : soleActionReply(decision.interaction.reply))) } } : {}),
     ...(decision.groupReply ? { groupReply: resolve(decision.groupReply) } : {}),
     ...(Array.isArray(decision.crossConversationActions) ? { crossConversationActions: decision.crossConversationActions.map(resolve) } : {}),
   }

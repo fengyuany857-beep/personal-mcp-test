@@ -1,4 +1,4 @@
-import { Context, Schema, Session } from 'koishi'
+import { Context, Schema, Session, h } from 'koishi'
 import { AudioConfig, CompactionConfig, EmbeddingConfig, FailoverConfig, ModelConfig, ProviderConfig, VisionConfig } from './narrator'
 import { BlindModeConfig, BrowserConfig, ChatActionsConfig, Config as InterludeConfig, extractSessionVoiceCount, GroupChatRule, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StickerLibraryConfig, StoryDefaults } from './service'
 import { AgencyConfig, AlterSystemConfig, ChatReactionName, ChatRhythmConfig, NativeFaceSemantic, StorySetting } from './types'
@@ -52,6 +52,7 @@ const ProviderAssignments = Schema.object({
   useForEmbedding: Schema.boolean().default(false).description('用于 Embedding。'),
   useForStickers: Schema.boolean().default(false).description('用于表情包描述。'),
   useForVision: Schema.boolean().default(false).description('用于侧端识图。'),
+  useForWorldSeeding: Schema.boolean().default(false).description('用于世界播种。'),
   priceInput: Schema.number().min(0).default(0).description('输入单价（百万 tokens；0 不计费）。'),
   priceOutput: Schema.number().min(0).default(0).description('输出单价（百万 tokens；0 不计费）。'),
   priceCachedInput: Schema.number().min(0).default(0).description('缓存输入单价（百万 tokens；0 按输入计）。'),
@@ -70,7 +71,9 @@ const Provider: Schema<ProviderConfig> = Schema.intersect([
   Schema.union([
     Schema.object({
       mode: Schema.const('openai-compatible'),
-      endpoint: Schema.string().default('').description('Chat Completions 完整地址。'),
+      protocol: Schema.union(['chat-completions', 'anthropic-messages']).default('chat-completions').description('自定义连接协议：Chat Completions 或 Anthropic Messages。旧配置保持 Chat Completions。'),
+      endpoint: Schema.string().default('').description('完整地址，如 https://host/v1/chat/completions 或 https://host/v1/messages；切换协议时自动匹配这两种标准路径。'),
+      anthropicCache: Schema.boolean().default(false).description('Anthropic 缓存标记（服务端需支持）：缓存 system；cache-first 时同时标记历史前缀。关闭仍保留 cache-first 内容顺序。'),
       apiKey: Schema.string().role('secret').default('').description('API Key。'),
       model: Schema.string().default('').description('模型名。'),
       extraHeaders: Schema.string().role('textarea').default('').description('额外请求头 JSON（可留空）。'),
@@ -149,9 +152,21 @@ const Model: Schema<ModelConfig> = Schema.object({
   mainTimeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('主叙事请求超时，单位毫秒。'),
   mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事输出格式；不支持 JSON mode 时选 prompt-only。'),
   mainStreamingMode: Schema.union(['off', 'experimental']).default('off').description('实验性私聊首泡加速；仅 JSON 模式。'),
-  mainPayloadOrder: Schema.union(['legacy', 'cache-first']).default('legacy').description('请求字段顺序；支持前缀缓存的接口可选 cache-first。'),
+  mainPayloadOrder: Schema.union(['legacy', 'cache-first']).default('cache-first').description('请求字段顺序；支持前缀缓存的接口可选 cache-first。'),
   failover: Failover.default({ enabled: true, strategy: 'priority', maxAttemptsPerProvider: 1, cooldownMinutes: 5 }).description('主叙事请求失败时的切换策略。'),
-  mainPrompt: Schema.string().role('textarea').default('Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing.').description('主叙事行为指令：定义模型如何连续写作、推进生活并处理外部事件。'),
+  specialization: Schema.union([
+    Schema.const('off').description('关闭（默认）：rc12 原始完整合约，行为与未特化版本完全一致'),
+    Schema.const('lite').description('精简合约：15 块核心 + content-only 协议 + 精简压缩/时间导演提示词（flash 级与 Grok/GLM-4.x 推荐）'),
+    Schema.const('standard').description('标准合约：rc12 全量 + content-only 协议（Gemini-Pro/GLM-5/Kimi/DeepSeek 推荐）'),
+    Schema.const('full').description('完整合约：特化前原样完整协议（Claude/GPT 推荐）'),
+  ]).default('off').description('模型特化档位（手动）：同时作用于主叙事合约与压缩/时间导演等侧端提示词；改配置后下回合生效。'),
+  specializationFamily: Schema.union([
+    Schema.const('auto').description('自动（默认）：按模型名识别家族，仅决定套用哪套特化块'),
+    Schema.const('gemini-flash'), Schema.const('gemini'), Schema.const('claude'), Schema.const('gpt'),
+    Schema.const('glm'), Schema.const('kimi'), Schema.const('deepseek'), Schema.const('grok'),
+    Schema.const('generic').description('不套用任何家族特化块'),
+  ]).default('auto').description('特化家族：模型名无法识别时（如中转自定义别名）在此显式指定。'),
+  mainPrompt: Schema.string().role('textarea').default('Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing.').description('已迁移到配置页最底部的主提示词分区；此处保留仅为兼容旧配置的自定义值。').hidden(),
   formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充规则。'),
   fixedPrompt: Schema.string().role('textarea').default('').description('通用长期规则。'),
   stylePrompt: Schema.string().role('textarea').default('Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama.').description('全局叙事文风；故事级 style 可进一步覆盖。'),
@@ -196,6 +211,12 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   typingMaxDelaySeconds: Schema.number().min(0).max(120).default(12).description('单条后续分段消息的最长打字等待秒数。'),
   typingJitterRatio: Schema.number().min(0).max(0.5).step(0.05).default(0.3).description('打字延迟随机浮动；0 为固定延迟。'),
   userMessageDebounceSeconds: Schema.number().min(0).max(15).default(2).description('短消息合并等待秒数；0 关闭。'),
+  forwardMessage: Schema.object({
+    enabled: Schema.boolean().default(true).description('是否读取 QQ 合并转发正文；关闭时保留原有转发卡片文本行为。'),
+    maxNodes: Schema.natural().min(1).max(100).default(30).description('单条合并转发最多读取的节点数。'),
+    maxCharacters: Schema.natural().min(500).max(32_000).default(8_000).description('合并转发注入当前事件的最大字符数。'),
+    maxDepth: Schema.natural().max(8).default(3).description('嵌套合并转发最多展开层数。'),
+  }).default({ enabled: true, maxNodes: 30, maxCharacters: 8_000, maxDepth: 3 }).description('【消息扩展】QQ 合并转发读取预算。'),
   narrativeRetryDelaySeconds: Schema.natural().min(5).max(3_600).default(60).description('叙事模型请求失败后，自动再次尝试处理该用户回合前等待的秒数。'),
   narrativeRetryMaxAttempts: Schema.natural().min(0).max(50).default(6).description('单次用户回合因模型失败可自动重试的最多次数；0 表示关闭。'),
   captureDirectMessages: Schema.boolean().default(true).description('是否拦截并处理私聊文本消息。'),
@@ -206,8 +227,8 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(50).description('近期原始记录的最低保留条目数。'),
-  contextTimeWindowMinutes: Schema.natural().min(0).max(1_440).default(60).description('额外保留最近多少分钟的记录；0 关闭。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(35).description('近期原始记录的最低保留条目数。'),
+  contextTimeWindowMinutes: Schema.natural().min(0).max(1_440).default(45).description('额外保留最近多少分钟的记录；0 关闭。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主叙事读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
@@ -334,7 +355,9 @@ const Memory: Schema<MemoryConfig> = Schema.object({
 const StoryDefaults: Schema<StoryDefaults> = Schema.object({
   characterName: Schema.string().default('Unnamed character').description('主角显示名称。'),
   characterProfile: Schema.string().role('textarea').default('').description('主角背景、性格、日程与说话方式。'),
-  perspective: Schema.string().role('textarea').default('').description('主角稳定的价值观和看待世界方式。'),
+  perspective: Schema.string().role('textarea').default('').description('主角稳定的价值观和看待世界方式（单条总述；多条独立观点请用 perspectives）。'),
+  perspectives: Schema.array(Schema.string().role('textarea')).default([]).description('主角多条独立价值观/视角：每条一段，进入提示词时保持独立条目不合并。'),
+  supplementaryFacts: Schema.array(Schema.string().role('textarea')).default([]).description('补充事实：界限不明显的世界/人物/关系复杂事实，每条一段，作为初始长期事实注入。'),
   userProfile: Schema.string().role('textarea').default('').description('默认用户资料；可由白名单行覆盖。'),
   relationship: Schema.string().role('textarea').default('').description('默认初始关系；可由白名单行覆盖。'),
   world: Schema.string().role('textarea').default('').description('故事时代、地点与现实规则。'),
@@ -373,6 +396,19 @@ const OneBotUserAccount: Schema<OneBotAccountRule> = Schema.object({
   enabled: Schema.boolean().default(true).description('是否接受该账号的私聊并允许向其投递消息。'),
 }).collapse(true)
 
+const WillingnessTierChoice = Schema.union([
+  Schema.const('quiet').description('极少：约每 10 条普通消息一次'),
+  Schema.const('reserved').description('谨慎：约每 6~8 条一次'),
+  Schema.const('normal').description('标准：约每 4~5 条一次'),
+  Schema.const('active').description('活跃：约每 2~3 条一次'),
+  Schema.const('eager').description('热情：几乎每批都想说'),
+])
+const GroupWillingnessAuto = Schema.object({
+  busy: WillingnessTierChoice.default('quiet').description('忙碌时使用的档位。'),
+  idle: WillingnessTierChoice.default('active').description('空闲时使用的档位。'),
+  asleep: WillingnessTierChoice.default('quiet').description('睡眠时使用的档位（额外有概率×0.2 与 @ 阻断）。'),
+}).collapse(true)
+
 const GroupWillingness: Schema<GroupWillingnessConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('启用本地群聊意愿门，不增加模型调用。'),
   maxScore: Schema.number().min(0.1).max(10).step(0.05).default(1).description('意愿累积上限。'),
@@ -396,7 +432,14 @@ const GroupChatRuleSchema: Schema<GroupChatRule> = (Schema.object({
   contextLimit: Schema.natural().min(4).max(100).default(20).description('进入主叙事时附带的最近群消息条数。'),
   debounceSeconds: Schema.number().min(0).max(10).default(1).description('合并短时间连续群消息后再开始主叙事的等待秒数。'),
   cooldownSeconds: Schema.natural().min(0).max(86_400).default(60).description('主角群发言后的冷却时间，避免连续刷屏。'),
-  willingness: GroupWillingness.default({ enabled: false, maxScore: 1, threshold: 0.24, probabilityAmplifier: 1.3, decayHalfLifeSeconds: 180, replyCost: 0.55, baseGain: 0.12, quoteGain: 0.12, keywordGain: 0.18, keywords: [] }).description('群聊本地意愿门；@ 机器人直接通过。'),
+  willingnessPreset: Schema.union([
+    Schema.const('off').description('关闭（默认）：仅响应模式与冷却生效；旧数值门已启用时自动按 custom 兼容'),
+    WillingnessTierChoice,
+    Schema.const('auto').description('自动：按压缩器生活状态切换（busy/asleep/idle 三态各自可配档位；睡眠时 @ 也不触发）'),
+    Schema.const('custom').description('自定义：使用下方旧数值参数'),
+  ]).default('off').description('群聊发言意愿档位。'),
+  willingnessAuto: GroupWillingnessAuto.default({ busy: 'quiet', idle: 'active', asleep: 'quiet' }).description('auto 档的三态映射。'),
+  willingness: GroupWillingness.default({ enabled: false, maxScore: 1, threshold: 0.24, probabilityAmplifier: 1.3, decayHalfLifeSeconds: 180, replyCost: 0.55, baseGain: 0.12, quoteGain: 0.12, keywordGain: 0.18, keywords: [] }).description('自定义数值门（仅 willingnessPreset=custom 时生效；keywords 对所有档位生效）；@ 直接通过，睡眠态除外。'),
 }) as unknown as Schema<GroupChatRule>).collapse(true)
 
 const OneBot: Schema<OneBotNapCatConfig> = Schema.object({
@@ -478,13 +521,27 @@ export const Config: Schema<InterludeConfig> = Schema.object({
   memory: Memory.description('【内在 12】记忆与连续性：场景压缩、事实召回、剧情余波和设定演化。'),
   alterSystem: AlterSystem.description('【内在 13】Alter 情绪：低频氛围偏移、动态阈值、权重和侧端分析。'),
   browser: Browser.description('【扩展 14】网页观察：Puppeteer 只读浏览与安全边界。'),
+  worldSeeder: Schema.object({
+    enabled: Schema.boolean().default(false).description('启用世界事件播种器：后台低频生成与她有关的外部事件（线下通道、NPC），到点以 [世界事件] 条目进入剧本。模型在【必填 2】模型中心的连接上勾选“用于世界播种”选择；未勾选任何连接时本开关无效。'),
+    cadenceMinutes: Schema.natural().min(5).max(1_440).default(45).description('生成检查间隔（分钟）；含随机抖动，多数检查输出空。'),
+    maxPending: Schema.natural().min(1).max(20).default(4).description('同时挂起的未注入事件上限。'),
+    dailyCap: Schema.natural().min(1).max(20).default(4).description('每 24 小时注入上限（推荐 1~4；高重要性每天至多 1 条）。'),
+    maxHorizonHours: Schema.natural().min(1).max(336).default(72).description('事件最远发生时限（小时）。'),
+    temperature: Schema.number().min(0).max(2).default(0.9).description('生成温度。'),
+    maxTokens: Schema.natural().min(256).max(8_192).default(1_000).description('单次输出预算（tokens）。'),
+    timeout: Schema.natural().min(5_000).max(300_000).default(60_000).description('请求超时（毫秒）。'),
+  }).collapse(true).description('【扩展 15】世界播种器：外部事件的生成与注入（未选模型即关闭）。'),
   blindMode: BlindMode.description('【维护 15】盲区模式：低频心跳的最小运行形态。'),
   logging: Logging.description('【维护 16】日志：级别、信息密度、布局和隐私预览。'),
+  mainPrompt: Schema.string().role('textarea').default('').description('⚠️ 除非有把握，否则不要修改。系统主提示词（主叙事行为指令）：与固定合约、文风和特化块协作，塑造全部回合的写作行为；留空使用内置默认，改动下回合立即生效，出问题清空即可恢复默认。'),
   chatRhythm: ChatRhythm.description('【已弃用】对话节奏：仅兼容旧配置，不再统计、干预写作或重试。').hidden(),
 })
 
 export function apply(ctx: Context, config: InterludeConfig) {
   const startupLogger = ctx.logger('hds-interlude')
+  // 顶层主提示词覆盖：非空时取代模型中心的旧字段（旧 YAML 自定义值继续生效）。
+  const mainPromptOverride = config.mainPrompt?.trim()
+  if (mainPromptOverride) config.model.mainPrompt = mainPromptOverride
   const blindModeEnabled = config.blindMode?.enabled === true || config.blackBox?.enabled === true
   if (!blindModeEnabled) startupLogger.info('plugin load started version=%s', HDS_INTERLUDE_VERSION)
   const service = new InterludeService(ctx, config)
@@ -577,6 +634,7 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
     .action(async ({ session }) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
+      const health = service.health.snapshot(story.id)
       return [
         `主角：${story.setting.character.name}`,
         `关系人数：${(await service.participants(story.id)).length}`,
@@ -585,6 +643,12 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
         `主模型连接：${service.config.model.providers.find(provider => provider.useForMain && provider.enabled !== false)?.label || '未指定（按模型配置回退）'}`,
         `允许主动可见消息：${service.config.runtime.allowProactiveMessages ? '开启' : '关闭'}`,
         `Agency Window：${service.config.agency?.enabled === false ? '关闭' : '开启'}（${story.state.agencyWindow?.activityLoad || '尚未建立'}）`,
+        `—— 健康指标（自 ${new Date(health.sinceAt).toLocaleString('zh-CN')}）——`,
+        `主叙事成功：${health.narrativeTotal}/${health.narrativeTotal + health.narrativeFailed}（${(health.successRate * 100).toFixed(1)}%）`,
+        `结构化回复缺失：${health.structureMissing} 次（挽回 ${health.recoverySaved} 次）`,
+        `回复模式：immediate ${health.replyModes.immediate} / none ${health.replyModes.none} / delayed ${health.replyModes.delayed} / 无投递 ${health.replyModes.noDelivery}`,
+        `前缀缓存命中：${(health.cacheHitRate * 100).toFixed(1)}%（输入 ${health.inputTokens.toLocaleString()} tokens）`,
+        `中位延迟：${(health.medianLatencyMs / 1000).toFixed(1)}s`,
       ].join('\n')
     })
 
@@ -623,7 +687,7 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
         .filter(entry => !entry.participantId || entry.participantId === participant?.id)
         .slice(-Math.max(1, Math.min(limit, 30)))
       if (!entries.length) return '当前故事还没有剧本记录。'
-      return entries.map(entry => `[${formatStoryDisplayTime(entry.occurredAt, story.setting.timezone)}] ${entry.actor}/${entry.kind}: ${entry.content}`).join('\n')
+      return h.text(entries.map(entry => `[${formatStoryDisplayTime(entry.occurredAt, story.setting.timezone)}] ${entry.actor}/${entry.kind}: ${entry.content}`).join('\n'))
     })
 
   ctx.command('interlude.memory [limit:number]', '查看当前账号相关的记忆摘要；limit 为条数，默认 10')
@@ -673,7 +737,7 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
       if (typeof story === 'string') return story
       const entries = await service.recentEntries(story.id, Math.max(1, Math.min(limit, 50)))
       if (!entries.length) return '当前主剧本还没有原始条目。'
-      return entries.map(entry => `#${entry.id} [${entry.occurredAt.toISOString()}] ${entry.actor}/${entry.kind}${entry.participantId ? `/${entry.participantId}` : ''}\n${entry.content}`).join('\n\n')
+      return h.text(entries.map(entry => `#${entry.id} [${entry.occurredAt.toISOString()}] ${entry.actor}/${entry.kind}${entry.participantId ? `/${entry.participantId}` : ''}\n${entry.content}`).join('\n\n'))
     })
 
   ctx.command('interlude.script.note <content:text>', '管理员：向剧本写入一条人工注记，不伪装成模型输出')
@@ -822,7 +886,19 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
   ctx.command('interlude.schedule.rebuild', '管理员：兼容别名，等同于 interlude.schedule.refresh')
     .action(({ session }) => requestScheduleRefresh(session))
 
-  ctx.command('interlude.database.clear', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据；执行前会询问 y/n')
+  ctx.command('interlude.reset', '管理员：完全重置——清空数据库并将故事设定重置为 Console 档案当前值（角色身份回到 storyDefaults 模板）；执行前会询问 y/n').action(async ({ session }) => {
+    if (!await requireManager(service, session)) return '无权限。'
+    const story = await requireStory(service, session)
+    if (typeof story === 'string') return story
+    const confirmed = await askConfirmation(session, '这将删除所有剧本、记忆、事实，并将角色设定重置为 Console 档案当前值。确定吗？(y/n)')
+    if (!confirmed) return '已取消。'
+    await service.clearDatabase()
+    await service.purgeAllStoryData(story.id)
+    return `已完全重置。数据库已清空，角色设定已回到 Console 故事档案（storyDefaults）模板。
+如需更换角色身份，请在 Console 修改故事档案后重新开始。`
+  })
+
+  ctx.command('interlude.database.clear', '管理员：清空 HDSI 自有 SQLite 数据表（剧本/记忆/事实等运行时数据）；角色人设和世界观来自 Console 故事档案（storyDefaults），清库后角色身份不变——如需重置人设请在 Console 修改或使用 interlude.reset；执行前会询问 y/n')
     .action(async ({ session }) => {
       if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
       if (!await askConfirmation(session, '即将清空 HDSI 自有数据库，剧本、记忆和状态记录都会删除。确认执行吗？(y/n)')) return '操作已取消。'
@@ -912,7 +988,7 @@ function isFactScope(value: string): value is 'character' | 'world' | 'relations
   return ['character', 'world', 'relationship', 'event', 'promise'].includes(value)
 }
 
-function looksLikeInterludeCommand(content: string) { return /^[!/.]?interlude(?:\s|$)/i.test(content.trim()) }
+export function looksLikeInterludeCommand(content: string) { return /^[!/.]?interlude(?:\s|$|\.)/i.test(content.trim()) }
 
 export * from './narrator'
 export * from './service'

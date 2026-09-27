@@ -27,5 +27,6 @@ export declare function encodeStoryState(value: StoryState): StoryState;
 export declare function normalizeAutomaticDeliverySummaries(value: unknown): AutomaticDeliverySummary[];
 export declare function normalizeScenePresenceState(value: unknown): ScenePresenceState[];
 export declare function normalizeWorkingDetails(value: unknown): WorkingDetail[];
+export declare function normalizeLifeStatus(value: unknown): StoryState['lifeStatus'];
 export declare function normalizeTimelineCarry(value: unknown): string[];
 export declare function normalizeContinuitySnapshot(value: unknown): ContinuitySnapshot | undefined;

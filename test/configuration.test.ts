@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Config, version } from '../src/index'
-import { hasRequiredNarrativeScript, normalizeGroupVisibleReply, normalizeInteraction, resolveBlindModeConfig, visibleReplyMode } from '../src/service'
+import { hasRequiredNarrativeScript, normalizeGroupVisibleReply, normalizeInteraction, requiresVisibleReplyRecovery, resolveBlindModeConfig, visibleReplyMode } from '../src/service'
 import { configuredProviders, ZHIPU_FIRST_VISIBLE_TOKEN_TIMEOUT } from '../src/narrator'
 import { HDS_INTERLUDE_VERSION } from '../src/meta'
 
@@ -10,7 +10,7 @@ const now = new Date('2026-09-09T12:00:00Z')
 test('Console sections follow the documented setup order', () => {
   assert.deepEqual(Object.keys(Config.dict), [
     'storyDefaults', 'model', 'onebot', 'sharedStory', 'runtime', 'urge', 'schedulePreplan', 'timelineDirector', 'agency',
-    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'blindMode', 'logging', 'chatRhythm',
+    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'worldSeeder', 'blindMode', 'logging', 'mainPrompt', 'chatRhythm',
   ])
   // 分类前缀让配置页按 必填→结构→节奏→表达→内在→扩展→维护 分组可读。
   const headers = Object.values(Config.dict).map((item: any) => String(item.meta?.description ?? ''))
@@ -20,7 +20,9 @@ test('Console sections follow the documented setup order', () => {
   assert.match(headers[9], /^【表达 10】/)
   assert.match(headers[11], /^【内在 12】/)
   assert.match(headers[13], /^【扩展 14】/)
-  assert.match(headers[14], /^【维护 15】/)
+  assert.match(headers[14], /^【扩展 15】/)
+  assert.match(headers[15], /^【维护 15】/)
+  assert.match(headers[16], /^【维护 16】/)
 })
 
 test('chat actions are opt-in and platform-scoped', () => {
@@ -58,7 +60,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '1.0.1-beta6-rebuild')
+  assert.equal(version, '1.0.1-rc24')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {
@@ -157,10 +159,10 @@ test('memory compaction defaults leave a slightly wider short-conversation buffe
   assert.equal(memory.sceneCharacterThreshold.meta.default, 10_000)
 })
 
-test('recent context combines a fifty-entry floor with a one-hour raw-message window', () => {
+test('recent context combines a thirty-five-entry floor with a 45-minute raw-message window', () => {
   const runtime = Config.dict.runtime.dict
-  assert.equal(runtime.contextEntryLimit.meta.default, 50)
-  assert.equal(runtime.contextTimeWindowMinutes.meta.default, 60)
+  assert.equal(runtime.contextEntryLimit.meta.default, 35)
+  assert.equal(runtime.contextTimeWindowMinutes.meta.default, 45)
 })
 
 test('Console exposes a separate, optional protagonist perspective layer', () => {
@@ -198,6 +200,20 @@ test('reply-mode logs distinguish missing live replies from normal background si
   assert.equal(visibleReplyMode({}, 'advance'), '无可见投递')
   assert.equal(visibleReplyMode({ crossConversationActions: [{ participantId: 'friend', mode: 'immediate', content: '在吗' }] }, 'advance'), '主动联系')
   assert.equal(visibleReplyMode({ interaction: { seen: true, reply: { mode: 'none' } } }, 'intent-due'), 'none')
+})
+
+test('a silent turn that carries an actionId no longer hard-fails the turn', () => {
+  // 弱模型矛盾形态：剧本写她在回复，interaction 却给 mode=none + 自造 actionId。
+  // 救援策略改为就地解析（锚定 say 行动则翻转 immediate，见 beta6-handoff 测试），
+  // 解析不到按合法沉默放行——重写无法改变模型的稳定输出习惯，硬失败只会让
+  // 故事停摆（beta7 实测教训：连续两稿同形态 → 整回合失败循环）。
+  const contradictory = { interaction: { seen: true, reply: { mode: 'none' as const, actionId: 'reply-17729' } } }
+  assert.equal(requiresVisibleReplyRecovery('user-message', undefined, contradictory), false)
+  const silent = { interaction: { seen: true, reply: { mode: 'none' as const } } }
+  assert.equal(requiresVisibleReplyRecovery('user-message', undefined, silent), false)
+  const missing = {}
+  assert.equal(requiresVisibleReplyRecovery('user-message', undefined, missing), true)
+  assert.equal(requiresVisibleReplyRecovery('advance', undefined, contradictory), false)
 })
 
 test('normalizeInteraction keeps seen and reply independent so unread silence cannot erase a sent message', () => {

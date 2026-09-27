@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { continuationBookmark, proseReuseObservation } from '../src/script/continuation'
-import { decisionToScriptCommit, findOutgoingScriptEvent } from '../src/script/commit-builder'
+import { decisionToScriptCommit, findPrivateOutgoingMessageEvent } from '../src/script/commit-builder'
 import { validateScriptCommit } from '../src/script/validator'
 import { toPromptPayload, systemPrompt, storyStateForPrompt } from '../src/narrator'
 import { emptyStorySetting, emptyStoryState, ScriptEntry } from '../src/types'
@@ -34,7 +34,7 @@ for (const [content, separator, split, expected] of [
       decision: { script: `她又惦记起那件事，发出“${content}”。`, interaction: { seen: false, reply: { mode: 'immediate', content } } },
     })
     assert.deepEqual(validateScriptCommit(commit, separator), { valid: true, errors: [] })
-    assert.deepEqual(findOutgoingScriptEvent(commit, 'alice', 'immediate', content, separator)?.bubbles, expected)
+    assert.deepEqual(findPrivateOutgoingMessageEvent(commit, 'alice', 'immediate', content, separator)?.bubbles, expected)
     assert.equal(commit.prose, `她又惦记起那件事，发出“${content}”。`)
   })
 }
@@ -98,7 +98,7 @@ test('literal reuse observation never suppresses a new contact or modifies prose
   })
   assert.equal(validateScriptCommit(commit).valid, true)
   assert.equal(commit.prose, prose)
-  assert.ok(findOutgoingScriptEvent(commit, 'alice', 'immediate', '在吗'))
+  assert.ok(findPrivateOutgoingMessageEvent(commit, 'alice', 'immediate', '在吗'))
 })
 
 test('positive continuation contract explicitly preserves renewed contact', () => {

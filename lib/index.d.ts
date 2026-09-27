@@ -6,13 +6,14 @@ declare module 'koishi' {
     }
 }
 export declare const name = "hds-interlude";
-export declare const version = "1.0.1-beta6-rebuild";
+export declare const version = "1.0.1-rc24";
 export declare const inject: {
     required: string[];
     optional: string[];
 };
 export declare const Config: Schema<InterludeConfig>;
 export declare function apply(ctx: Context, config: InterludeConfig): void;
+export declare function looksLikeInterludeCommand(content: string): boolean;
 export * from './narrator';
 export * from './service';
 export * from './types';

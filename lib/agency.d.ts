@@ -1,4 +1,4 @@
-import { AgencyConfig, AgencyWindowState, ProactiveContactDraft, ProactiveContactOrigin } from './types';
+import { AgencyConfig, AgencyWindowState, ProactiveContactDraft } from './types';
 export declare const DEFAULT_AGENCY_CONFIG: AgencyConfig;
 export interface AgencyCapacityResult {
     allowed: boolean;
@@ -13,4 +13,3 @@ export declare function normalizeProactiveContact(value: unknown, now: Date, con
 export declare function evaluateAgencyCapacity(window: AgencyWindowState | undefined, candidate: ProactiveContactDraft, now: Date, config: AgencyConfig, lastCharacterMessageAt?: string): AgencyCapacityResult;
 export declare function proactiveCandidateFingerprint(candidate: ProactiveContactDraft): string;
 export declare function proactiveRecheckAt(candidate: ProactiveContactDraft, capacity: AgencyCapacityResult, window: AgencyWindowState, now: Date): Date;
-export declare function proactiveOriginBypassesOrdinaryInterval(origin: ProactiveContactOrigin): origin is "promise";

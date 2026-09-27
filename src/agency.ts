@@ -1,5 +1,5 @@
 import {
-  AgencyConfig, AgencyWindowState, ProactiveContactDraft, ProactiveContactOrigin,
+  AgencyConfig, AgencyWindowState, ProactiveContactDraft,
 } from './types'
 
 const MINUTE = 60_000
@@ -169,10 +169,6 @@ export function proactiveRecheckAt(candidate: ProactiveContactDraft, capacity: A
     .sort((left, right) => left.getTime() - right.getTime())[0] ?? fallback
   const expiry = toDate(candidate.expiresAt) ?? new Date(now.getTime() + HOUR)
   return new Date(Math.min(selected.getTime(), expiry.getTime()))
-}
-
-export function proactiveOriginBypassesOrdinaryInterval(origin: ProactiveContactOrigin) {
-  return origin === 'promise'
 }
 
 function groundedIds(value: unknown, valid: ReadonlySet<number>, fallback?: number) {

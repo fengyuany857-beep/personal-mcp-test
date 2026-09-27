@@ -2,7 +2,6 @@ import { format as formatText } from 'node:util'
 import { NarrativePhase } from './types'
 
 export type InterludeLogLevel = 'error' | 'warn' | 'info' | 'debug'
-export type InterludeLogFormat = 'compact' | 'detailed' | 'layered'
 export type InterludeLogColorTheme = 'dark' | 'light'
 export type InterludeLogAction =
   | 'receive' | 'send' | 'processing' | 'complete' | 'trigger' | 'emotion'

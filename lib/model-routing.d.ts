@@ -36,3 +36,4 @@ export declare function usesRemoteProviders(config: ModelConfig): boolean;
 export declare function providerKey(provider: ProviderConfig): string;
 export declare function isAssignedTo(provider: ProviderConfig, task: Exclude<ModelTask, 'timeline'>): boolean;
 export declare function formatModelRouting(table: ModelRoutingTable): string;
+export declare function normalizeProtocolEndpoint(endpoint: string, protocol: ProviderConfig['protocol']): string;

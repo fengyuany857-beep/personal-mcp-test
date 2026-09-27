@@ -119,6 +119,8 @@ export function formatModelRouting(table: ModelRoutingTable) {
 }
 
 function resolveRoute(task: Exclude<ModelTask, 'timeline' | 'stickers' | 'vision'>, providers: ProviderConfig[], target: ResolvedModelTarget, requireChatModel: boolean): ResolvedModelRoute {
+  // Messages API has no embeddings endpoint. Keep vector traffic on its own compatible connection.
+  if (task === 'embedding') providers = providers.filter(provider => provider.protocol !== 'anthropic-messages')
   const assigned = providers.filter(provider => provider.enabled && provider.endpoint && provider.model && isAssignedTo(provider, task))
   if (assigned.length) return { task, target, providers: assigned, assigned: true, available: true, reason: 'assigned-provider' }
 
@@ -170,11 +172,14 @@ function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   const zhipuOfficial = provider.mode === 'zhipu-official'
   const deepseekOfficial = provider.mode === 'deepseek-official'
   const officialEndpoint = presetEndpoint(provider.mode, provider.dashscopeRegion)
+  const protocol = !officialEndpoint && provider.protocol === 'anthropic-messages' ? 'anthropic-messages' : 'chat-completions'
   return {
     ...provider,
     id: provider.id?.trim() || `${provider.label?.trim() || 'provider'}:${provider.model?.trim() || ''}`,
     label: provider.label?.trim() || (zhipuOfficial ? 'Zhipu Official' : deepseekOfficial ? 'DeepSeek Official' : 'Model connection'),
-    endpoint: officialEndpoint || provider.endpoint,
+    protocol,
+    anthropicCache: provider.anthropicCache === true,
+    endpoint: officialEndpoint || normalizeProtocolEndpoint(provider.endpoint, protocol),
     apiKey: provider.apiKey ?? '', model: provider.model ?? '',
     temperature: provider.temperature ?? (zhipuOfficial ? 1 : 0.8),
     topP: provider.topP ?? (zhipuOfficial ? 0.95 : 1),
@@ -194,6 +199,12 @@ function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     useForStickers: provider.useForStickers === true,
     useForVision: provider.useForVision === true,
   }
+}
+
+export function normalizeProtocolEndpoint(endpoint: string, protocol: ProviderConfig['protocol']) {
+  const value = endpoint?.trim() || ''
+  if (protocol !== 'anthropic-messages') return value.replace(/\/messages(?=\?|$)/, '/chat/completions')
+  return value.replace(/\/chat\/completions(?=\?|$)/, '/messages')
 }
 
 function presetEndpoint(mode: ProviderMode | undefined, dashscopeRegion?: string) {

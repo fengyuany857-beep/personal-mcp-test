@@ -199,11 +199,6 @@ export function emotionalOffsetForPrompt(
   return { ...state.emotionalOffset, weight: state.alterWeight }
 }
 
-export function alterAnalysisCoolingDown(state: AlterSystemState, now = new Date(), cooldownMs = 5 * 60 * 1000) {
-  const lastAttempt = dateValue(state.lastAnalysisAttemptAt)
-  return !!lastAttempt && now.getTime() - lastAttempt.getTime() < cooldownMs
-}
-
 /** The current scope has its own retry gate, so a failed relationship-local
  * analysis does not suppress an unrelated piece of independent life. */
 export function alterScopeCoolingDown(state: AlterSystemState, participantId = '', now = new Date(), cooldownMs = 5 * 60 * 1000) {

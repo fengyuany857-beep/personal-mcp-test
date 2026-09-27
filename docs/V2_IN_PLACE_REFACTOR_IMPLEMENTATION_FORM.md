@@ -4,7 +4,7 @@
 
 最新增量：主提示词向 0.1.1-beta6 的简明剧本任务靠拢，合并原文与续写说明，取消逐步互动分析及每轮环境铺陈要求，允许口语省略、自然气泡停顿和开放结尾。保持同一剧本、认知归属、时间边界及行动引用；不修改记忆或调度算法。283 项回归与类型检查通过；beta9 发布与桌面安装随本次执行。实机需比较当前话语回应、未完成生活承接及事实归属，而不以回复变短作为拟真度结论。
 
-状态：当前修正版本为 **1.0.0-beta16**。在唯一剧本主链上汇总 P0-1/P0-2/P0-4、P1-1～P1-4、可选 Urge 调度、事件优先续写／Alter 收束／关系学习证据边界，以及生活剧本展开与消息感知提示词；P0-3 不实施。完整原始剧本仍是唯一续写正文，辅助记录只携带来源、角色视角、条件与调度，不把期待升级为共同事实。发布前自动测试、严格类型检查与构建通过；真实模型拟真度、多日运行与外部平台恢复仍待实机验收。详见 [P1 实现记录](development/P1_MEMORY_NAVIGATION.md)、[Urge 实现记录](development/URGE_SYSTEM_IMPLEMENTATION.md)、[事件优先修正](development/EVENT_LED_SCRIPT_REPAIR.md) 与 [更新记录](CHANGELOG.md)。下文 beta9 及旧里程碑保留作历史基线，涉及时间账本、实时 snapshot 与学习入口的旧描述，以本次状态和 [当前架构](ARCHITECTURE.md) 为准。  
+状态：当前修正版本为 **1.0.1-rc6**。在唯一剧本主链上汇总 P0-1/P0-2/P0-4、P1-1～P1-4、可选 Urge 调度、事件优先续写／Alter 收束／关系学习证据边界，以及生活剧本展开与消息感知提示词；P0-3 不实施。完整原始剧本仍是唯一续写正文，辅助记录只携带来源、角色视角、条件与调度，不把期待升级为共同事实。发布前自动测试、严格类型检查与构建通过；真实模型拟真度、多日运行与外部平台恢复仍待实机验收。详见 [P1 实现记录](development/P1_MEMORY_NAVIGATION.md)、[Urge 实现记录](development/URGE_SYSTEM_IMPLEMENTATION.md)、[事件优先修正](development/EVENT_LED_SCRIPT_REPAIR.md) 与 [更新记录](CHANGELOG.md)。下文 beta9 及旧里程碑保留作历史基线，涉及时间账本、实时 snapshot 与学习入口的旧描述，以本次状态和 [当前架构](ARCHITECTURE.md) 为准。  
 起点：`0.1.5-beta10-foresight`  
 架构依据：[SCRIPT_CENTRIC_ARCHITECTURE_REDESIGN.md](SCRIPT_CENTRIC_ARCHITECTURE_REDESIGN.md)  
 实施方式：在当前唯一主链上逐步替换，不建设生产并行的 V1/V2 双引擎

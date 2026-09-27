@@ -1,6 +1,6 @@
 # HDS Interlude 配置指南
 
-适用版本：`1.0.1-beta6-rebuild`
+适用版本：`1.0.1-rc24`
 
 第一次安装先看 `BEGINNER_GUIDE.md`。本文件按配置依赖关系组织字段；下方先列出当前 Console 的实际顺序，旧版本已经移除或隐藏的字段集中列在末尾，不再混入正常配置流程。
 
@@ -65,6 +65,10 @@
 
 `fallback` 不调用远程模型，只适合验证插件、数据库和命令是否安装成功。
 
+### 自定义提供商协议（rc12）
+
+自定义 `openai-compatible` 提供商在 rc12 可选择 `protocol=chat-completions`（默认）或 `anthropic-messages`，后者使用 `/v1/messages` 及 `x-api-key` 认证。`anthropicCache` 默认关闭；开启后添加服务端缓存标记，与 `mainPayloadOrder=cache-first` 可组合。完整配置、流式与音频限制见 [rc12 适配说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)。以下官方预设仍采用各自原有协议。
+
 ### 智谱官方提供商模式
 
 在任意一行 `providers` 中将该行 `mode` 设为 `zhipu-official`，保存并重载后，Console 会切换为智谱专属字段：只需填写智谱 API Key、模型代码和推理强度。该行固定使用 `https://open.bigmodel.cn/api/paas/v4/chat/completions`，不会显示 endpoint、额外请求头或额外请求体；其它提供商行仍可保持 `openai-compatible`。
@@ -121,7 +125,7 @@
 - `mainTimeout`
 - `mainResponseFormat`：主叙事唯一的输出格式设置
 - `mainStreamingMode`：实验性流式首条回复，默认 `off`
-- `mainPayloadOrder`：主叙事 payload 字段顺序，默认 `legacy`
+- `mainPayloadOrder`：主叙事 payload 字段顺序，默认 `cache-first`；遇到服务商兼容性或上下文质量问题时可切回 `legacy`
 
 `mainPayloadOrder=cache-first` 重排用户 payload：对话历史（recentScript）与低频记忆层（长期事实、记忆、Overlay、场景摘要；有原文时不注入旧连续性快照）前置，每轮变化的字段（时钟、当前事件、参与者状态、意图账本）后置。对支持自动前缀缓存的服务商（DeepSeek 官方、GLM 官方、Kimi/Moonshot、硅基流动等），连续对话轮命中稳定前缀后输入成本与 prefill 延迟显著下降；群聊回合与 advance 回合的历史视图不同，缓存命中率会低于私聊连续对话。payload 末尾附带 `recentExchange` 最近交换块（最多 3 条、1600 字符，排除当前消息本身），把最后几条交互重新锚定在生成点旁，避免历史前置稀释语境显著性；固定合约会同步告知模型该块是既定过去的强调而非新事件。默认 `legacy` 使用常规字段顺序，两种模式都使用 beta6 的原文与执行语义。开启后建议先在沙盒观察若干轮回复质量与日志中的`回复模式`分布，不适配随时切回。
 
@@ -129,7 +133,7 @@
 
 思考型模型或 Ollama 兼容网关若在 `json-object` 下出现空回复、字段缺失或反复触发恢复重写，可先切换为 `prompt-only`，并按模型实际推理长度适度提高 `mainMaxTokens`。确认模型能稳定输出结构化结果后，再使用 `json-object`。
 
-`mainStreamingMode=experimental` 只在 `json-object` 下尝试私聊首条提前投递。它要求服务商返回标准 OpenAI SSE `choices[].delta.content`；智谱官方 GLM 走已有 SSE 路径，OpenAI-compatible 和各官方兼容预设走实验性通用路径。未知中转站请先在低风险私聊测试，群聊仍等待完整结果。首条成功投递后，后续流式结果失败不会触发可见消息重试，而是只安排一次无 transport 的剧本补写，避免重复发言。
+`mainStreamingMode=experimental` 只在 `json-object` 下尝试私聊首条提前投递。Chat Completions 要求标准 OpenAI SSE `choices[].delta.content`；rc12 的 Anthropic Messages 使用其原生 SSE text delta，thinking 不进入剧本。智谱官方 GLM 走已有 SSE 路径，其余兼容预设走实验性通用路径。未知中转站请先在低风险私聊测试，群聊仍等待完整结果。首条成功投递后，后续流式结果失败不会触发可见消息重试，而是只安排一次无 transport 的剧本补写，避免重复发言。
 
 ### 3.4 failover 与提示词
 
@@ -180,7 +184,7 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `cooldownSeconds` | 主角群发言后的最短冷却。 |
 | `willingness` | 可选的纯算法群聊意愿：积累、半衰减、阈值概率与成功发言成本。 |
 
-群聊不再调用独立快速筛选模型。满足入口规则的消息在合并后直接交给主叙事，由主叙事决定是否输出 `groupReply`。
+群聊不再调用独立快速筛选模型。普通消息合并后仍经过意愿与冷却判断，再交给主叙事。rc12 对可提取的音频文件/语音跳过意愿、冷却与仅 @ 门槛，直接进入合并写作队列，携带本批原生音频；仍由主叙事决定是否输出 `groupReply`。群白名单、原生音频开关、数量及大小限制保留；音频读取失败会警告。Messages 连接需要音频兼容的 Chat Completions 故障转移连接。
 
 对 `responseMode=always` 的活跃群，可开启 `willingness`。它完全在本地按算法运行：普通群消息累积意愿、按半衰期自然衰减、接近上限时增益递减、超过阈值后按概率决定是否进入主模型；主角成功群发言后会扣除意愿。关键词与引用机器人消息可增加意愿，@ 机器人始终绕过概率。它默认关闭，只作用于这个群，不影响私聊、Alter、Agency、自动推进或主提示词，也不产生额外模型调用。
 
@@ -192,6 +196,19 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `timeoutMs` | `20000` | 转写最大等待时间；超时后仍保留语音事实并继续本轮。 |
 
 转写成功后，主模型收到的用户事件会带有 `[用户语音转写]` 标记，并和当前文本、图片一起构成同一个回合。该功能需要 SnowLuma 支持原始 OneBot `fetch_ptt_text` 动作；NapCat 或其它实现不支持时会安全降级。它不把音频文件或 base64 写入 HDSI 数据库。
+
+### 4.4 `model.audio`：原生音频理解
+
+这条路径与 `voiceTranscription` 不同：不请求文字转写，而是由 SnowLuma 将 QQ SILK 语音转码后作为原生音频内容交给主模型。只有支持音频输入的主模型（例如 Gemini）才适用；它不会在模型不支持时自动回退为文字转写。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `false` | 启用原生语音/音频理解。 |
+| `outFormat` | `mp3` | SnowLuma 转码格式；`mp3` 通常兼容性最好。 |
+| `maxFileSizeMB` | `10` | 单个音频附件最大体积。超出后保留语音事实但跳过音频输入。 |
+| `maxPerMessage` | `1` | 每个事件最多接收的音频附件数。 |
+
+转码失败、OneBot 实现不支持或模型拒绝音频时，插件继续处理同一消息中的文字和图片，不猜测音频内容；音频二进制和请求内容不会写入 HDSI 数据库。
 
 ## 4. sharedStory：共享主剧本（【结构 4】）
 
@@ -206,6 +223,8 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `participantContextLimit` | 单次请求携带的其它参与者摘要数量。 |
 | `managerAccounts` | 有权执行全局管理命令的 QQ；空表表示所有已授权用户。 |
 
+启用 `allowCrossConversationMessages` 后，模型可在私聊回合同时输出当前私聊回复和群消息。群消息目标使用 `crossConversationActions[].participantId` 的 `group:<QQ群号>` 格式，并且只能投递到 `onebot.groupChats` 中已启用的群。
+
 ## 5. runtime：运行时与节奏（【节奏 5】）
 
 ### 6.1 消息合并、回复和失败恢复
@@ -216,6 +235,19 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `autoCreate` | 没有故事时是否从当前 Console 档案自动启动；关闭时先执行 `interlude.doctor`，再由管理员执行 `interlude.story.start`。 |
 | `ignoreCommandMessages` | 防止管理命令进入剧本。 |
 | `userMessageDebounceSeconds` | 合并连续私聊的静默等待时间，默认 2 秒。 |
+
+### 6.2 QQ 合并转发读取
+
+`runtime.forwardMessage` 默认开启。收到 QQ `forward` segment 时，HDSI 会通过当前 SnowLuma/OneBot 账号调用 `get_forward_msg`，把转发节点中的文字、@、回复关系和媒体类型占位符并入同一条当前用户事件；普通文本、图片和语音消息不会额外发起请求。
+
+| 字段 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `enabled` | `true` | 关闭后不读取正文，保留原有转发卡片行为。 |
+| `maxNodes` | `30` | 单条转发最多读取的节点数。 |
+| `maxCharacters` | `8000` | 注入当前事件的最大字符数。 |
+| `maxDepth` | `3` | 嵌套合并转发的最大展开层数。 |
+
+读取失败、资源标识缺失或达到预算时会保留占位事实，不根据卡片摘要猜测正文。转发节点中的第三方发言属于“被转交内容”，不会自动创建参与者或绕过现有白名单。
 | `narrativeRetryDelaySeconds` / `narrativeRetryMaxAttempts` | 叙事服务失败后的重试节奏。 |
 | `cancelDelayedRepliesOnUserMessage` | 是否同时取消普通延迟回复和跨关系计划；未发送的 `<sep/>` 分段始终会被新消息截断。 |
 | `minimumDelayedReplySeconds` / `maximumDelayedReplyMinutes` | 模型允许计划的延迟范围。 |
@@ -239,8 +271,8 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `minimumAdvanceMinutes` | 手动推进在没有到期任务时需要的最小时间差。 |
 | `allowProactiveMessages` | 是否允许无新消息时产生可见主动联系。 |
 | `proactiveWillingnessThreshold` | 主模型主动联系意愿门槛。 |
-| `contextEntryLimit` | 近期上下文最低条目数，默认 `50`。与 cache-first 搭配时提升几乎不影响实际成本。 |
-| `contextTimeWindowMinutes` | 与条目下限取并集的时间窗口，默认 `60` 分钟；窗口内真实用户/角色消息受保护。 |
+| `contextEntryLimit` | 近期上下文最低条目数，默认 `35`。与 cache-first 搭配时提升几乎不影响实际成本。 |
+| `contextTimeWindowMinutes` | 与条目下限取并集的时间窗口，默认 `45` 分钟；窗口内真实用户/角色消息受保护。 |
 | `memoryLimit` | 主叙事携带的长期事实数量。 |
 
 ## 6. urge：弹性推进（【节奏 6】）

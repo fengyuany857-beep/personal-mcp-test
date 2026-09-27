@@ -2,7 +2,7 @@ import type { NarrativeIntent } from '../types'
 
 /** These tasks have their own executor, never the live narrator's completion. */
 export function liveNarrativeIntents(intents: NarrativeIntent[]) {
-  return intents.filter(intent => !['split-message', 'browser-research', 'proactive-check', 'active-consequence'].includes(intent.type))
+  return intents.filter(intent => !['split-message', 'browser-research', 'narrative-retry', 'proactive-check', 'active-consequence'].includes(intent.type))
 }
 
 export function consumedLiveIntentIds(intents: NarrativeIntent[]) {

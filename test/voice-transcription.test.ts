@@ -90,3 +90,31 @@ test('group inbound attachments become fact placeholders instead of URL soup', (
   assert.equal(describeGroupAttachments('听这个[CQ:record,file=abc.silk,url=https://x/y.silk]'), '听这个[语音]')
   assert.equal(describeGroupAttachments('正常文字和[微笑]表情'), '正常文字和[微笑]表情')
 })
+
+test('blank-line boundaries in reply content become bubble separators; single line breaks stay inside one bubble', () => {
+  const runtime = { maxMessageCharacters: 500, messageSeparator: '<sep/>', minimumDelayedReplySeconds: 10, maximumDelayedReplyMinutes: 120 }
+  // 空行（段落边界）→ 气泡分隔
+  const blank = normalizeInteraction({
+    seen: true,
+    reply: { mode: 'immediate', content: '在呢\n\n刚在忙，怎么了？' },
+  }, new Date(), runtime as any)
+  assert.equal(blank?.reply.content, '在呢<sep/>刚在忙，怎么了？')
+  // 单个换行留在一条消息内：不再机械制造两段式（反定式，实测 24/24 回合精确 2.0 段）。
+  const single = normalizeInteraction({
+    seen: true,
+    reply: { mode: 'immediate', content: '在呢\n刚在忙' },
+  }, new Date(), runtime as any)
+  assert.equal(single?.reply.content, '在呢\n刚在忙')
+  // 已用分隔符的内容不受影响。
+  const already = normalizeInteraction({
+    seen: true,
+    reply: { mode: 'immediate', content: '在呢<sep/>刚在忙' },
+  }, new Date(), runtime as any)
+  assert.equal(already?.reply.content, '在呢<sep/>刚在忙')
+  // 拆条关闭时保持原样（分隔符不会被拆分，也不做转换）。
+  const off = normalizeInteraction({
+    seen: true,
+    reply: { mode: 'immediate', content: '在呢\n\n刚在忙' },
+  }, new Date(), { ...runtime, splitReplyMessages: false } as any)
+  assert.equal(off?.reply.content, '在呢\n\n刚在忙')
+})

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { attachMessageEvent, prepareOutgoingDelivery, restoreMessageEvent, scriptEventPayload } from '../src/delivery'
-import { decisionToScriptCommit, findOutgoingScriptEvent } from '../src/script/commit-builder'
+import { decisionToScriptCommit, findPrivateOutgoingMessageEvent } from '../src/script/commit-builder'
 import {
   createScriptDeliveryActions, deliveryReference, platformActionReference, updateScriptDeliveryActions,
 } from '../src/script/delivery-ledger'
@@ -20,7 +20,7 @@ test('partial requires actual delivery, while unfinished attempts remain pending
 test('ledger read and write failures do not interrupt confirmation or remaining bubble scheduling', async () => {
   for (const failure of ['read', 'write']) {
     const value = commit()
-    const event = findOutgoingScriptEvent(value, 'alice')!
+    const event = findPrivateOutgoingMessageEvent(value, 'alice')!
     const intents: any[] = []
     const warnings: any[] = []
     const service: any = {
@@ -80,7 +80,7 @@ test('M6 ledger groups text and platform segments under their script event ident
 
 test('M6 ledger reports partial and terminal delivery without downgrading delivered speech', () => {
   const value = commit()
-  const event = findOutgoingScriptEvent(value, 'alice')!
+  const event = findPrivateOutgoingMessageEvent(value, 'alice')!
   const initial = createScriptDeliveryActions(value)
   const first = deliveryReference(event, 42, 0)!
   const second = deliveryReference(event, 42, 1)!
@@ -95,7 +95,7 @@ test('M6 ledger reports partial and terminal delivery without downgrading delive
 
 test('a successful retry clears an earlier transport failure reason', () => {
   const value = commit()
-  const event = findOutgoingScriptEvent(value, 'alice')!
+  const event = findPrivateOutgoingMessageEvent(value, 'alice')!
   const reference = deliveryReference(event, 42, 0)!
   const failed = updateScriptDeliveryActions(createScriptDeliveryActions(value), reference, 'failed', new Date(), 'temporary network failure')!
   const recovered = updateScriptDeliveryActions(failed, reference, 'delivered', new Date())!
@@ -111,7 +111,7 @@ test('M6 persistence changes metadata only and delivery preserves exact bubble t
   assert.deepEqual(draft.metadata?.scriptEvents, value.events)
   assert.ok(Array.isArray(draft.metadata?.deliveryActions))
 
-  const event = findOutgoingScriptEvent(value, 'alice')!
+  const event = findPrivateOutgoingMessageEvent(value, 'alice')!
   const attached = attachMessageEvent({ participantId: 'alice', content: event.content! }, event, 42)
   const prepared = prepareOutgoingDelivery(attached, event.bubbles!)!
   assert.equal(prepared.content, '第一句')

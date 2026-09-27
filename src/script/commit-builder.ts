@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { NarrativeDecision, NarrativePhase } from '../types'
-import { resolveAuthoredActions, type AuthoredAction } from './authored-actions'
+import { reconcileTransportReferences, type AuthoredAction } from './authored-actions'
 import {
   isOutgoingScriptEvent, ScriptCommitDraft, ScriptDeliveryMode, ScriptEventDraft,
 } from './contract'
@@ -26,7 +26,7 @@ export interface ScriptFirstDecisionInput {
  * decisions; it gives the existing single response stable commit/event ids.
  */
 export function decisionToScriptCommit(input: ScriptFirstDecisionInput): ScriptCommitDraft {
-  input = { ...input, decision: resolveAuthoredActions(input.decision, false, input.messageSeparator) }
+  input = { ...input, decision: reconcileTransportReferences(input.decision, false, input.messageSeparator) }
   const participantId = input.participantId?.trim() ?? ''
   const prose = input.decision.script?.trim() ?? ''
   const commitId = stableCommitId(input, participantId, prose)
@@ -48,7 +48,9 @@ export function decisionToScriptCommit(input: ScriptFirstDecisionInput): ScriptC
     kind: 'narrative', actor: 'protagonist', occurredAt: input.now.toISOString(),
     causedByEventIds: perceived ? [perceived.eventId] : [], content: prose,
   })
-  if (interaction?.reply.content && (interaction.reply.mode === 'immediate' || interaction.reply.mode === 'delayed')) {
+  // 空白 content（模型偶发输出纯空格）不生成消息事件：truthy 检查会放过 ' '，
+  // 随后 validator 的空 bubbles 检查将拒绝整个 commit——一条废消息不该炸掉整回合。
+  if (interaction?.reply.content?.trim() && (interaction.reply.mode === 'immediate' || interaction.reply.mode === 'delayed')) {
     addMessageEvent(add, {
       participantId,
       content: interaction.reply.content,
@@ -134,7 +136,7 @@ export function decisionToScriptCommit(input: ScriptFirstDecisionInput): ScriptC
   }
 }
 
-export function findOutgoingScriptEvent(
+export function findPrivateOutgoingMessageEvent(
   commit: ScriptCommitDraft,
   participantId: string,
   mode?: ScriptDeliveryMode,

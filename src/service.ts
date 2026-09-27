@@ -1,12 +1,16 @@
 import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { registerTables } from './database'
+import { createWorldSeeder, parseWorldSeedEvents, resolveWorldSeederRuntime, validateSeedEvent, type SeedValidationInput, type WorldSeeder } from './world-seeder'
+import type { SeededWorldEvent } from './types'
+import { HealthMonitor } from './health'
 import { contactEvidenceThreads, knowledgeClauses, knowledgeRelatedIds, legacyConditionCue, normalizeKnowledgeEvidence, supportsRecordedOutcome } from './script/knowledge-evidence'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { createTurnEngine, shouldSupersedeRequest, type TurnEngine, type TurnBufferedNarrativeTurn as BufferedNarrativeTurn, type TurnBufferedUserMessage as BufferedUserMessage } from './turn-engine'
 import { UrgeConfig, resolveUrgeConfig, normalizeUrgeState, urgeUserEvent, planUrge, commitUrge, acknowledgeUrge, urgeBurstActive } from './urge'
 import { extname, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { AudioConfig, compactPromptEntries, createCompactor, createEmbedder, createNarrator, createStickerDescriber, createVisionDescriber, formatTokenUsageLine, ModelConfig, promptVisibleMessageContent, recentScriptOwnership, StickerDescriber, StickerDescription, TokenUsageRecord, VisionDescriber } from './narrator'
+import { AudioConfig, compactPromptEntries, createCompactor, createEmbedder, createNarrator, createStickerDescriber, createVisionDescriber, detectMessageRepetition, formatTokenUsageLine, ModelConfig, promptVisibleMessageContent, recentScriptOwnership, StickerDescriber, StickerDescription, TokenUsageRecord, VisionDescriber } from './narrator'
 import { formatModelRouting, ModelRoutingTable, resolveModelRouting } from './model-routing'
 import {
   advanceAlterSystem, alterHistoryForScope, alterScopeCoolingDown, alterScopeValue, calculateAlterThreshold,
@@ -17,7 +21,7 @@ import {
 import { buildEpisodeIndex, episodeExcerpt, groundedEpisodeTags, episodeTagScore } from './script/episode-index'
 import { indexOriginal, scoreOriginal, recallKeys, recallFocus, type RecallSpan } from './script/recall-navigation'
 import { developmentDimension, developmentScenes, developmentContextQuery, promptReadyDevelopment, reviewedDevelopmentSupport } from './script/development'
-import { resolveAuthoredActions } from './script/authored-actions'
+import { reconcileTransportReferences } from './script/authored-actions'
 import { normalizeLifeHandoff, entryLifeHandoff } from './script/life-handoff'
 import { needsTimelineDirector } from './script/timeline-routing'
 import { assertContinuityReview, compactionPrefix } from './script/continuity-checkpoint'
@@ -28,8 +32,9 @@ import {
 import { HDS_INTERLUDE_VERSION } from './meta'
 import { formatLayeredLog, phaseLabel, renderLogMessage } from './logging'
 import { calendarDayKey, formatLogTime, localClockMinutes, storyLocalTimeContext } from './time'
-import { consumeGroupWillingness, evaluateGroupWillingness, GroupWillingnessConfig, GroupWillingnessState } from './group-willingness'
+import { consumeWillingnessGate, evaluateWillingnessGate, GroupWillingnessConfig, GroupWillingnessState, normalizeLifeStatusDraft } from './group-willingness'
 import { normalizeQQNativeFaceSegments } from './qq-face'
+import { extractForwardIds, readForwardContent, ForwardReadResult } from './forward-message'
 import {
   applySchedulePreplanProposal, nextSchedulePreplanTransition, normalizeSchedulePreplanRecord,
   refreshSchedulePreplan, resolveSchedulePreplanConfig, SchedulePreplanConfig, schedulePreplanNeedsModel,
@@ -40,7 +45,7 @@ import {
   normalizeContinuitySnapshot, normalizeScenePresenceState,
 } from './story-state'
 import { attachMessageEvent, deliveryEntryMetadata, prepareOutgoingDelivery, restoreMessageEvent, scriptEventPayload } from './delivery'
-import { decisionToScriptCommit, findGroupScriptEvent, findOutgoingScriptEvent, unboundImmediateMessageEvents } from './script/commit-builder'
+import { decisionToScriptCommit, findGroupScriptEvent, findPrivateOutgoingMessageEvent, unboundImmediateMessageEvents } from './script/commit-builder'
 import { liveNarrativeIntents, consumedLiveIntentIds } from './script/intent-lifecycle'
 import { messageEventReference, ScriptCommitDraft } from './script/contract'
 import { platformActionReference, ScriptDeliveryReference, ScriptDeliverySegmentStatus, updateScriptDeliveryActions } from './script/delivery-ledger'
@@ -62,7 +67,7 @@ import {
 } from './types'
 import type { DesktopInboundEvent, DesktopRuntimePhase } from './desktop-bridge'
 
-export type DesktopTimelineTrack = 'script' | 'messages' | 'system' | 'scenes' | 'facts' | 'preplan'
+export type DesktopTimelineTrack = 'script' | 'messages' | 'system' | 'scenes' | 'facts' | 'preplan' | 'alter' | 'compaction'
 export interface DesktopTimelineRangeRequest {
   from?: string
   to?: string
@@ -73,7 +78,7 @@ export interface DesktopTimelineRangeRequest {
   limit?: number
 }
 
-const DESKTOP_TIMELINE_TRACKS: DesktopTimelineTrack[] = ['script', 'messages', 'system', 'scenes', 'facts', 'preplan']
+const DESKTOP_TIMELINE_TRACKS: DesktopTimelineTrack[] = ['script', 'messages', 'system', 'scenes', 'facts', 'preplan', 'alter', 'compaction']
 
 function desktopTimelineTrackForEntry(entry: Pick<ScriptEntry, 'kind' | 'actor'>): DesktopTimelineTrack {
   if (entry.kind === 'script' || entry.actor === 'narrator') return 'script'
@@ -85,6 +90,24 @@ function parseDesktopTimelineDate(value: unknown) {
   if (typeof value !== 'string') return undefined
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? undefined : date
+}
+
+/** Fix#9: 分页游标改为 occurredAt+id 双键（与排序键一致）；旧 entry:<id> 继续兼容。 */
+export interface TimelineCursor { occurredAt?: Date, id?: number }
+export function parseTimelineCursor(cursor: string | undefined): TimelineCursor | undefined {
+  if (typeof cursor !== 'string' || !cursor) return undefined
+  const dual = /^e:(\d{12,15}):(\d+)$/.exec(cursor)
+  if (dual) return { occurredAt: new Date(Number(dual[1])), id: Number(dual[2]) }
+  const legacy = /^entry:(\d+)$/.exec(cursor)
+  if (legacy) return { id: Number(legacy[1]) }
+  return undefined
+}
+export function timelineEntryQueryAfter(base: Record<string, unknown>, cursor: TimelineCursor | undefined): Record<string, unknown> {
+  if (!cursor) return base
+  if (cursor.occurredAt && Number.isFinite(cursor.id!)) {
+    return { $and: [base, { $or: [{ occurredAt: { $lt: cursor.occurredAt } }, { occurredAt: cursor.occurredAt, id: { $lt: cursor.id } }] }] }
+  }
+  return cursor.id != null ? { ...base, id: { $lt: cursor.id } } : base
 }
 
 function normalizeDesktopTimelineRangeRequest(value: DesktopTimelineRangeRequest) {
@@ -99,9 +122,8 @@ function normalizeDesktopTimelineRangeRequest(value: DesktopTimelineRangeRequest
   const tracks = new Set((Array.isArray(value.tracks) ? value.tracks : DESKTOP_TIMELINE_TRACKS)
     .filter((track): track is DesktopTimelineTrack => DESKTOP_TIMELINE_TRACKS.includes(track as DesktopTimelineTrack)))
   if (!tracks.size) DESKTOP_TIMELINE_TRACKS.forEach(track => tracks.add(track))
-  const cursorId = typeof value.cursor === 'string' && /^entry:\d+$/u.test(value.cursor)
-    ? Number(value.cursor.slice('entry:'.length)) : undefined
-  return { from, to, tracks, cursorId, limit: Math.max(1, Math.min(Math.floor(Number(value.limit) || 240), 500)), detailLevel: value.detailLevel === 'full' ? 'full' : 'summary' as const }
+  const cursor = parseTimelineCursor(typeof value.cursor === 'string' ? value.cursor : undefined)
+  return { from, to, tracks, cursor, limit: Math.max(1, Math.min(Math.floor(Number(value.limit) || 240), 500)), detailLevel: value.detailLevel === 'full' ? 'full' : 'summary' as const }
 }
 
 function desktopRangeOverlaps(from: Date, to: Date, start: Date, end?: Date) {
@@ -161,6 +183,12 @@ export function desktopTimelineEntryView(entry: ScriptEntry) {
     ...(typeof entry.metadata?.commitId === 'string' ? { commitId: entry.metadata.commitId } : {}),
     ...(desktopDeliveryRealitySummary(entry) ? { deliveryActions: desktopDeliveryRealitySummary(entry) } : {}),
     ...(desktopSceneCheckpoint(entry) ? { sceneCheckpoint: desktopSceneCheckpoint(entry) } : {}),
+    // Media attachment counts for the desktop media/files track.
+    ...(typeof entry.metadata?.imageCount === 'number' && entry.metadata.imageCount > 0 ? { imageCount: entry.metadata.imageCount } : {}),
+    ...(typeof entry.metadata?.audioCount === 'number' && entry.metadata.audioCount > 0 ? { audioCount: entry.metadata.audioCount } : {}),
+    // Alter value for the desktop alter track (severity/colour rendering).
+    ...(typeof entry.metadata?.alterValue === 'number' ? { alterValue: entry.metadata.alterValue } : {}),
+    ...(typeof entry.metadata?.alterOffset === 'string' && entry.metadata.alterOffset ? { alterOffset: entry.metadata.alterOffset } : {}),
   }
 }
 
@@ -270,6 +298,10 @@ export interface Config {
   sharedStory?: SharedStoryConfig
   /** Optional, read-only browser observations powered by koishi-plugin-puppeteer. */
   browser?: BrowserConfig
+  /** 世界事件播种器：独立提供商配置块；未选模型即视为关闭。 */
+  worldSeeder?: unknown
+  /** 顶层主提示词（Console 最底部）：非空时覆盖 model.mainPrompt。 */
+  mainPrompt?: string
   /** Optional OneBot/NapCat account gate. It only affects the onebot platform. */
   onebot?: OneBotNapCatConfig
   /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
@@ -347,6 +379,10 @@ export interface GroupChatRule {
   contextLimit: number
   debounceSeconds: number
   cooldownSeconds: number
+  /** 档位化的群聊意愿门：off/quiet/reserved/normal/active/eager/auto/custom。 */
+  willingnessPreset?: string
+  /** auto 档三态（busy/asleep/idle）各自使用的档位。 */
+  willingnessAuto?: { busy?: string, idle?: string, asleep?: string }
   willingness?: Partial<GroupWillingnessConfig>
 }
 
@@ -433,6 +469,12 @@ export interface RuntimeConfig {
   typingJitterRatio?: number
   /** Wait after the newest user message before starting a writing request. */
   userMessageDebounceSeconds?: number
+  forwardMessage?: {
+    enabled?: boolean
+    maxNodes?: number
+    maxCharacters?: number
+    maxDepth?: number
+  }
   /** @deprecated Ignored since 0.1.2; requests remain replaceable until the first reply is committed. */
   staleNarrativeRequestWindowSeconds?: number
   /** 新版自动推进调度；旧版 minimumAdvanceMinutes 仍保留兼容。 */
@@ -516,39 +558,13 @@ interface AutoAdvanceConfig {
   restWindows: RestWindow[]
 }
 
-interface BufferedUserMessage {
-  content: string
-  occurredAt: Date
-  supersededIntents: NarrativeIntent[]
-  quote?: QuotedMessageContext
-  /** Short-lived source links only; never written to HDSI storage. */
-  imageSources: string[]
-  /** Short-lived voice record tokens/URLs only; never written to HDSI storage. */
-  audioSources: string[]
-}
-
-/** A per-relationship input buffer. Messages are durable immediately, while
- * the narrator waits briefly for the user to finish a short burst. */
-interface BufferedNarrativeTurn {
-  storyId: string
-  participantId: string
-  messages: BufferedUserMessage[]
-  latestSession?: Session
-  /** Context timers return a disposer rather than Node's native Timeout. */
-  timer?: () => void
-  nextRevision: number
-  inFlightRequestId?: number
-  firstMessageCommittedRequestId?: number
-  obsoleteRequestIds: Set<number>
-}
-
 interface BufferedGroupTurn {
   storyId: string
   groupId: string
   rule: GroupChatRule
   channelId: string
   latestSession?: Session
-  messages: GroupMessageContext[]
+  messages: (GroupMessageContext & { audioSources?: string[], audioSession?: Session })[]
   timer?: () => void
   revision: number
   mentionedBot: boolean
@@ -579,6 +595,8 @@ export interface StoryDefaults {
   characterName: string
   characterProfile: string
   perspective: string
+  perspectives?: string[]
+  supplementaryFacts?: string[]
   userProfile: string
   relationship: string
   world: string
@@ -625,6 +643,8 @@ export class InterludeService extends Service {
   static inject = ['database', 'http']
   private narrator: NarrativeProvider
   private compactor: NarrativeCompactor
+  private worldSeeder: WorldSeeder = { available: false, generate: async () => { throw new Error('世界播种器未配置。') } }
+  private worldSeederRuntime = resolveWorldSeederRuntime(undefined)
   private embedder: NarrativeEmbedder
   private stickerDescriber: StickerDescriber
   private visionDescriber: VisionDescriber
@@ -633,6 +653,10 @@ export class InterludeService extends Service {
    * minimal content. Loaded lazily on first recall and extended incrementally
    * by the background backfill; never persisted. */
   private historyVectors = new Map<string, Map<number, HistoryVectorEntry>>()
+  /** 桥接幂等（轻量修复）：桌面 30s 超时后入 inbox 重放时，同一消息会再次到达。
+   * 用内存 Map 按 platform:messageId 去重——进程生命周期内有效，重启后由
+   * script_entry.metadata.messageId 的磁盘记录兜底（重放场景不会跨重启）。 */
+  private seenIncomingMessages = new Map<string, number>()
   private historyVectorsReady = new Set<string>()
   private historyVectorLoads = new Map<string, Promise<void>>()
   private historyBackfills = new Set<string>()
@@ -655,7 +679,7 @@ export class InterludeService extends Service {
    * 取消旧延迟回复”可能与定时发送同时发生，造成过期消息仍被发出。
    */
   private queues = new Map<string, Promise<unknown>>()
-  private bufferedNarrativeTurns = new Map<string, BufferedNarrativeTurn>()
+  private turnEngine!: TurnEngine
   private bufferedGroupTurns = new Map<string, BufferedGroupTurn>()
   /** Short-lived group-member display names. QQ number remains the stable key. */
   private groupMemberNameCache = new Map<string, { name: string, expiresAt: number }>()
@@ -667,7 +691,6 @@ export class InterludeService extends Service {
   /** Synchronously marks a relationship whose current typing chain was interrupted by new input. */
   private interruptedTypingParticipants = new Set<string>()
   /** Prevent a background life turn from racing an unlocked live model call. */
-  private narratingStories = new Set<string>()
   private factBackfills = new Set<string>()
   /** Coalesce repeated post-turn compaction requests into one queued pass. */
   private scheduledCompactions = new Set<string>()
@@ -694,6 +717,14 @@ export class InterludeService extends Service {
   private cachedAgencyConfig?: AgencyConfig
   private cachedSchedulePreplanConfig?: SchedulePreplanConfig
   private cachedBlindModeConfig?: BlindModeConfig
+  /** P3: Console 健康面板的内存滚动指标（重载后归零）。 */
+  readonly health = new HealthMonitor()
+  /** Token 用量到达时可能尚未有 canonical story——用最近活跃的 storyId 记账。
+   * P3 Fix: constructor 末尾初始化为当前 canonical story，减少首轮漏记。 */
+  private lastActiveStoryId?: string
+  private get canonicalStoryIdForHealth() { return this.lastActiveStoryId ?? '' }
+  /** P2 Fix: 主动联系计数——发送动作入列后待平台确认的数量。 */
+  private pendingProactiveCount = 0
   private cachedAutoAdvanceConfig?: AutoAdvanceConfig
   private cachedSharedStoryConfig?: SharedStoryConfig
   private cachedMemoryConfig?: MemoryConfig
@@ -720,15 +751,50 @@ export class InterludeService extends Service {
     registerTables(ctx)
     // One shared token-usage sink: every chat task (main/compaction/alter/
     // sticker description) reports through here and lands in the Koishi log.
-    const onUsage = (record: TokenUsageRecord) => this.reportTokenUsage(record)
+    const onUsage = (record: TokenUsageRecord) => {
+      this.reportTokenUsage(record)
+      // P3: token 用量进入健康面板（按当前 canonical 故事记账，重载后归零）。
+      if (record.inputTokens || record.cachedInputTokens) {
+        const storyId = this.canonicalStoryIdForHealth
+        if (storyId) this.health?.recordTokens(storyId, record.inputTokens ?? 0, record.cachedInputTokens ?? 0)
+      }
+    }
     this.modelRouting = resolveModelRouting(config.model, config.alterSystem)
     this.narrator = createNarrator(ctx, config.model, this.blindModeConfig.enabled, onUsage, this.modelRouting)
     this.compactor = createCompactor(ctx, config.model, this.blindModeConfig.enabled, onUsage, this.modelRouting)
     this.embedder = createEmbedder(ctx, config.model, this.modelRouting)
     this.stickerDescriber = createStickerDescriber(ctx, config.model, this.blindModeConfig.enabled, onUsage, this.modelRouting)
     this.visionDescriber = createVisionDescriber(ctx, config.model, this.blindModeConfig.enabled, onUsage, this.modelRouting)
+    // 播种器模型来自模型中心的“用于世界播种”勾选（useForWorldSeeding）；
+    // 无勾选连接即视为关闭——不再单独复制一份提供商配置。
+    const seederProvider = (config.model.providers ?? []).find(provider => provider.enabled !== false && provider.useForWorldSeeding === true && provider.model?.trim())
+    this.worldSeederRuntime = resolveWorldSeederRuntime(config.worldSeeder, seederProvider)
+    if (this.worldSeederRuntime.enabled) {
+      this.worldSeeder = createWorldSeeder(ctx, config.model, this.worldSeederRuntime, onUsage)
+      this.reportStandaloneOperation('standard', 'info', '世界播种器已启用 模型=%s 间隔=%d分钟', this.worldSeederRuntime.provider?.model, this.worldSeederRuntime.cadenceMinutes)
+    }
+    // P2 Fix: 侧端任务成败上报到健康面板——注册必须在 narrator/compactor 创建之后，
+    // 参数签名为 (task, ok)。narrator 和 compactor 是独立实例，都要注册。
+    const sideTaskHealthReporter = (_task: string, ok: boolean) => {
+      const storyId = this.canonicalStoryIdForHealth
+      if (storyId) this.health?.recordSideTask(storyId, ok)
+    }
+    for (const target of [this.narrator, this.compactor]) {
+      if (target && typeof (target as any).setSideTaskHealthReporter === 'function') {
+        ;(target as any).setSideTaskHealthReporter(sideTaskHealthReporter)
+      }
+    }
     // Defer timer registration by one event-loop turn. This keeps Console
     // plugin load/reload responsive while preserving the same background work.
+    // TurnEngine：回合状态管理（缓冲回合容器 + narrating 标记）集中于此，
+    // service 仅通过 turnEngine.turns / turnEngine.narrating 访问。
+    this.turnEngine = createTurnEngine({
+      setTimeout: (fn: () => void, ms: number) => this.ctx.setTimeout(fn, ms),
+      userMessageDebounceSeconds: this.config.runtime.userMessageDebounceSeconds ?? 2,
+      reportOperation: (level: string, kind: string, story: InterludeStory, phase: string, message: string, ...args: unknown[]) => {
+        this.reportOperation(level as 'summary' | 'standard' | 'diagnostic', kind as 'error' | 'warn' | 'info' | 'debug', story, phase as NarrativeRequest['phase'], message, ...args)
+      },
+    })
     ctx.setTimeout(() => this.startBackgroundTasks(), 0)
     // The logger target may not be installed yet during plugin construction;
     // emit a second lifecycle record after Koishi is ready so it is visible in
@@ -745,6 +811,9 @@ export class InterludeService extends Service {
     const sweepInterval = Math.max(1, this.config.runtime.sweepIntervalMinutes)
     this.ctx.setInterval(() => void this.sweep().catch(error => this.reportStandalone('warn', '后台推进失败 错误=%s', error)), sweepInterval * Time.minute)
     if (this.memoryConfig.enabled || this.schedulePreplanConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('warn', '后台整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
+    if (this.worldSeederRuntime.enabled && this.worldSeeder.available) {
+      this.ctx.setInterval(() => void this.worldSeederSweep().catch(error => this.reportStandalone('warn', '世界播种器运行失败 错误=%s', error)), this.worldSeederRuntime.cadenceMinutes * Time.minute)
+    }
     if (this.blindModeConfig.enabled) {
       this.ctx.setInterval(() => this.reportBlindModeHealth(), this.blindModeConfig.healthReportMinutes * Time.minute)
     }
@@ -771,7 +840,7 @@ export class InterludeService extends Service {
     if (phase === 'paused') {
       for (const timer of this.dueIntentWakeTimers.values()) timer.cancel()
       this.dueIntentWakeTimers.clear()
-      for (const turn of this.bufferedNarrativeTurns.values()) {
+      for (const turn of this.turnEngine.turns.values()) {
         if (turn.timer) turn.timer()
         turn.timer = undefined
       }
@@ -782,7 +851,7 @@ export class InterludeService extends Service {
     } else if (phase === 'running') {
       // Resume only turns which were already persisted before pause. This
       // avoids both losing a message and manufacturing a new user event.
-      for (const [key, turn] of this.bufferedNarrativeTurns) {
+      for (const [key, turn] of this.turnEngine.turns) {
         if (turn.timer || turn.inFlightRequestId || !turn.messages.length) continue
         const revision = ++turn.nextRevision
         turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), 0)
@@ -865,11 +934,10 @@ export class InterludeService extends Service {
     const story = await this.getCanonicalStory()
     if (!story) return emptyDesktopTimelineRange()
     const query = normalizeDesktopTimelineRangeRequest(request)
-    const entryQuery: Record<string, unknown> = {
+    const entryQuery = timelineEntryQueryAfter({
       storyId: story.id,
       occurredAt: { $gte: query.from, $lte: query.to },
-    }
-    if (query.cursorId) entryQuery.id = { $lt: query.cursorId }
+    }, query.cursor)
     const candidateLimit = Math.min(query.limit * 4 + 1, 501)
     const [entryRows, sceneRows, factRows, preplan] = await Promise.all([
       this.dbGet('interlude_script_entry', entryQuery, { limit: candidateLimit, sort: { occurredAt: 'desc', id: 'desc' } }) as Promise<ScriptEntry[]>,
@@ -894,6 +962,10 @@ export class InterludeService extends Service {
     const latestEntryId = entryRows[0]?.id ?? 0
     const latestScene = scenes.reduce((latest, scene) => !latest || scene.startedAt > latest ? scene.startedAt : latest, '')
     const latestFact = facts.reduce((latest, fact) => !latest || fact.updatedAt > latest ? fact.updatedAt : latest, '')
+    // Alter 状态投影：从 story.state.alterSystem 提取当前值与 history 供桌面轨道渲染。
+    const alterProjection = this.projectAlterForDesktop(story)
+    // 压缩状态投影：当前活跃场景的 entryCount / 最后压缩时间。
+    const compactionProjection = this.projectCompactionForDesktop(story, sceneRows)
     return {
       protocol: 4,
       storyId: story.id,
@@ -902,7 +974,41 @@ export class InterludeService extends Service {
       cursorAt: story.cursorAt.toISOString(), updatedAt: story.updatedAt.toISOString(), timezone: story.setting.timezone,
       entries, scenes, facts,
       preplan: preplan ? { revision: preplan.revision, timezone: preplan.timezone, validFrom: preplan.validFrom, validThrough: preplan.validThrough, materializedDays: preplan.materializedDays } : undefined,
-      nextCursor: entryRows.length === candidateLimit && selectedEntries[0] ? `entry:${selectedEntries[0].id}` : undefined,
+      alter: alterProjection,
+      compaction: compactionProjection,
+      nextCursor: entryRows.length === candidateLimit && selectedEntries[0] ? `e:${selectedEntries[0].occurredAt.getTime()}:${selectedEntries[0].id}` : undefined,
+    }
+  }
+
+  /** Project alterSystem state for the desktop alter track. */
+  private projectAlterForDesktop(story: InterludeStory) {
+    const state = normalizeAlterSystemState(story.state.alterSystem)
+    if (!state) return undefined
+    return {
+      value: state.alterValue ?? 0,
+      alterWeight: state.alterWeight ?? 1,
+      emotionalOffset: state.emotionalOffset ? { direction: state.emotionalOffset.direction, intensity: state.emotionalOffset.intensity, description: state.emotionalOffset.description } : null,
+      lastUpdatedAt: state.lastUpdatedAt,
+      history: (state.history ?? []).slice(-30).map(h => ({
+        value: h.alterValue, alter: h.alter, at: h.timestamp,
+      })),
+    }
+  }
+
+  /** Project compaction status for the desktop compaction track. */
+  private projectCompactionForDesktop(story: InterludeStory, scenes: InterludeScene[]) {
+    const state = decodeStoryState(story.state)
+    const activeScene = scenes.find(s => s.status === 'active') ?? scenes[0]
+    if (!activeScene) return undefined
+    const lastCompactionAt = typeof state.lastContinuityUpdateAt === 'string' && state.lastContinuityUpdateAt
+      ? state.lastContinuityUpdateAt
+      : activeScene.updatedAt.toISOString()
+    return {
+      activeSceneId: activeScene.id,
+      sceneHook: activeScene.hook ?? '',
+      entryCount: activeScene.entryCount ?? 0,
+      lastCompactionAt,
+      isDirty: (activeScene.entryCount ?? 0) > 5,
     }
   }
 
@@ -1114,6 +1220,36 @@ export class InterludeService extends Service {
       kind: 'setup', actor: 'system', content: `The story begins with ${setting.character.name}.`,
       occurredAt: now.toISOString(), metadata: {},
     }, now)
+    // 补充事实写入初始长期事实：scope 按前缀推断（人物=character、关系=relationship、
+    // 其余=world），importance 中等、confidence 高（它们是配置的既定事实）。
+    for (const [index, fact] of (setting.supplementaryFacts ?? []).entries()) {
+      const text = fact.trim()
+      if (!text) continue
+      const scope = /^主角|^(?:她|他)的/.test(text) ? 'character' as const
+        : /关系|两人之间|互动/.test(text) ? 'relationship' as const
+          : 'world' as const
+      try {
+        await this.dbCreate('interlude_fact', {
+          storyId: story.id, participantId: '', scope,
+          content: text, importance: 0.6, confidence: 0.95, unresolved: false,
+          sourceEntryIds: [], status: 'active',
+          knowledge: { mode: 'confirmed', clauses: [], relatedFactIds: [] },
+          createdAt: now, updatedAt: now, lastSeenAt: now,
+        })
+      } catch (error) {
+        // 补充事实入库失败必须有日志——用户配置了它却发现没生效是最难排查的。
+        this.reportStandalone('warn', '补充事实入库失败 故事=%s 序号=%d 错误=%s', story.id, index, error)
+      }
+    }
+    // 回填 rc2/rc3 已写入但 lastSeenAt 为空的补充事实——不回填则 facts() 排序崩溃。
+    try {
+      const existingFacts = await this.dbGet('interlude_fact', { storyId: story.id, status: 'active' }) as NarrativeFact[]
+      for (const fact of existingFacts) {
+        if (!fact.lastSeenAt) {
+          await this.dbSet('interlude_fact', { id: fact.id }, { lastSeenAt: fact.updatedAt ?? fact.createdAt ?? now, updatedAt: now })
+        }
+      }
+    } catch { /* 防御性回填失败不阻断故事创建 */ }
     await this.scheduleNextAutomaticAdvance(story.id, now)
     return story
   }
@@ -1248,8 +1384,8 @@ export class InterludeService extends Service {
   private async recentEntriesForPrompt(storyId: string, now: Date) {
     // M4.1 restores a substantial raw-script continuation window. High-density
     // chat may add dozens of entries without demoting yesterday's causal tail.
-    const count = Math.max(50, Math.min(this.config.runtime.contextEntryLimit ?? 20, 200))
-    const minutes = Math.max(0, Math.min(this.config.runtime.contextTimeWindowMinutes ?? 60, 1_440))
+    const count = Math.max(35, Math.min(this.config.runtime.contextEntryLimit ?? 20, 200))
+    const minutes = Math.max(0, Math.min(this.config.runtime.contextTimeWindowMinutes ?? 45, 1_440))
     const [countRows, timeRows] = await Promise.all([
       this.dbGet('interlude_script_entry', { storyId }, { limit: count, sort: { occurredAt: 'desc' } }),
       minutes > 0
@@ -1430,6 +1566,8 @@ export class InterludeService extends Service {
    */
   async purgeAllStoryData(storyId: string) {
     this.invalidateBufferedNarratives(storyId)
+    // Fix#3: 软删后历史向量缓存必须失效，否则语义召回继续注入已删除内容直至重启。
+    this.invalidateHistoryVectors(storyId)
     await this.purgeTable('interlude_script_entry', { storyId }, {
       kind: 'redacted', actor: 'system', content: '[管理员已删除剧本内容]', metadata: { redacted: true },
     })
@@ -1486,6 +1624,20 @@ export class InterludeService extends Service {
   async clearDatabase() {
     if (this.databaseResetting) throw new Error('HDSI 数据库清空已经在进行中。')
     this.databaseResetting = true
+    // 竞态屏障：等待在途模型回合完成——否则正在飞行的模型调用会把含旧记忆的
+    // 剧本写入刚清过的数据库，下次调用读到"幽灵记忆"。
+    const inFlightKeys = []
+    for (const [key, turn] of this.turnEngine?.turns ?? new Map()) {
+      if (turn?.inFlightRequestId != null) inFlightKeys.push({ key, id: turn.inFlightRequestId })
+    }
+    for (const { key, id } of inFlightKeys) {
+      this.reportStandalone('warn', '清空前等待在途回合完成 参与者=%s 请求=%d', key, id)
+      const deadline = Date.now() + 30_000
+      const turns = this.turnEngine?.turns
+      while (turns?.get(key)?.inFlightRequestId === id && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+    }
     this.invalidateBufferedNarratives()
     this.invalidateHistoryVectors()
     try {
@@ -1609,7 +1761,8 @@ export class InterludeService extends Service {
     if (!rule) return false
     const mentionedBot = mentionsBot(session)
     const quotedBot = quotesBot(session)
-    if (rule.responseMode === 'mention-only' && !mentionedBot) return false
+    const audioSources = extractSessionAudioSources(session)
+    if (rule.responseMode === 'mention-only' && !mentionedBot && !audioSources.length) return false
     let story = await this.findStory(session)
     if (!story && this.config.runtime.autoCreate) story = await this.createStory(session)
     if (!story || story.status !== 'active') return false
@@ -1617,7 +1770,22 @@ export class InterludeService extends Service {
     const senderId = normalizeAccountId(session.userId)
     const senderName = await this.groupSenderName(groupId, senderId, session)
     const quote = describeQuotedMessage(session, story.setting.character.name)
-    const messageContent = describeGroupAttachments(session.content)
+    const forward = await this.readForward(session)
+    const messageContent = forward ? mergeForwardContent(describeGroupAttachments(session.content), forward.content) : describeGroupAttachments(session.content)
+    // 桥接幂等（群聊侧，与私聊 receive 对齐）：桌面超时-重放会把同一群消息
+    // 再投递一次；平台+频道+messageId 命中即直接确认，不重复落库与入队。
+    const groupDedupeKey = `${session.platform}:${session.channelId}:${session.messageId}`
+    if (session.messageId && this.seenIncomingMessages.has(groupDedupeKey)) {
+      this.reportOperation('diagnostic', 'debug', story, 'user-message', '桥接重放去重命中（群聊），跳过重复消息 键=%s', groupDedupeKey)
+      return true
+    }
+    if (session.messageId) {
+      this.seenIncomingMessages.set(groupDedupeKey, Date.now())
+      if (this.seenIncomingMessages.size > 600) {
+        const oldest = this.seenIncomingMessages.keys().next().value
+        this.seenIncomingMessages.delete(oldest)
+      }
+    }
     const accepted = await this.serial(story.id, async () => {
       const current = await this.getStory(story!.id)
       const entry = await this.appendEntry(current.id, {
@@ -1637,7 +1805,7 @@ export class InterludeService extends Service {
       ...(messageId ? { messageId, messageRef: groupMessageRef(accepted.id) } : {}),
       ...(quote ? { quote } : {}),
       content: messageContent, occurredAt: now, direction: 'user',
-    }, mentionedBot, quotedBot)
+    }, mentionedBot, quotedBot, audioSources)
     this.reportOperation('summary', 'info', story, 'user-message', '收到群聊消息 群=%s 发送者=%s', groupId, senderId)
     return true
   }
@@ -1667,13 +1835,28 @@ export class InterludeService extends Service {
       return false
     }
     if (!session.content?.trim() && !extractSessionVoiceCount(session)) return false
+    // 桥接幂等：同一条消息（平台+messageId）近期已处理过则直接确认，不再入队
+    // 叙事——这是桌面超时-重放双写双回的插件侧防线。
+    const dedupeKey = `${session.platform}:${session.messageId}`
+    if (session.messageId && this.seenIncomingMessages.has(dedupeKey)) {
+      this.reportOperation('diagnostic', 'debug', story, 'user-message', '桥接重放去重命中，跳过重复消息 键=%s', dedupeKey)
+      return true
+    }
     const observed = this.describeVisionEvent(session)
     if (!observed.content.trim() && !observed.sources.length && !extractSessionVoiceCount(session) && !extractSessionFileFacts(session).length) return false
+    if (session.messageId) {
+      this.seenIncomingMessages.set(dedupeKey, Date.now())
+      if (this.seenIncomingMessages.size > 600) {
+        const oldest = this.seenIncomingMessages.keys().next().value
+        this.seenIncomingMessages.delete(oldest)
+      }
+    }
     // Mark the relationship synchronously before waiting for the story queue.
     // This lets an arriving message invalidate a model request that is about
     // to persist, and lets a due split segment stop before transport begins.
     this.signalIncomingInterruption(story, participant)
-    const userInput = this.describeUserEvent(story, session)
+    const forward = await this.readForward(session)
+    const userInput = this.describeUserEvent(story, session, forward)
     this.reportOperation('summary', 'info', story, 'user-message', '收到参与者私聊消息 参与者=%s', participant.id)
     if (this.config.logging?.logMessageContent) {
       this.reportOperation('diagnostic', 'info', story, 'user-message', '用户消息内容：%s', userInput.content.slice(0, this.config.logging.previewLength))
@@ -1747,7 +1930,7 @@ export class InterludeService extends Service {
     }
   }
 
-  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean) {
+  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean, audioSources: string[] = []) {
     const key = `${story.id}:${normalizeGroupId(rule.groupId)}`
     const existing = this.bufferedGroupTurns.get(key)
     const turn: BufferedGroupTurn = existing ?? {
@@ -1757,7 +1940,8 @@ export class InterludeService extends Service {
     if (turn.timer) turn.timer()
     turn.channelId = session.channelId
     turn.latestSession = session
-    turn.messages.push(message)
+    // Transport sources belong only to this fresh batch, never to durable history.
+    turn.messages.push({ ...message, ...(audioSources.length ? { audioSources, audioSession: session } : {}) })
     turn.mentionedBot ||= mentionedBot
     turn.quotedBot ||= quotedBot
     const revision = ++turn.revision
@@ -1769,15 +1953,33 @@ export class InterludeService extends Service {
   private async flushGroupTurn(key: string, revision: number) {
     const turn = this.bufferedGroupTurns.get(key)
     if (!turn || turn.revision !== revision || this.databaseResetting || this.desktopRuntimePhase === 'paused') return
-    if (this.narratingStories.has(turn.storyId)) {
+    if (this.turnEngine.narrating.has(turn.storyId)) {
       turn.timer = this.ctx.setTimeout(() => void this.flushGroupTurn(key, revision), 250)
       return
     }
+    // Claim before the first await: private turns use the same story guard.
+    this.turnEngine.narrating.add(turn.storyId)
+    try {
+      await this.flushGroupTurnUnlocked(key, turn)
+    } finally {
+      this.turnEngine.narrating.delete(turn.storyId)
+      if (this.bufferedGroupTurns.get(key) === turn && !turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
+    }
+  }
+
+  private async flushGroupTurnUnlocked(key: string, turn: BufferedGroupTurn) {
+    const session = turn.latestSession
+    const channelId = turn.channelId
     turn.timer = undefined
     // Unlike private turns, a group batch stays deliverable after its model
     // request has started. New group messages form the next batch so a busy
     // conversation cannot permanently starve the protagonist of a reply.
     const batch = turn.messages.splice(0)
+    const hasAudio = batch.some(message => message.audioSources?.length)
+    const mentionedBot = turn.mentionedBot
+    const quotedBot = turn.quotedBot
+    turn.mentionedBot = false
+    turn.quotedBot = false
     if (!batch.length) {
       this.bufferedGroupTurns.delete(key)
       return
@@ -1787,34 +1989,34 @@ export class InterludeService extends Service {
       story = await this.getStory(turn.storyId)
     } catch (error) {
       this.reportStandalone('warn', '群聊回合读取剧本失败，已放弃本批消息 故事=%s 错误=%s', turn.storyId, error)
-      if (!turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
+      if (this.bufferedGroupTurns.get(key) === turn && !turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
       return
     }
     if (story.status !== 'active') {
-      if (!turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
+      if (this.bufferedGroupTurns.get(key) === turn && !turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
       return
     }
-    const willingness = evaluateGroupWillingness(this.groupWillingness.get(key), turn.rule.willingness, {
+    const willingness = evaluateWillingnessGate(this.groupWillingness.get(key), turn.rule.willingnessPreset, turn.rule.willingnessAuto, decodeStoryState(story.state).lifeStatus, turn.rule.willingness, {
       now: Date.now(), messageCount: batch.length, content: batch.map(message => message.content).join('\n'),
-      mentionedBot: turn.mentionedBot, quotedBot: turn.quotedBot,
+      mentionedBot, quotedBot,
     })
     this.groupWillingness.set(key, willingness.state)
-    turn.mentionedBot = false
-    turn.quotedBot = false
-    if (!willingness.shouldCall) {
+    const tierLabel = willingness.diagnosis.preset === 'auto'
+      ? `auto(${willingness.diagnosis.lifeStatus ?? (willingness.diagnosis.stale ? '过期' : '无状态')}→${willingness.diagnosis.tier}${willingness.diagnosis.asleep ? '×0.2' : ''})`
+      : willingness.diagnosis.tier ?? willingness.diagnosis.preset
+    if (!hasAudio && !willingness.shouldCall) {
       this.reportOperation('diagnostic', 'debug', story, 'user-message',
-        '群聊意愿未触发模型调用 群=%s 分数=%s 概率=%s 原因=%s', turn.groupId,
-        willingness.state.score.toFixed(3), willingness.probability.toFixed(3), willingness.reason)
-      if (!turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
+        '群聊意愿未触发模型调用 群=%s 分数=%s 概率=%s 原因=%s 档位=%s', turn.groupId,
+        willingness.state.score.toFixed(3), willingness.probability.toFixed(3), willingness.reason, tierLabel)
+      if (this.bufferedGroupTurns.get(key) === turn && !turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
       return
     }
-    if (await this.groupCooldownActive(story.id, turn.groupId, turn.rule.cooldownSeconds)) {
+    if (!hasAudio && await this.groupCooldownActive(story.id, turn.groupId, turn.rule.cooldownSeconds)) {
       this.reportOperation('diagnostic', 'debug', story, 'user-message', '群聊仍在冷却期，跳过群发言 群=%s', turn.groupId)
-      if (!turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
+      if (this.bufferedGroupTurns.get(key) === turn && !turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
       return
     }
-    this.reportOperation('standard', 'info', story, 'user-message', '群聊消息准备进入主叙事 群=%s 模式=%s 意愿=%s', turn.groupId, turn.rule.responseMode, willingness.state.score.toFixed(3))
-    this.narratingStories.add(turn.storyId)
+    this.reportOperation('standard', 'info', story, 'user-message', '群聊消息准备进入主叙事 群=%s 模式=%s 意愿=%s 档位=%s', turn.groupId, turn.rule.responseMode, willingness.state.score.toFixed(3), willingness.diagnosis.preset === 'auto' ? `auto(${willingness.diagnosis.lifeStatus ?? '过期'}→${willingness.diagnosis.tier ?? 'normal'})` : willingness.diagnosis.tier ?? willingness.diagnosis.preset)
     try {
       const snapshot = await this.serial(story.id, async () => {
         const current = await this.getStory(story.id)
@@ -1823,22 +2025,31 @@ export class InterludeService extends Service {
         return { story: current, from: narrativeCursor(current, now), now, contextMessages }
       })
       const groupContext: GroupContext = {
-        groupId: turn.groupId, channelId: turn.channelId, label: turn.rule.label,
+        groupId: turn.groupId, channelId: channelId, label: turn.rule.label,
         purpose: turn.rule.purpose, characterRole: turn.rule.characterRole,
         messages: snapshot.contextMessages,
       }
-      const chatCapabilities = this.groupChatCapabilities(turn.latestSession, groupContext.messages)
+      const chatCapabilities = this.groupChatCapabilities(session, groupContext.messages)
       const userMessage = batch.map((message, index) => `[群聊连续消息 ${index + 1}｜${message.speaker}]\n${message.content}`).join('\n\n')
       const turnQueryEmbedding = this.semanticTurnEmbeddingEnabled()
         ? await this.embedText(userMessage.slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
         : undefined
-      const stickerCatalog = await this.stickerCatalogForSession(turn.latestSession, turnQueryEmbedding)
-      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, [], [], chatCapabilities, [], stickerCatalog, turnQueryEmbedding)
+      const stickerCatalog = await this.stickerCatalogForSession(session, turnQueryEmbedding)
+      const audio: NarrativeAudio[] = []
+      for (const message of batch) {
+        if (!message.audioSources?.length) continue
+        const loaded = await this.loadNativeAudio(snapshot.story, message.audioSources, message.audioSession)
+        for (const item of loaded) audio.push({ ...item, id: `group-audio-${audio.length + 1} (${message.speaker})` })
+      }
+      if (hasAudio) this.reportOperation('standard', audio.length ? 'info' : 'warn', story, 'user-message',
+        '群音频直接触发主叙事（跳过意愿/冷却），已载入音频=%s；实际发言由剧本决定%s', audio.length,
+        audio.length ? '' : '；音频未载入，请检查原生音频开关、格式、大小或读取日志')
+      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, [], audio, chatCapabilities, [], stickerCatalog, turnQueryEmbedding)
       const chatActions = normalizeGroupChatActions(decision, chatCapabilities, groupContext)
       const sticker = this.resolveSticker(decision.localMedia, stickerCatalog)
       const nativeFace = sticker ? undefined : this.resolveNativeFace(decision, chatCapabilities)
       const result = await this.serial(story.id, async () => {
-        if (this.databaseResetting || !succeeded) return {
+        if (this.databaseResetting || this.bufferedGroupTurns.get(key) !== turn || !succeeded) return {
           content: '', messages: [] as OutgoingMessageDraft[],
           chatActions: { reactions: [] } as ExecutableGroupChatActions,
           commit: undefined as ScriptCommitDraft | undefined,
@@ -1851,23 +2062,23 @@ export class InterludeService extends Service {
           localMedia: sticker ? decision.localMedia : undefined,
           nativeFace: nativeFace ? decision.nativeFace : undefined,
         }, snapshot.from, snapshot.now, false, 'user-message')
-        const content = normalizeGroupVisibleReply(decision.groupReply, decision.interaction, this.config.runtime.maxMessageCharacters, this.config.runtime.messageSeparator)
+        const content = normalizeGroupVisibleReply(decision.groupReply, decision.interaction, this.config.runtime.maxMessageCharacters, this.config.runtime.messageSeparator, this.config.runtime.splitReplyMessages !== false)
         await this.dbSet('interlude_story', { id: current.id }, { cursorAt: snapshot.now, updatedAt: new Date() })
         if (succeeded) await this.scheduleConversationFollowUpsAfterTurn(current.id, snapshot.now, decision.interaction)
         return { content, messages: persisted.messages, chatActions, sticker, nativeFace, commit: persisted.commit, scriptEntry: persisted.scriptEntry }
       })
       const platformEntryId = result.scriptEntry?.id
-      const completedReactions = result.chatActions.reactions.length && turn.latestSession
+      const completedReactions = result.chatActions.reactions.length && session
         ? await this.executeGroupReactions(
           snapshot.story,
-          turn.latestSession,
+          session,
           turn.groupId,
           result.chatActions.reactions,
           reaction => platformActionReference(result.commit, platformEntryId, 'message-reaction', `${reaction.messageRef}:${reaction.reaction}`),
         )
         : 0
       const groupDelivery: GroupDeliveryResult = result.content
-        ? await this.sendGroupMessage(snapshot.story, turn.channelId, result.content, result.chatActions.replyTo?.messageId, turn.latestSession)
+        ? await this.sendGroupMessage(snapshot.story, channelId, result.content, result.chatActions.replyTo?.messageId, session)
         : { deliveredSegments: [], complete: false, segmentOutcomes: [] }
       if (groupDelivery.segmentOutcomes.length || groupDelivery.deliveredSegments.length) {
         await this.serial(story.id, async () => {
@@ -1885,7 +2096,7 @@ export class InterludeService extends Service {
               kind: 'character-group-message', actor: 'character', content: groupDelivery.deliveredSegments.join('<sep/>'),
               occurredAt: now.toISOString(),
               metadata: {
-                groupId: turn.groupId, channelId: turn.channelId,
+                groupId: turn.groupId, channelId: channelId,
                 ...(scriptEvent ?? {}),
                 deliverySegmentIndexes: groupDelivery.segmentOutcomes.filter(item => item.status === 'delivered').map(item => item.index),
                 ...(groupDelivery.complete ? {} : { partialDelivery: true, deliveredSegments: groupDelivery.deliveredSegments.length }),
@@ -1895,35 +2106,34 @@ export class InterludeService extends Service {
           }
         })
       }
-      const stickerDelivered = result.sticker && turn.latestSession
+      const stickerDelivered = result.sticker && session
         ? await this.sendSticker(
           snapshot.story,
-          turn.latestSession,
-          turn.channelId,
+          session,
+          channelId,
           result.sticker,
           turn.groupId,
           platformActionReference(result.commit, platformEntryId, 'local-media', result.sticker.assetId),
         )
         : false
-      const nativeFaceDelivered = result.nativeFace && turn.latestSession
+      const nativeFaceDelivered = result.nativeFace && session
         ? await this.sendNativeFace(
           snapshot.story,
-          turn.latestSession,
-          turn.channelId,
+          session,
+          channelId,
           result.nativeFace,
           turn.groupId,
           platformActionReference(result.commit, platformEntryId, 'native-face', result.nativeFace),
         )
         : false
       if (groupDelivery.deliveredSegments.length || completedReactions || stickerDelivered || nativeFaceDelivered) {
-        this.groupWillingness.set(key, consumeGroupWillingness(this.groupWillingness.get(key), turn.rule.willingness, Date.now()))
+        this.groupWillingness.set(key, consumeWillingnessGate(this.groupWillingness.get(key), turn.rule.willingnessPreset, turn.rule.willingnessAuto, decodeStoryState(story.state).lifeStatus, turn.rule.willingness, Date.now()))
       }
+      // Other conversations use the same delivery ledger as private turns.
+      if (result.messages.length) await this.sendOutgoingMessages(snapshot.story, result.messages)
       this.scheduleCompaction(story.id)
     } catch (error) {
       this.report('warn', story, 'user-message', '群聊主叙事失败，保持静默 群=%s 错误=%s', turn.groupId, error)
-    } finally {
-      this.narratingStories.delete(turn.storyId)
-      if (!turn.messages.length && !turn.timer) this.bufferedGroupTurns.delete(key)
     }
   }
   private async groupMessages(storyId: string, groupId: string, limit: number) {
@@ -2169,7 +2379,8 @@ export class InterludeService extends Service {
         ? [h('quote', { id: replyToMessageId }), segment]
         : segment
       try {
-        await bot.sendMessage(channelId, outgoing)
+        const receipt = await bot.sendMessage(channelId, outgoing)
+        if (Array.isArray(receipt) && !receipt.length) throw new Error('Group transport returned no message receipt.')
         deliveredSegments.push(segment)
         segmentOutcomes.push({ index, content: segment, status: 'delivered' })
       }
@@ -2188,7 +2399,7 @@ export class InterludeService extends Service {
    */
   private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[], content = String(session.content ?? ''), imageSources: string[] = [], audioSources: string[] = [], quote?: QuotedMessageContext) {
     const key = participant.id
-    const existing = this.bufferedNarrativeTurns.get(key)
+    const existing = this.turnEngine.turns.get(key)
     const turn: BufferedNarrativeTurn = existing ?? {
       storyId: story.id, participantId: participant.id, messages: [], nextRevision: 0, obsoleteRequestIds: new Set(),
     }
@@ -2202,13 +2413,13 @@ export class InterludeService extends Service {
     const revision = ++turn.nextRevision
     const delay = Math.max(0, this.config.runtime.userMessageDebounceSeconds ?? 2) * Time.second
     turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), delay)
-    this.bufferedNarrativeTurns.set(key, turn)
+    this.turnEngine.turns.set(key, turn)
     this.reportOperation('diagnostic', 'debug', story, 'user-message', '短时消息合并 参与者=%s 待处理=%d 等待=%dms', participant.id, turn.messages.length, delay)
   }
 
   private signalIncomingInterruption(story: InterludeStory, participant: InterludeParticipant) {
     this.interruptedTypingParticipants.add(participant.id)
-    const turn = this.bufferedNarrativeTurns.get(participant.id)
+    const turn = this.turnEngine.turns.get(participant.id)
     if (!turn || !shouldSupersedeNarrativeRequest(turn.inFlightRequestId, turn.firstMessageCommittedRequestId, turn.obsoleteRequestIds)) return
     turn.obsoleteRequestIds.add(turn.inFlightRequestId)
     this.reportOperation('standard', 'info', story, 'user-message',
@@ -2225,16 +2436,17 @@ export class InterludeService extends Service {
     turn: BufferedNarrativeTurn,
     requestId: number,
     reply: EarlyNarrativeReply,
+    requestStartedAt?: Date,
   ) {
     if (reply.kind !== 'private' || !reply.interaction || reply.interaction.reply.mode !== 'immediate') return false
     if (turn.nextRevision !== requestId || turn.obsoleteRequestIds.has(requestId) || turn.firstMessageCommittedRequestId === requestId) return false
     if (!this.canHandleParticipant(participant)) return false
     // 早发内容与常规投递共用同一可见文本合约：长度上限与括号表情标签清理一致。
-    const content = normalizeVisibleMessageContent(reply.interaction.reply.content, this.config.runtime.maxMessageCharacters, this.config.runtime.messageSeparator)
+    const content = sanitizeAndClampVisibleContent(reply.interaction.reply.content, this.config.runtime.maxMessageCharacters, this.config.runtime.messageSeparator)
     if (!content || this.splitOutgoingMessage(content).length !== 1) return false
     const delivered = await this.sendOutgoingMessages(story, [{
       participantId: participant.id, content, interaction: reply.interaction, userInitiated: true,
-    }], participant, session)
+    }], participant, session, undefined, true, requestStartedAt)
     if (!delivered.length) return false
     const confirmed = await this.confirmOutgoingDeliveries(story, delivered)
     if (!confirmed.length) return false
@@ -2273,13 +2485,14 @@ export class InterludeService extends Service {
   /** One user event folds typed text, images and voice into a single fact:
    * attachments ride their own native channels, the stored content keeps a
    * place-holder fact so history and the desktop timeline stay readable. */
-  private describeUserEvent(story: InterludeStory, session: Session) {
+  private describeUserEvent(story: InterludeStory, session: Session, forward?: ForwardReadResult) {
     const visual = this.describeVisionEvent(session)
     const audioSources = extractSessionAudioSources(session)
     const files = extractSessionFileFacts(session)
     const audioFiles = files.filter(file => file.audio)
     const plainFiles = files.filter(file => !file.audio)
     let content = visual.content
+    if (forward) content = mergeForwardContent(content, forward.content)
     if (!content) {
       content = visual.sources.length ? '[用户发送了图片；图片内容以本轮视觉输入为准，未提供视觉内容时保持未知。]'
         : audioSources.length ? audioFiles.length
@@ -2298,6 +2511,15 @@ export class InterludeService extends Service {
       audioSources,
       quote: describeQuotedMessage(session, story.setting.character.name),
     }
+  }
+
+  private async readForward(session: Session): Promise<ForwardReadResult | undefined> {
+    if (!extractForwardIds(session.content).length) return undefined
+    if (this.config.runtime.forwardMessage?.enabled === false) return undefined
+    const result = await readForwardContent(session, this.config.runtime.forwardMessage)
+    if (result?.failed) this.reportStandaloneOperation('diagnostic', 'warn', '合并转发读取失败 平台=%s 机器人ID=%s 用户ID=%s', session.platform, session.selfId, session.userId)
+    else if (result) this.reportStandaloneOperation('diagnostic', 'debug', '合并转发读取完成 节点=%d 嵌套=%d 截断=%s', result.nodeCount, result.forwardCount, result.truncated)
+    return result
   }
 
   private async scanStickerLibrary() {
@@ -2898,11 +3120,11 @@ export class InterludeService extends Service {
   private invalidateBufferedNarratives(storyId?: string) {
     if (storyId) this.compactionBackoff.delete(storyId)
     else this.compactionBackoff.clear()
-    for (const [key, turn] of this.bufferedNarrativeTurns) {
+    for (const [key, turn] of this.turnEngine.turns) {
       if (storyId && turn.storyId !== storyId) continue
       if (turn.timer) turn.timer()
       if (turn.inFlightRequestId) turn.obsoleteRequestIds.add(turn.inFlightRequestId)
-      this.bufferedNarrativeTurns.delete(key)
+      this.turnEngine.turns.delete(key)
     }
     // Group turns have their own debounce timers. They must be cancelled by
     // the same reset/purge path, otherwise an old buffered group message can
@@ -2924,8 +3146,8 @@ export class InterludeService extends Service {
 
   /** True while a live or debounced conversation should take priority over background work. */
   private hasPendingNarrative(storyId: string) {
-    if (this.narratingStories.has(storyId)) return true
-    for (const turn of this.bufferedNarrativeTurns.values()) {
+    if (this.turnEngine.narrating.has(storyId)) return true
+    for (const turn of this.turnEngine.turns.values()) {
       if (turn.storyId === storyId && (turn.messages.length || turn.timer || turn.inFlightRequestId)) return true
     }
     for (const turn of this.bufferedGroupTurns.values()) {
@@ -2936,20 +3158,20 @@ export class InterludeService extends Service {
 
   private async flushBufferedNarrative(key: string, revision: number) {
     if (this.databaseResetting || this.desktopRuntimePhase === 'paused') return
-    const turn = this.bufferedNarrativeTurns.get(key)
+    const turn = this.turnEngine.turns.get(key)
     if (!turn || turn.nextRevision !== revision) return
     // One shared story has one narrator at a time. If another relationship is
     // currently waiting on the provider, keep this batch intact and retry
     // shortly instead of taking an inconsistent cursor snapshot.
-    if (this.narratingStories.has(turn.storyId)) {
+    if (this.turnEngine.narrating.has(turn.storyId)) {
       turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), 250)
       return
     }
-    this.narratingStories.add(turn.storyId)
+    this.turnEngine.narrating.add(turn.storyId)
     turn.timer = undefined
     const batch = turn.messages.splice(0)
     if (!batch.length) {
-      this.narratingStories.delete(turn.storyId)
+      this.turnEngine.narrating.delete(turn.storyId)
       return
     }
     const requestId = revision
@@ -2967,7 +3189,18 @@ export class InterludeService extends Service {
           .filter(intent => !intent.participantId || intent.participantId === participant.id)
         return { story, participant, from: narrativeCursor(story, now), now, due }
       })
-      if (!snapshot) return
+      if (!snapshot) {
+        // Fix#10: 批次已被 splice 消费，早退同样要排重试（入站消息已先落库）。
+        // 参与者已暂停时不排——重试会由到期路径消化成暂停期的一次投递；
+        // 恢复后由用户新消息自然驱动。
+        const participantNow = await this.getParticipant(turn.participantId).catch(() => undefined)
+        if (participantNow?.status === 'active') {
+          await this.scheduleNarrativeRetry(turn.storyId, turn.participantId, new Date()).catch(() => undefined)
+        } else {
+          this.reportStandalone('info', '参与者已暂停或不存在，跳过为其排叙事重试 参与者=%s', turn.participantId)
+        }
+        return
+      }
 
       const userMessage = formatBufferedUserMessages(batch)
       const turnQueryEmbedding = userMessage?.trim() && this.semanticTurnEmbeddingEnabled()
@@ -3001,11 +3234,13 @@ export class InterludeService extends Service {
         interaction: undefined as NarrativeInteraction | undefined,
         deliveryEntry: undefined as ScriptEntry | undefined,
       }
+      // 首条打字下限的基准：叙事请求发起时刻（模型耗时从此时起算）。
+      const requestStartedAt = new Date()
       const narrative = await this.tryDecide(
         snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded, undefined, images, audio, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations,
         async reply => {
           if (early.delivered) return false
-          const deliveryEntry = await this.deliverEarlyPrivateReply(snapshot.story, snapshot.participant, turn.latestSession, turn, requestId, reply)
+          const deliveryEntry = await this.deliverEarlyPrivateReply(snapshot.story, snapshot.participant, turn.latestSession, turn, requestId, reply, requestStartedAt)
           if (deliveryEntry) {
             early.delivered = true
             early.interaction = reply.interaction
@@ -3060,14 +3295,17 @@ export class InterludeService extends Service {
           && decision.interaction?.reply?.mode === 'immediate'
           && typeof decision.interaction.reply.content === 'string'
           && !!decision.interaction.reply.content.trim()
-        if (commitsFirstReply) turn.firstMessageCommittedRequestId = requestId
         const persisted = await this.persistDecision(current, currentParticipant, {
           ...decision,
           localMedia: sticker ? decision.localMedia : undefined,
           nativeFace: nativeFace ? decision.nativeFace : undefined,
         }, snapshot.from, effectiveNow, true, 'user-message', [], early.delivered)
+        // Fix#10 回归修正：committed 标志在持久化成功后才置位——提前置位会让
+        // catch 守卫（!== requestId）误判“已提交”，模型成功但落库抛错的回合
+        // 既无投递也无重试。
+        if (commitsFirstReply) turn.firstMessageCommittedRequestId = requestId
         if (early.deliveryEntry && persisted.commit && decision.interaction?.reply.content) {
-          const event = findOutgoingScriptEvent(
+          const event = findPrivateOutgoingMessageEvent(
             persisted.commit,
             currentParticipant.id,
             'immediate',
@@ -3084,6 +3322,9 @@ export class InterludeService extends Service {
         }
         if (succeeded) {
           await this.dbSet('interlude_story', { id: current.id }, { cursorAt: effectiveNow, updatedAt: now })
+          // 用户回合已成功：取消此前失败遗留的同参与者 pending 重试——用户在
+          // 沉默期重发是常态，旧 retry 到期会再跑完整回合并重复投递一条回复。
+          await this.cancelPendingNarrativeRetries(current, currentParticipant.id, now)
           const consumedDueIds = consumedLiveIntentIds(snapshot.due)
           if (consumedDueIds.length) await this.dbSet('interlude_intent', { id: { $in: consumedDueIds } }, { status: 'completed', updatedAt: now })
         } else {
@@ -3100,8 +3341,16 @@ export class InterludeService extends Service {
         return
       }
       if (this.canHandleParticipant(snapshot.participant)) {
-        const delivered = await this.sendOutgoingMessages(snapshot.story, result.messages, snapshot.participant, turn.latestSession)
+        const delivered = await this.sendOutgoingMessages(snapshot.story, result.messages, snapshot.participant, turn.latestSession, undefined, true, requestStartedAt)
         await this.confirmOutgoingDeliveries(snapshot.story, delivered)
+        // P2 Fix: 主动联系按实际投递结果计数——成功/失败在平台确认后。
+        if (this.pendingProactiveCount > 0) {
+          const sent = delivered.length > 0
+          for (let i = 0; i < this.pendingProactiveCount; i++) {
+            this.health?.recordProactive(snapshot.story.id, sent)
+          }
+          this.pendingProactiveCount = 0
+        }
         if (sticker && turn.latestSession) {
           await this.sendSticker(
             snapshot.story,
@@ -3126,14 +3375,18 @@ export class InterludeService extends Service {
       this.scheduleCompaction(turn.storyId)
     } catch (error) {
       this.reportStandalone('warn', '合并写作任务失败：参与者=%s 错误=%s', turn.participantId, error)
+      // Fix#10: 持久化抛错不再静默吞批——未 committed 的回合从已落库入站条目排一次重试。
+      if (turn.firstMessageCommittedRequestId !== requestId) {
+        await this.scheduleNarrativeRetry(turn.storyId, turn.participantId, new Date()).catch(() => undefined)
+      }
     } finally {
       if (turn.inFlightRequestId === requestId) {
         turn.inFlightRequestId = undefined
         turn.firstMessageCommittedRequestId = undefined
-        this.narratingStories.delete(turn.storyId)
+        this.turnEngine.narrating.delete(turn.storyId)
       }
       turn.obsoleteRequestIds.delete(requestId)
-      if (!turn.messages.length && !turn.timer && !turn.inFlightRequestId) this.bufferedNarrativeTurns.delete(key)
+      if (!turn.messages.length && !turn.timer && !turn.inFlightRequestId) this.turnEngine.turns.delete(key)
     }
   }
 
@@ -3298,27 +3551,8 @@ export class InterludeService extends Service {
     // in executeDeferredBrowserIntent(), so re-reading the whole pending list
     // here only adds a SQLite round trip to every background sweep.
     due = due.filter(intent => intent.type !== 'browser-research')
-    // Paces director retries only: a persisted retry gate with an unchanged
-    // window start means the previous sweep ended without consuming the
-    // cursor (e.g. another failure), so wait for the backoff instead of
-    // re-entering tryDecide every sweep. Successful director-less degradation
-    // moves the cursor and clears this gate naturally. Manual advancement
-    // remains an explicit escape hatch for operators.
-    const timelineRetryAt = toDate(story.state.automation?.timelineRetryAt)
-    const timelineRetryFrom = story.state.automation?.timelineRetryFrom
-    if (!force && timelineRetryAt && timelineRetryFrom === from.toISOString() && timelineRetryAt > now) {
-      this.reportOperation('diagnostic', 'debug', story, 'advance',
-        '自动推进等待时间导演重试 冷却至=%s 时间窗口起点=%s',
-        formatLogTime(timelineRetryAt, story.setting.timezone), formatLogTime(from, story.setting.timezone))
-      this.scheduleDueIntentWake(story.id, timelineRetryAt)
-      return messages
-    }
-    if (timelineRetryAt && (timelineRetryAt <= now || timelineRetryFrom !== from.toISOString())) {
-      const automation = { ...(story.state.automation ?? {}) }
-      delete automation.timelineRetryAt
-      delete automation.timelineRetryFrom
-      story.state = { ...story.state, automation }
-    }
+    // Director retry gates only the optional director, never the life scheduler.
+    // Its persisted cooldown survives cursor changes and is handled at call time.
     // Turning off automatic advancement must suppress *every* background
     // writing path, including short plans that were persisted before the
     // owner disabled the feature. Manual `interlude.advance` still passes
@@ -3384,41 +3618,59 @@ export class InterludeService extends Service {
       // while still draining every plan that was already due this sweep.
       const dueParticipantId = dueBatch[0]?.participantId || ''
       const dueParticipant = dueParticipantId ? await this.getParticipant(dueParticipantId) : undefined
-      this.reportOperation('standard', 'info', current, 'intent-due',
-        '即将处理到期计划 数量=%d 类型=%s 参与者=%s', dueBatch.length, Array.from(new Set(dueBatch.map(intent => intent.type))).join(','), dueParticipant?.id || '全局')
-      const { decision, succeeded, timelinePlan } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
-      const streamRecovery = dueBatch.every(intent => intent.type === 'narrative-retry' && intent.payload?.streamRecovery === true)
-      const recovered = streamRecovery && succeeded
-        ? await this.persistStreamScriptRecovery(current, dueParticipant ?? null, decision, now)
-        : false
-      const turnSucceeded = streamRecovery ? recovered : succeeded
-      if (!streamRecovery) {
-        const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
-        const persisted = await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', dueBatch, false, timelinePlan)
-        messages.push(...persisted.messages)
-      }
-      if (turnSucceeded) {
-        await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
-        const ordinaryDueIds = dueBatch.filter(intent => intent.type !== 'follow-up-commitment').map(intent => intent.id)
-        if (ordinaryDueIds.length) await this.dbSet('interlude_intent', { id: { $in: ordinaryDueIds } }, { status: 'completed', updatedAt: now })
-        if (dueBatch.some(intent => intent.type === 'delayed-reply')) {
-          delayedReplyProcessed = true
-          await this.pauseAutomaticAdvanceAfterDelayedReply(story.id, now, dueParticipant?.id ?? '')
-        } else if (!advanced && !delayedReplyProcessed) {
-          await this.scheduleNextAutomaticAdvance(story.id, now)
-        }
+      if (dueParticipantId && (!dueParticipant || dueParticipant.status !== 'active')) {
+        // 与 live 路径对齐：暂停/缺失参与者的到期意图不消耗模型回合。
+        // delayed-reply 等保留 pending（参与者恢复后仍会到期）；narrative-retry
+        // 取消——其入站消息早已落库，恢复后由用户新消息自然驱动。
+        const staleRetries = dueBatch.filter(intent => intent.type === 'narrative-retry')
+        if (staleRetries.length) await this.dbSet('interlude_intent', { id: { $in: staleRetries.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+        this.reportOperation('standard', 'info', current, 'intent-due', '跳过暂停参与者的到期计划 参与者=%s 数量=%d 取消重试=%d', dueParticipantId, dueBatch.length, staleRetries.length)
       } else {
-        // A failed user turn gets a persisted retry. Otherwise a transient
-        // 403/5xx would leave its already-recorded incoming message waiting
-        // forever for somebody to send another DM.
-        const retries = dueBatch.filter(intent => intent.type === 'narrative-retry')
-        if (retries.length) {
-          const attempts = Math.max(...retries.map(intent => Number(intent.payload?.attempt) || 0))
-          await this.dbSet('interlude_intent', { id: { $in: retries.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
-          if (streamRecovery) await this.scheduleStreamScriptRecovery(current.id, dueParticipant?.id ?? '', now, attempts)
-          else await this.scheduleNarrativeRetry(current.id, dueParticipant?.id ?? '', now, attempts)
+        try {
+          this.reportOperation('standard', 'info', current, 'intent-due',
+            '即将处理到期计划 数量=%d 类型=%s 参与者=%s', dueBatch.length, Array.from(new Set(dueBatch.map(intent => intent.type))).join(','), dueParticipant?.id || '全局')
+          const { decision, succeeded, timelinePlan } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
+          const streamRecovery = dueBatch.every(intent => intent.type === 'narrative-retry' && intent.payload?.streamRecovery === true)
+          const recovered = streamRecovery && succeeded
+            ? await this.persistStreamScriptRecovery(current, dueParticipant ?? null, decision, now)
+            : false
+          const turnSucceeded = streamRecovery ? recovered : succeeded
+          if (!streamRecovery) {
+            const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
+            const persisted = await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', dueBatch, false, timelinePlan)
+            messages.push(...persisted.messages)
+          }
+          if (turnSucceeded) {
+            await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
+            const ordinaryDueIds = dueBatch.filter(intent => intent.type !== 'follow-up-commitment').map(intent => intent.id)
+            if (ordinaryDueIds.length) await this.dbSet('interlude_intent', { id: { $in: ordinaryDueIds } }, { status: 'completed', updatedAt: now })
+            if (dueBatch.some(intent => intent.type === 'delayed-reply')) {
+              delayedReplyProcessed = true
+              await this.pauseAutomaticAdvanceAfterDelayedReply(story.id, now, dueParticipant?.id ?? '')
+            } else if (!advanced && !delayedReplyProcessed) {
+              await this.scheduleNextAutomaticAdvance(story.id, now)
+            }
+          } else {
+            // A failed user turn gets a persisted retry. Otherwise a transient
+            // 403/5xx would leave its already-recorded incoming message waiting
+            // forever for somebody to send another DM.
+            const retries = dueBatch.filter(intent => intent.type === 'narrative-retry')
+            if (retries.length) {
+              const attempts = Math.max(...retries.map(intent => Number(intent.payload?.attempt) || 0))
+              await this.dbSet('interlude_intent', { id: { $in: retries.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+              if (streamRecovery) await this.scheduleStreamScriptRecovery(current.id, dueParticipant?.id ?? '', now, attempts)
+              else await this.scheduleNarrativeRetry(current.id, dueParticipant?.id ?? '', now, attempts)
+            }
+            // Keep ordinary delayed plans pending until the provider recovers.
+          }
+        } catch (error) {
+          // 无界重试防线：到期批次的处理（模型/持久化链）抛错时整批退避一个
+          // 扫描周期——否则意图保持 pending，每个 sweep 重复同一失败回合，
+          // 持续消耗 token 且游标不前进。
+          this.report('warn', current, 'intent-due', '到期计划处理失败，整批退避一个扫描周期 错误=%s', error)
+          const backoffAt = new Date(now.getTime() + Math.max(Time.minute, this.config.runtime.sweepIntervalMinutes * Time.minute))
+          await this.dbSet('interlude_intent', { id: { $in: dueBatch.map(intent => intent.id) } }, { notBefore: backoffAt, updatedAt: now }).catch(() => undefined)
         }
-        // Keep ordinary delayed plans pending until the provider recovers.
       }
     }
     if (dueBatches.length > 1) {
@@ -3441,6 +3693,8 @@ export class InterludeService extends Service {
     // User and due-intent turns may arrive before the next background sweep.
     // Retire expired consequences here too, while keeping this a cheap local
     // database operation rather than a separate model request.
+    // 世界事件排水：到期事件先进账，本回合 recentScript 即可见（低重要性仅推进/跟进回合）。
+    await this.drainDueSeededEvents(story, now, phase !== 'user-message')
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
     const memoryEnabled = this.memoryConfig.enabled
     // One turn-level query vector serves every semantic consumer (sticker
@@ -3449,7 +3703,7 @@ export class InterludeService extends Service {
       ? await this.embedText(userMessage.trim().slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
       : undefined)
     const liveFactEmbedding = this.config.model.embedding?.liveQuery ? resolvedTurnEmbedding : undefined
-    const [recentEntries, memories, scene, arc, previousScenes, facts, allParticipants, webContext, activeConsequences, overlaySnapshots, followUpCommitments, scheduleRecord, upcomingIntents] = await Promise.all([
+    const [recentEntries, memories, scene, arc, previousScenes, facts, allParticipants, webContext, activeConsequences, overlaySnapshots, followUpCommitments, upcomingIntents] = await Promise.all([
       // Use the runtime limits on the live path.  They are the options shown
       // to testers as “上下文条目/长期事实”，and should be authoritative.
       this.recentEntriesForPrompt(story.id, now),
@@ -3469,7 +3723,6 @@ export class InterludeService extends Service {
       participant && (phase === 'user-message' || phase === 'intent-due')
         ? this.pendingFollowUpCommitments(story.id, participant.id)
         : Promise.resolve([] as NarrativeIntent[]),
-      this.schedulePreplanConfig.enabled ? this.getSchedulePreplan(story.id) : Promise.resolve(undefined),
       this.upcomingNarrativeIntents(story.id, now),
     ])
     const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
@@ -3541,7 +3794,12 @@ export class InterludeService extends Service {
       : undefined
     const developmentTendencies = memoryEnabled
       ? await this.developmentForPrompt(story.id, participant?.id, developmentContextQuery(userMessage, visibleDueIntents.map(intent => intent.summary), promptEntries)) : []
-    return resolveAuthoredActions(await this.narrator.decide({
+    // Repetition guard: a fixed bubble-count run over her recent delivered
+    // replies is an anchoring artifact. It is surfaced to the author only on
+    // conversation turns — advance phases stay untouched.
+    const messageRepetition = (phase === 'user-message' || phase === 'conversation-follow-up') && !groupContext
+      ? detectMessageRepetition(promptEntries) : undefined
+    return reconcileTransportReferences(await this.narrator.decide({
       urgeEnabled: this.urgeConfig.enabled && !dueIntents.some(intent => intent.type === 'narrative-retry'),
       phase, refreshContinuity, outputRecovery, story, from, now, userMessage, userReportedTimes, images, audio, visualObservations, timelinePlan, developmentTendencies,
       writingOptions: {
@@ -3549,12 +3807,18 @@ export class InterludeService extends Service {
         splitReplyMessages: this.config.runtime.splitReplyMessages !== false,
         browserMode: !this.browserConfig.enabled || (groupContext && !this.browserConfig.allowGroupTriggeredResearch)
           ? 'disabled' : phase === 'user-message' && participant && !groupContext ? this.browserConfig.mode : 'deferred-only',
+        ...(messageRepetition ? { messageRepetition } : {}),
       },
       participant: phase === 'advance' ? null : participant,
       // A background turn may see relationship state through these opaque
       // participant summaries and may proactively contact one account only
       // when the owner explicitly enables proactive messages.
       participants: phase === 'advance' && !advanceCanContact ? [] : participants,
+      availableGroupTargets: this.sharedStoryConfig.allowCrossConversationMessages
+        && !groupContext && (phase === 'user-message' || phase === 'advance' && advanceCanContact && !this.agencyConfig.enabled)
+        ? (this.config.onebot?.groupChats ?? []).filter(group => group.enabled !== false && normalizeGroupId(group.groupId))
+          .map(group => ({ participantId: `group:${normalizeGroupId(group.groupId)}`, groupId: normalizeGroupId(group.groupId), label: group.label || '' }))
+        : [],
       dueIntents: visibleDueIntents, upcomingIntents: visibleUpcomingIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
       recentEntries: promptEntries, memories, sceneContext: { scene, arc, ...(previousScenes.length ? { previousScenes } : {}) }, facts, groupContext, chatCapabilities,
@@ -3594,7 +3858,7 @@ export class InterludeService extends Service {
         ? decodedState.automaticDeliverySummaries
         : [],
       followUpCommitments,
-      schedulePreplan: schedulePreplanWindow(scheduleRecord, now, story.setting.timezone, 12, this.schedulePreplanConfig),
+      schedulePreplan: await this.currentSchedulePreplanWindow(story, now),
       onEarlyReply,
     }), false, this.config.runtime.messageSeparator)
   }
@@ -3607,27 +3871,27 @@ export class InterludeService extends Service {
     return false
   }
 
-  /** Automatic prose no longer invents the world timeline by itself. The
-   * compaction route first returns a tiny relative-time ledger; if it cannot,
-   * preserving the current cursor is safer than writing an ungrounded future. */
+  /** The optional director supplies a relative-time ledger. Its failures cool
+   * down independently while the main author may continue without that ledger. */
   private async planAutomaticTimeline(story: InterludeStory, participant: InterludeParticipant | null, phase: Extract<NarrativeRequest['phase'], 'advance' | 'conversation-follow-up' | 'intent-due'>, from: Date, now: Date, dueIntents: NarrativeIntent[]) {
     if (this.config.timelineDirector?.enabled === false) return undefined
     if (!this.compactor.planTimeline) return undefined
-    const backoff = this.timelineBackoff.get(story.id)
-    if (backoff && backoff.from === from.getTime() && now.getTime() < backoff.until) {
+    const persisted = decodeStoryState(story.state).automation
+    if (!this.timelineDirectorFailures.has(story.id) && persisted?.timelineDirectorFailures) {
+      this.timelineDirectorFailures.set(story.id, persisted.timelineDirectorFailures)
+    }
+    const retryAt = toDate(persisted?.timelineRetryAt)
+    const backoff = this.timelineBackoff.get(story.id) ?? (retryAt ? { from: 0, until: retryAt.getTime() } : undefined)
+    if (backoff && Date.now() < backoff.until) {
       this.reportOperation('diagnostic', 'debug', story, phase,
-        '时间导演调用冷却中，保留当前时间窗口至 %s', formatLogTime(new Date(backoff.until), story.setting.timezone))
+        '时间导演调用冷却至 %s；主叙事仍可无账本推进', formatLogTime(new Date(backoff.until), story.setting.timezone))
       return undefined
     }
-    if (backoff && (backoff.from !== from.getTime() || now.getTime() >= backoff.until)) this.timelineBackoff.delete(story.id)
-    // 熔断冷却：连续失败达阈值后，冷却期内不再调用时间导演（降级路径接管），到期重试一次完整路径。
-    const failures = this.timelineDirectorFailures.get(story.id) ?? 0
-    if (failures >= TIMELINE_DIRECTOR_FUSE && backoff && now.getTime() < backoff.until) return undefined
-    const [scene, recentEntries, facts, scheduleRecord] = await Promise.all([
+    if (backoff) this.timelineBackoff.delete(story.id)
+    const [scene, recentEntries, facts] = await Promise.all([
       this.activeScene(story.id),
       this.recentEntriesForPrompt(story.id, now),
       this.memoryConfig.enabled ? this.facts(story.id, Math.min(16, this.config.runtime.memoryLimit), '', participant?.id) : Promise.resolve([] as NarrativeFact[]),
-      this.schedulePreplanConfig.enabled ? this.getSchedulePreplan(story.id) : Promise.resolve(undefined),
     ])
     const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
       ? recentEntries
@@ -3652,7 +3916,7 @@ export class InterludeService extends Service {
           ? { hostTimelineLedger: continuationLedger.content }
           : {}),
       } : null,
-      dueIntents, schedulePreplan: schedulePreplanWindow(scheduleRecord, now, story.setting.timezone, 12, this.schedulePreplanConfig),
+      dueIntents, schedulePreplan: await this.currentSchedulePreplanWindow(story, now),
     }
     try {
       const rawPlan: unknown = await this.compactor.planTimeline(request)
@@ -3663,7 +3927,13 @@ export class InterludeService extends Service {
         const automation = { ...(story.state.automation ?? {}) }
         delete automation.timelineRetryAt
         delete automation.timelineRetryFrom
+        delete automation.timelineDirectorFailures
         story.state = { ...story.state, automation }
+        try {
+          await this.dbSet('interlude_story', { id: story.id }, { state: story.state, updatedAt: new Date() })
+        } catch (error) {
+          this.reportOperation('diagnostic', 'debug', story, phase, '时间导演成功状态持久化失败 错误=%s', error)
+        }
         this.reportOperation('diagnostic', 'debug', story, phase, '时间导演已生成事件账本 节点=%d', plan.beats.length)
       } else {
         // 可诊断性：把模型原始返回暴露出来，避免"永远失效但不知道为什么"。
@@ -3679,7 +3949,7 @@ export class InterludeService extends Service {
     } catch (error) {
       const failures = (this.timelineDirectorFailures.get(story.id) ?? 0) + 1
       this.timelineDirectorFailures.set(story.id, failures)
-      this.reportOperation('diagnostic', 'warn', story, phase, '时间导演调用失败 错误=%s', error)
+      this.reportOperation('standard', 'warn', story, phase, '时间导演调用失败（连续第 %d 次）错误=%s', failures, error)
       await this.persistTimelineRetry(story, from, phase, failures)
       return undefined
     }
@@ -3692,11 +3962,9 @@ export class InterludeService extends Service {
     return failures
   }
 
-  /** Persist the retry gate once per unchanged cursor. The in-memory map is
-   * retained for fast checks inside a live turn, while the story state makes
-   * the guard survive a plugin reload/restart. */
+  /** Persist director health independently from the narrative cursor. */
   private async persistTimelineRetry(story: InterludeStory, from: Date, phase: NarrativeRequest['phase'], failures = 1) {
-    // 指数退避：10min → 20min → 40min → 80min → 160min → 封顶 2h。
+    // 指数退避：10min → 20min → 40min → 80min → 封顶 2h。
     // 退避只决定重试节奏；真正终止循环的是熔断降级（planAutomaticTimeline）。
     const backoff = Math.min(TIMELINE_RETRY_BACKOFF_BASE * 2 ** Math.max(0, failures - 1), TIMELINE_DIRECTOR_FUSE_COOLDOWN)
     const until = new Date(Date.now() + backoff)
@@ -3705,9 +3973,7 @@ export class InterludeService extends Service {
       ...(story.state.automation ?? {}),
       timelineRetryAt: until.toISOString(),
       timelineRetryFrom: from.toISOString(),
-      // Move the automatic wake-up out of the failed window. This is a hint
-      // for legacy schedulers; the entry guard above remains authoritative.
-      nextAdvanceAt: until.toISOString(),
+      timelineDirectorFailures: Math.min(TIMELINE_DIRECTOR_FUSE, failures),
     }
     story.state = encodeStoryState({ ...decodeStoryState(story.state), automation })
     try {
@@ -3722,7 +3988,7 @@ export class InterludeService extends Service {
     let effectiveNow = now
     const automaticPhase = phase === 'advance' || phase === 'conversation-follow-up' || phase === 'intent-due'
     const shortSchedule = automaticPhase && phase !== 'advance' && this.schedulePreplanConfig.enabled
-      ? schedulePreplanWindow(await this.getSchedulePreplan(story.id), from, story.setting.timezone, 12, this.schedulePreplanConfig) : undefined
+      ? await this.currentSchedulePreplanWindow(story, from) : undefined
     const directorRequired = automaticPhase && this.config.timelineDirector?.enabled !== false
       && needsTimelineDirector(phase, from, now, story.setting.timezone, shortSchedule)
     const timelinePlan = directorRequired
@@ -3787,12 +4053,28 @@ export class InterludeService extends Service {
             ? '剧本越过当前时间终点，已抛弃本次未落库剧本并重新写作 原因=%s'
             : '结构化可见回复缺失，已抛弃本次未落库剧本并重新写作',
           ...(initialTimeOverflow ? [initialTimeOverflow] : []))
+        // Fix 5：structureMissing 在首稿就计数（进入恢复重写即视为"发生了一次
+        // 缺失"）；recoverySaved 在恢复稿通过校验后才计数（不是进入恢复就计）。
+        if (initialVisibleRecovery) this.health?.recordStructureMissing(story.id)
+        else if (initialTimeOverflow) { /* 时间越界不在此计数 */ }
         decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, immediateObservations, true, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan)
         const recoveredTimeOverflow = detectLiveScriptTimeOverflow(decision.script, phase, from, effectiveNow, story.setting.timezone, endorsedClocks)
         if (recoveredTimeOverflow) throw new Error(`Narrative provider crossed the live time boundary after one recovery attempt: ${recoveredTimeOverflow}`)
+        // 恢复成功 = 第二稿不再需要回复恢复。
+        if (initialVisibleRecovery && !requiresVisibleReplyRecovery(phase, groupContext, decision) && !recoveredTimeOverflow) {
+          this.health?.recordRecoverySaved(story.id)
+        }
         if (this.modelRouting.main.available && !earlyReplyCommitted && requiresVisibleReplyRecovery(phase, groupContext, decision)) {
           this.reportOperation('diagnostic', 'warn', story, phase, '恢复尝试仍缺失结构化回复 interaction=%s', safeJsonPreview(decision.interaction))
-          throw new Error('Narrative provider omitted the required visible-reply structure after one recovery attempt.')
+          // 降级而非硬失败：两稿都丢 interaction 时，若剧本非空仍以无可见回复
+          // 提交——生活继续走、用户下次还能触发回复；硬失败会让整回合进
+          // 30s 重试队列，弱模型下变成失败循环。
+          if (typeof decision.script === 'string' && decision.script.trim()) {
+            this.reportOperation('standard', 'warn', story, phase, '结构化回复两稿均缺失，降级为无可见回复提交（剧本推进不受影响）')
+            decision = { ...decision, interaction: undefined, groupReply: undefined }
+          } else {
+            throw new Error('Narrative provider omitted the required visible-reply structure after one recovery attempt.')
+          }
         }
       }
       // The fixed narrative contract requires prose for every real model turn.
@@ -3817,15 +4099,18 @@ export class InterludeService extends Service {
       this.reportOperation('standard', 'info', story, phase,
         '模型调用完成 任务=主叙事 耗时=%dms 剧本文字=%d 回复模式=%s',
         Date.now() - startedAt, result.decision.script?.length ?? 0, visibleReplyMode(result.decision, phase, groupContext))
-      // 无可见回复的私聊回合打出最终 interaction，用于区分：模型主动 none、
-      // 未读沉默（seen=false）、引用失配被兜底前丢弃（actionId 残留）三种链路。
-      if (phase === 'user-message' && !groupContext && result.decision.interaction?.reply.mode === 'none') {
-        this.reportOperation('diagnostic', 'info', story, phase, '本回合无可见回复 interaction=%s',
+      this.health?.recordNarrativeComplete(story.id, Date.now() - startedAt, visibleReplyMode(result.decision, phase, groupContext))
+      this.lastActiveStoryId = story.id
+      // 无可见回复的私聊回合打出最终 interaction（standard 级：文件日志可见，
+      // 远程排查能直接区分模型主动 none / 未读沉默 / 引用矛盾被重写前的形态）。
+      if (phase === 'user-message' && !groupContext && result.decision.interaction?.reply?.mode === 'none') {
+        this.reportOperation('standard', 'info', story, phase, '本回合无可见回复 interaction=%s',
           safeJsonPreview(result.decision.interaction))
       }
       return result
     } catch (error) {
       this.report('warn', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s', Date.now() - startedAt, error)
+      this.health?.recordNarrativeFailed(story.id)
       return { decision: {}, succeeded: false, effectiveNow, immediateObservations, timelinePlan }
     }
   }
@@ -3843,13 +4128,27 @@ export class InterludeService extends Service {
     timelinePlan?: TimelinePlan,
   ) {
     // 先规范化，再写库：不信任模型给出的时间、长度和结构，尤其不能让未来剧情落库。
-    raw = resolveAuthoredActions(raw, immediateReplyAlreadyDelivered, this.config.runtime.messageSeparator)
+    raw = reconcileTransportReferences(raw, immediateReplyAlreadyDelivered, this.config.runtime.messageSeparator)
+    // 无 participant 回合（群聊/推进）容错重排 interaction：见 hoistParticipantlessInteraction。
+    if (!participant) {
+      const hoisted = hoistParticipantlessInteraction(raw, phase)
+      if (hoisted !== raw) {
+        const originalMode = raw.interaction?.reply?.mode
+        raw = hoisted
+        this.reportOperation('standard', 'info', story, phase,
+          '无参与者回合已重排 interaction 回复 原mode=%s 处理=%s', originalMode, hoisted.groupReply ? '提升为群发' : '剥离（无回复通道）')
+      }
+    }
     const allParticipants = await this.participants(story.id)
     const permittedParticipantIds = new Set(allParticipants.filter(item => this.canHandleParticipant(item)).map(item => item.id))
+    const permittedGroupIds = new Set((this.config.onebot?.groupChats ?? [])
+      .filter(group => group.enabled !== false)
+      .map(group => normalizeGroupId(group.groupId))
+      .filter(Boolean))
     const refreshContinuity = this.shouldRefreshContinuity(story, phase)
-    const decision = normalizeDecision(
+    let decision = normalizeDecision(
       raw, from, now, permitMessages, this.effectiveUrgeRuntime, this.sharedStoryConfig,
-      participant?.id ?? '', permittedParticipantIds, phase, this.memoryConfig, refreshContinuity,
+      participant?.id ?? '', permittedParticipantIds, permittedGroupIds, phase, this.memoryConfig, refreshContinuity,
     )
     const stateBefore = decodeStoryState(story.state)
     const activeScene = decision.script ? await this.activeScene(story.id) : null
@@ -3872,7 +4171,36 @@ export class InterludeService extends Service {
       undefined,
       this.config.runtime.maxMessageCharacters,
       this.config.runtime.messageSeparator,
+      this.config.runtime.splitReplyMessages !== false,
     )
+    // Fix 3（Commit 绑定）：advance 相位在 Commit 构建前做一次合成预检——
+    // 模型只给了 proactiveContact 意愿但没给 crossConversationActions 行动时，
+    // 从唯一 say 行动合成并注入 decision，让 commit-builder 正常为其生成
+    // outgoing-message 事件和投递账本绑定。此前合成发生在 Commit 之后，
+    // 导致合成消息不进账本（deliveryReality 下一轮报 no-outgoing-action-recorded）。
+    // 注意：Agency 完整判断（容量/意愿门槛）仍在后方做——此处只做"是否有
+    // proactiveContact + 是否缺行动 + 恰好一条 say"的注入预检，后方如果
+    // Agency 拒绝发送，crossActions 过滤会把这条注入的行动拦下。
+    if (phase === 'advance' && !decision.crossConversationActions.length && decision.proactiveContact) {
+      const synthesized = this.synthesizeCrossActionFromScript(decision, String((decision.proactiveContact as unknown as { participantId?: unknown })?.participantId ?? ''))
+      if (synthesized) {
+        decision = { ...decision, crossConversationActions: [synthesized] }
+        this.reportOperation('standard', 'info', story, phase,
+          'Commit 前合成：模型未返回 crossConversationAction，已从唯一 say 行动注入 参与者=%s', synthesized.participantId)
+      }
+    }
+    // proactive-check 相位的对称前移：模型没输出 interaction.reply 时，从唯一
+    // say 行动合成 interaction 并注入 decision——让 commit-builder 为其生成
+    // outgoing-message 事件和投递账本绑定。此前合成在 Commit 后导致账本缺记录。
+    if (contextIntents.length > 0 && contextIntents.every(intent => intent.type === 'proactive-check')
+      && participant && decision.proactiveContact && (!decision.interaction?.reply?.content)) {
+      const synthesized = this.synthesizeCrossActionFromScript(decision, participant.id)
+      if (synthesized) {
+        decision = { ...decision, interaction: { seen: false, reply: { mode: 'immediate', content: synthesized.content } } }
+        this.reportOperation('standard', 'info', story, phase,
+          'Commit 前合成：模型未输出 interaction 回复，已从唯一 say 行动注入 参与者=%s', participant.id)
+      }
+    }
     const commit = decision.script
       ? decisionToScriptCommit({
           storyId: story.id,
@@ -3908,11 +4236,11 @@ export class InterludeService extends Service {
     if (commit) {
       // A resolution belongs to this exact message reaching the user.
       if (participant && (permitMessages || immediateReplyAlreadyDelivered) && decision.followUpResolutions.length) {
-        const event = findOutgoingScriptEvent(commit, participant.id, 'immediate', decision.interaction?.reply.content, this.config.runtime.messageSeparator)
+        const event = findPrivateOutgoingMessageEvent(commit, participant.id, 'immediate', decision.interaction?.reply.content, this.config.runtime.messageSeparator)
         if (event) event.metadata = { ...event.metadata, followUpResolutions: decision.followUpResolutions }
       }
       if (participant && phase === 'user-message' && (permitMessages || immediateReplyAlreadyDelivered)) {
-        const event = findOutgoingScriptEvent(commit, participant.id, 'immediate', decision.interaction?.reply.content, this.config.runtime.messageSeparator)
+        const event = findPrivateOutgoingMessageEvent(commit, participant.id, 'immediate', decision.interaction?.reply.content, this.config.runtime.messageSeparator)
         const commitment = decision.followUpCommitment ?? (interactionPromisesFollowUp(decision.interaction?.reply.content)
           ? inferredFollowUpCommitment(decision.interaction!.reply.content!, now) : undefined)
         if (event && commitment) event.metadata = { ...event.metadata, followUpCommitment: commitment }
@@ -4060,9 +4388,19 @@ export class InterludeService extends Service {
     }
 
     const messages: OutgoingMessageDraft[] = []
-    const interaction = isAgencyCheck
-      ? agencyAllowsSend && decision.interaction?.reply.mode === 'immediate' ? decision.interaction : undefined
+    // proactive-check 回位的同类救援：Agency 通过但模型没输出 interaction.reply
+    // → 从剧本 say 行动合成，与 advance 相位的 crossActions 合成对称。
+    let interaction = isAgencyCheck
+      ? agencyAllowsSend && decision.interaction?.reply?.mode === 'immediate' ? decision.interaction : undefined
       : decision.interaction
+    if (isAgencyCheck && agencyAllowsSend && participant && (!interaction?.reply?.content)) {
+      const synthesized = this.synthesizeCrossActionFromScript(decision, participant.id)
+      if (synthesized) {
+        this.reportOperation('standard', 'info', story, phase,
+          'Agency 通过但模型未输出 interaction 回复，已从剧本 say 行动合成 参与者=%s', participant.id)
+        interaction = { seen: false, reply: { mode: 'immediate', content: synthesized.content } }
+      }
+    }
     if ((phase === 'intent-due' || phase === 'user-message') && participant) {
       await this.deferUnresolvedDueFollowUps(story.id, participant.id, contextIntents, resolvedFollowUps, interaction, now)
     }
@@ -4073,13 +4411,13 @@ export class InterludeService extends Service {
         }
       : undefined
     if (participant && phase === 'user-message' && !isAgencyCheck && interaction?.seen) await this.markParticipantSeen(participant, now)
-    if (participant && permitMessages && !immediateReplyAlreadyDelivered && interaction?.reply.mode === 'immediate' && interaction.reply.content) {
+    if (participant && permitMessages && !immediateReplyAlreadyDelivered && interaction?.reply?.mode === 'immediate' && interaction.reply.content) {
       messages.push(attachMessageEvent({
         participantId: participant.id, content: interaction.reply.content, automaticDelivery,
         interaction: interaction ?? null, userInitiated: phase === 'user-message',
-      }, commit ? findOutgoingScriptEvent(commit, participant.id, 'immediate', interaction.reply.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
+      }, commit ? findPrivateOutgoingMessageEvent(commit, participant.id, 'immediate', interaction.reply.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
     }
-    if (participant && permitMessages && interaction?.reply.mode === 'delayed' && interaction.reply.content && interaction.reply.sendAt) {
+    if (participant && permitMessages && interaction?.reply?.mode === 'delayed' && interaction.reply.content && interaction.reply.sendAt) {
       const sendAt = new Date(interaction.reply.sendAt)
       await this.appendIntent(story.id, {
         type: 'delayed-reply',
@@ -4092,7 +4430,7 @@ export class InterludeService extends Service {
           ...(commit
               ? scriptEventPayload(attachMessageEvent(
                   { participantId: participant.id, content: interaction.reply.content },
-                  findOutgoingScriptEvent(commit, participant.id, 'delayed', interaction.reply.content, this.config.runtime.messageSeparator),
+                  findPrivateOutgoingMessageEvent(commit, participant.id, 'delayed', interaction.reply.content, this.config.runtime.messageSeparator),
                   scriptEntry?.id,
                 ))
             : {}),
@@ -4104,13 +4442,16 @@ export class InterludeService extends Service {
     // A cross-account message is itself proactive from the target's point of
     // view. Allow it during a live user event, or during background work only
     // when the global proactive-message switch is enabled.
-    const crossActions = phase === 'user-message'
+    let crossActions = phase === 'user-message'
       ? decision.crossConversationActions
       : phase === 'advance' && !this.agencyConfig.enabled && this.config.runtime.allowProactiveMessages
         ? decision.crossConversationActions
       : phase === 'advance' && agencyAllowsSend && agencyCandidate
         ? decision.crossConversationActions.filter(action => action.participantId === agencyCandidate!.participantId && action.mode === 'immediate').slice(0, 1)
         : []
+    // Fix 3 后半：合成已在 Commit 前注入 decision.crossConversationActions，此处
+    // Agency 过滤会自然保留或拦下它。仅当 proactive-check 相位（走 interaction
+    // 路径而非 crossActions）时，仍需后置合成 interaction。
     if (phase === 'advance' && decision.crossConversationActions.length && !crossActions.length) {
       this.reportOperation('diagnostic', 'debug', story, phase,
         'Agency 拒绝未通过容量或来源验证的 crossConversationAction 数量=%d', decision.crossConversationActions.length)
@@ -4132,10 +4473,20 @@ export class InterludeService extends Service {
     }
     for (const action of crossActions) {
       if (action.mode === 'immediate') {
+        if (action.participantId.startsWith('group:')) {
+          // Use the shared delivery queue so background turns do not discard
+          // group sends, and keep the originating event for receipt projection.
+          messages.push(attachMessageEvent({
+            participantId: action.participantId, content: action.content, userInitiated: phase === 'user-message',
+          }, commit ? findPrivateOutgoingMessageEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
+          continue
+        }
+        // P2 Fix: 主动联系计数移到投递结果处——加入数组不等于发送成功。
         messages.push(attachMessageEvent({
           participantId: action.participantId, content: action.content, automaticDelivery,
           interaction: interaction ?? null, userInitiated: phase === 'user-message',
-        }, commit ? findOutgoingScriptEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
+        }, commit ? findPrivateOutgoingMessageEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
+        this.pendingProactiveCount++
       } else {
         const sendAtValue = (action as { sendAt?: string }).sendAt
         if (action.mode !== 'delayed' || !sendAtValue) continue
@@ -4148,7 +4499,7 @@ export class InterludeService extends Service {
             ...(commit
               ? scriptEventPayload(attachMessageEvent(
                   { participantId: action.participantId, content: action.content },
-                  findOutgoingScriptEvent(commit, action.participantId, 'delayed', action.content, this.config.runtime.messageSeparator),
+                  findPrivateOutgoingMessageEvent(commit, action.participantId, 'delayed', action.content, this.config.runtime.messageSeparator),
                   scriptEntry?.id,
                 ))
               : {}),
@@ -4162,7 +4513,7 @@ export class InterludeService extends Service {
     // bubbles in memory until the first bubble arrives; every bubble retains
     // the identity of the script event from which it was derived.
     const prepared = messages
-      .map(message => prepareOutgoingDelivery(message, this.splitOutgoingMessage(message.content)))
+      .map(message => message.participantId.startsWith('group:') ? message : prepareOutgoingDelivery(message, this.splitOutgoingMessage(message.content)))
       .filter((message): message is OutgoingMessageDraft => !!message)
     if (this.urgeConfig.enabled && scriptEntry && (isAutomaticNarrativePhase(phase) || phase === 'intent-due' && !contextIntents.some(intent => intent.type === 'narrative-retry'))) {
       try {
@@ -4721,6 +5072,16 @@ export class InterludeService extends Service {
   }
 
   /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
+/** 用户回合成功后的清理：遗留的 narrative-retry 已无意义——其入站消息早已
+ * 被本轮覆盖或消化，保留只会到期再跑一轮完整回合（userInitiated 允许投递）
+ * 并给用户送去一条重复回复。 */
+  private async cancelPendingNarrativeRetries(story: InterludeStory, participantId: string, now: Date) {
+    const pending = await this.dbGet('interlude_intent', { storyId: story.id, participantId, status: 'pending', type: 'narrative-retry' })
+    if (!pending.length) return
+    await this.dbSet('interlude_intent', { id: { $in: pending.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+    this.reportOperation('standard', 'info', story, 'user-message', '已取消遗留的叙事重试意图 参与者=%s 数量=%d', participantId, pending.length)
+  }
+
   private async scheduleNarrativeRetry(storyId: string, participantId: string, now: Date, previousAttempts = 0) {
     const delaySeconds = Math.max(5, this.config.runtime.narrativeRetryDelaySeconds ?? 60)
     const maxAttempts = Math.max(0, this.config.runtime.narrativeRetryMaxAttempts ?? 6)
@@ -4945,7 +5306,7 @@ export class InterludeService extends Service {
     now: Date,
     deliveryEventId?: string,
   ) {
-    if (!resolutions.length || interaction?.reply.mode !== 'immediate' || !interaction.reply.content?.trim()) return new Set<number>()
+    if (!resolutions.length || interaction?.reply?.mode !== 'immediate' || !interaction.reply.content?.trim()) return new Set<number>()
     const ids = resolutions.map(item => item.id)
     const rows = await this.dbGet('interlude_intent', {
       storyId, participantId, type: 'follow-up-commitment', status: 'pending', id: { $in: ids },
@@ -5043,18 +5404,25 @@ export class InterludeService extends Service {
       candidate.participantId, formatLogTime(notBefore, story.setting.timezone), reason)
   }
 
+  /** Fix#2: schedule_preplan 的主键就是 storyId，Minato 拒绝含主键的 update——
+   * 混在改写循环里必抛，导致后续 participantId 回填被跳过（隐私脱敏失效）。
+   * 改为读旧行→建新行→删旧行（每故事仅一行，无并发窗口问题）。 */
+  private async migrateSchedulePreplanRecord(legacyStoryId: string, newStoryId: string) {
+    const preplanRows = await this.dbGet('interlude_schedule_preplan', { storyId: legacyStoryId })
+    if (!preplanRows.length) return
+    const { storyId: _oldStoryId, ...rest } = preplanRows[0] as Record<string, unknown>
+    await this.dbCreate('interlude_schedule_preplan', { ...rest, storyId: newStoryId })
+    await this.dbRemove('interlude_schedule_preplan', { storyId: legacyStoryId })
+  }
+
   private async cancelPendingOutgoingMessages(storyId: string, participantId: string, now: Date, cancelPlanned = true) {
-    let completed = false
     try {
       const intents = await this.dbGet('interlude_intent', { storyId, participantId, status: 'pending' })
       const matching = intents.filter(intent => intent.participantId === participantId && (
         intent.type === 'split-message'
         || cancelPlanned && (intent.type === 'delayed-reply' || intent.type === 'cross-conversation-message')
       ))
-      if (!matching.length) {
-        completed = true
-        return matching
-      }
+      if (!matching.length) return matching
 
       await this.dbSet('interlude_intent', { id: { $in: matching.map(intent => intent.id) } }, {
         status: 'cancelled',
@@ -5085,10 +5453,10 @@ export class InterludeService extends Service {
         occurredAt: now.toISOString(),
         metadata: { intentIds: matching.map(intent => intent.id), interruptedDrafts },
       }, now, participantId)
-      completed = true
       return matching
     } finally {
-      if (completed) this.interruptedTypingParticipants.delete(participantId)
+      // Fix#11: 无条件清理——异常滞留会永久跳过该参与者的后续分段投递。
+      this.interruptedTypingParticipants.delete(participantId)
     }
   }
 
@@ -5104,6 +5472,47 @@ export class InterludeService extends Service {
    * This is the boundary that prevents a shared story from accidentally
    * sending every reply back to the account that happened to trigger the turn.
    */
+  /** When Agency approves a proactive contact but the model omitted the
+   * crossConversationAction field, synthesize one from the script's say
+   * actions. The model wrote what she sends in the script; the host only
+   * fills the transport envelope. Never invents words not in the script. */
+  private synthesizeCrossActionFromScript(decision: { authoredActions?: unknown, script?: string }, participantId: string): { participantId: string, mode: 'immediate', content: string } | undefined {
+    const actions = Array.isArray(decision?.authoredActions) ? decision.authoredActions as { id: string, content: string }[] : []
+    // 多行动时无法确定哪条属于目标接收者（AuthoredAction 不携带归属）——
+    // 保守不合成而非猜"最后一条"，零误发风险；单行动时归属无歧义。
+    if (actions.length !== 1) return undefined
+    const action = actions[0]
+    if (!action?.content?.trim()) return undefined
+    const content = sanitizeAndClampVisibleContent(action.content, this.config.runtime.maxMessageCharacters, this.config.runtime.messageSeparator)
+    if (!content) return undefined
+    return { participantId, mode: 'immediate' as const, content }
+  }
+
+  private async sendCrossGroupMessage(story: InterludeStory, message: OutgoingMessageDraft, session?: Session) {
+    const groupId = normalizeGroupId(message.participantId.slice('group:'.length))
+    const allowed = this.config.onebot?.groupChats?.some(group => group.enabled !== false && normalizeGroupId(group.groupId) === groupId)
+    const outcome: GroupDeliveryResult = allowed
+      ? await this.sendGroupMessage(story, groupId, message.content, undefined, session)
+      : { deliveredSegments: [], complete: false, segmentOutcomes: this.splitOutgoingMessage(message.content).map((content, index) => ({ index, content, status: 'failed', reason: 'group-not-allowed' })) }
+    const now = new Date()
+    await this.serial(story.id, async () => {
+      if (message.scriptEvent) {
+        for (const segment of outcome.segmentOutcomes) {
+          await this.updateScriptDeliveryOutcome(story.id, { ...message.scriptEvent, segmentIndex: segment.index }, segment.status, now, segment.reason)
+        }
+      }
+      if (outcome.deliveredSegments.length) {
+        await this.appendEntry(story.id, {
+          kind: 'character-group-message', actor: 'character', content: outcome.deliveredSegments.join('<sep/>'), occurredAt: now.toISOString(),
+          metadata: { groupId, channelId: groupId, ...(message.scriptEvent ?? {}),
+            deliverySegmentIndexes: outcome.segmentOutcomes.filter(segment => segment.status === 'delivered').map(segment => segment.index),
+            partialDelivery: !outcome.complete },
+        }, now)
+      }
+    })
+    if (!outcome.complete) this.report('warn', story, 'intent-due', '跨群消息投递未完成（不自动重发）群频道=%s', groupId)
+  }
+
   private async sendOutgoingMessages(
     story: InterludeStory,
     messages: OutgoingMessageDraft[],
@@ -5111,16 +5520,25 @@ export class InterludeService extends Service {
     session?: Session,
     shouldCancel?: (target: InterludeParticipant) => boolean,
     recordFailures = true,
+    requestStartedAt?: Date,
   ) {
     const delivered: OutgoingMessageDraft[] = []
     if (!messages.length) return delivered
-    const ids = Array.from(new Set(messages.map(message => message.participantId).filter(Boolean)))
+    const ids = Array.from(new Set(messages.map(message => message.participantId).filter(id => !!id && !id.startsWith('group:'))))
     const byId = new Map<string, InterludeParticipant>()
     if (current && ids.includes(current.id)) byId.set(current.id, current)
     const missingIds = ids.filter(id => !byId.has(id))
     const participants = await Promise.all(missingIds.map(id => this.getParticipant(id)))
     for (const participant of participants) if (participant) byId.set(participant.id, participant)
+    let typingFloorApplied = false
     for (const message of messages) {
+      if (message.participantId.startsWith('group:')) {
+        // A group target must never enter private participant lookup or use
+        // session.send() from the private turn that authored this action.
+        try { await this.sendCrossGroupMessage(story, message, session) }
+        catch (error) { this.report('warn', story, 'intent-due', '跨群投递或回执记录失败（不自动重发）目标=%s 错误=%s', message.participantId, error) }
+        continue
+      }
       const target = byId.get(message.participantId)
       if (!target) {
         this.report('warn', story, 'intent-due', '无法投递消息：参与者不存在 %s', message.participantId)
@@ -5131,6 +5549,16 @@ export class InterludeService extends Service {
         this.report('warn', story, 'intent-due', '消息被当前账号白名单拦截 参与者=%s', target.id)
         if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'participant-not-allowed')
         continue
+      }
+      // 首条发言的打字时间下限：模型返回快于按字数估算的打字时长时补足等待，
+      // 返回慢于该时长则不等待。仅对当前对话参与者的首条生效，一次调用至多一次。
+      if (requestStartedAt && current && message.participantId === current.id && !typingFloorApplied) {
+        typingFloorApplied = true
+        const hold = this.firstMessageTypingHoldMs(message.content, requestStartedAt)
+        if (hold > 0) {
+          this.reportOperation('diagnostic', 'debug', story, 'user-message', '首条消息按打字时间补足等待 参与者=%s 等待=%dms', target.id, hold)
+          await new Promise<void>(resolve => { this.ctx.setTimeout(() => resolve(), hold) })
+        }
       }
       if (shouldCancel?.(target)) {
         this.reportOperation('standard', 'info', story, 'user-message', '新消息打断主角输入，停止发送后续分段 参与者=%s', target.id)
@@ -5153,7 +5581,8 @@ export class InterludeService extends Service {
           this.report('info', story, 'intent-due', '主角消息内容：%s', message.content.slice(0, this.config.logging.previewLength))
         }
         if (session && current?.id === target.id) {
-          await session.send(outgoingContent)
+          const receipt = await session.send(outgoingContent)
+          if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
           delivered.push(message)
           continue
         }
@@ -5176,7 +5605,8 @@ export class InterludeService extends Service {
           if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'bot-not-found')
           continue
         }
-        await bot.sendMessage(target.channelId, outgoingContent)
+        const receipt = await bot.sendMessage(target.channelId, outgoingContent)
+        if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
         delivered.push(message)
       } catch (error) {
         this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
@@ -5386,6 +5816,15 @@ export class InterludeService extends Service {
     return Math.max(250, Math.min(maximumSeconds * Time.second, Math.round(nominal * factor * Time.second)))
   }
 
+  /** 首条发言的打字时间下限：以叙事请求发起时刻为基准，模型耗时不足
+   * typingDelay(首条字数) 时返回需补足的毫秒数；耗时已超过则返回 0（立即发送）。
+   * elapsed 以 0 为下限——起点时间戳异常（时钟偏差）不会反向放大等待。 */
+  private firstMessageTypingHoldMs(content: string, requestStartedAt: Date) {
+    const floor = this.typingDelayMilliseconds(content)
+    const elapsed = Math.max(0, Date.now() - requestStartedAt.getTime())
+    return Math.max(0, floor - elapsed)
+  }
+
   private findBotForParticipant(participant: InterludeParticipant) {
     return this.ctx.bots.find(bot =>
       String(bot.selfId) === String(participant.selfId)
@@ -5513,7 +5952,7 @@ export class InterludeService extends Service {
     if (!config.enabled) return
     const story = await this.getStory(storyId)
     const interaction = rawInteraction ? normalizeInteraction(rawInteraction, now, this.config.runtime) : undefined
-    const delayedUntil = interaction?.reply.mode === 'delayed' ? toDate(interaction.reply.sendAt) : undefined
+    const delayedUntil = interaction?.reply?.mode === 'delayed' ? toDate(interaction.reply.sendAt) : undefined
     const anchor = delayedUntil && delayedUntil > now ? delayedUntil : now
     if (this.urgeConfig.enabled) return this.scheduleUrgeAdvance(story, anchor)
     // Sleep/rest windows keep their low-frequency cadence: do not wake the
@@ -5610,6 +6049,16 @@ export class InterludeService extends Service {
     setting.relationship = defaults.relationship
     setting.world = defaults.world
     setting.perspective = clip(defaults.perspective, 1_200)
+    // 多条独立视角：去空去重、截断，保留为独立条目不合并。
+    const perspectives = Array.isArray(defaults.perspectives)
+      ? defaults.perspectives.filter(p => typeof p === 'string' && p.trim()).map(p => clip(p, 800)).slice(0, 12)
+      : []
+    if (perspectives.length) setting.perspectives = perspectives
+    // 补充事实：复杂世界/人物/关系事实，同规则截断。
+    const supplementary = Array.isArray(defaults.supplementaryFacts)
+      ? defaults.supplementaryFacts.filter(f => typeof f === 'string' && f.trim()).map(f => clip(f, 800)).slice(0, 20)
+      : []
+    if (supplementary.length) setting.supplementaryFacts = supplementary
     setting.supportingCast = defaults.supportingCast
     setting.location = defaults.location
     setting.style = defaults.style || setting.style
@@ -5714,9 +6163,10 @@ export class InterludeService extends Service {
     const participant = await this.ensureParticipant(story, session, now)
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
-      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation',
     ] as const
     for (const table of tables) await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id } as any)
+    await this.migrateSchedulePreplanRecord(legacy.id, story.id)
     // The old story only had one user, so account-bound records can safely be
     // attached to that initial relationship branch during migration.
     for (const table of ['interlude_script_entry', 'interlude_memory', 'interlude_intent', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation'] as const) {
@@ -5983,6 +6433,147 @@ export class InterludeService extends Service {
     run()
   }
 
+  // ── 世界事件播种器：生成回路 + 到期排水 ─────────────────────────────────
+  // 事实权威、反应自由（docs/WORLD_EVENT_SEEDER_DESIGN.md）：事件条目是既成
+  // 现实，她如何感知与应对由主作者书写。注册参与者严格拉黑；只允许线下通道。
+
+  private worldSeederSweepRunning = false
+
+  private async worldSeederSweep() {
+    if (this.desktopRuntimePhase === 'paused' || !this.worldSeederRuntime.enabled || !this.worldSeeder.available || this.worldSeederSweepRunning) return
+    this.worldSeederSweepRunning = true
+    try {
+      const story = await this.getCanonicalStory()
+      if (!story || !this.canHandleStory(story)) return
+      // 抖动：随机跳过部分检查，避免固定节律感（多数运行仍应输出空）。
+      if (Math.random() < 0.25) return
+      const now = new Date()
+      const dayAgo = new Date(now.getTime() - 24 * Time.hour)
+      const [scheduled, last24, recentInjected] = await Promise.all([
+        this.dbGet('interlude_seeded_event', { storyId: story.id, status: 'scheduled' }),
+        this.dbGet('interlude_seeded_event', { storyId: story.id, status: 'injected', updatedAt: { $gte: dayAgo } }),
+        this.dbGet('interlude_seeded_event', { storyId: story.id, status: 'injected', occursAt: { $gte: new Date(now.getTime() - 14 * Time.day) } }),
+      ])
+      const runtime = this.worldSeederRuntime
+      if (scheduled.length >= runtime.maxPending || last24.length >= runtime.dailyCap) return
+      const payload = await this.buildWorldSeederPayload(story, now, recentInjected.map(row => String(row.summary)))
+      const raw = await this.worldSeeder.generate(payload)
+      const drafts = parseWorldSeedEvents(raw)
+      if (!drafts.length) {
+        this.reportOperation('diagnostic', 'debug', story, 'advance', '世界播种器本轮无事件')
+        return
+      }
+      const input: SeedValidationInput = {
+        now, timezone: story.setting.timezone, maxHorizonHours: runtime.maxHorizonHours,
+        blockedNames: await this.worldSeederBlockedNames(story.id),
+        recentSummaries: recentInjected.map(row => String(row.summary)),
+      }
+      let pendingCount = scheduled.length
+      let dailyCount = last24.length
+      let highToday = last24.filter(row => row.importance === 'high').length
+      for (const draft of drafts) {
+        if (pendingCount >= runtime.maxPending || dailyCount >= runtime.dailyCap) break
+        if (draft.importance === 'high' && highToday >= 1) continue
+        const rejection = validateSeedEvent(draft, input)
+        if (rejection) {
+          this.reportOperation('diagnostic', 'debug', story, 'advance', '世界事件被校验闸拒绝 原因=%s 摘要=%s', rejection, draft.summary.slice(0, 60))
+          continue
+        }
+        await this.dbCreate('interlude_seeded_event', {
+          storyId: story.id, summary: draft.summary, importance: draft.importance,
+          occursAt: draft.occursAt, status: 'scheduled',
+          ...(draft.expiresAt ? { expiresAt: draft.expiresAt } : {}),
+          subjects: draft.subjects, sourcePayload: { rationale: draft.rationale },
+          createdAt: now, updatedAt: now,
+        })
+        pendingCount += 1
+        dailyCount += 1
+        if (draft.importance === 'high') highToday += 1
+        this.scheduleDueIntentWake(story.id, draft.occursAt)
+        this.reportOperation('standard', 'info', story, 'advance', '世界事件已排期 重要性=%s 发生于=%s 摘要=%s', draft.importance, draft.occursAt.toISOString(), draft.summary.slice(0, 60))
+      }
+    } finally {
+      this.worldSeederSweepRunning = false
+    }
+  }
+
+  /** 上下文 payload：环境（时区/季节/世界设定）、历史剧本（压缩摘录）、
+   * 关系网（拉黑名单）、主角所为（workingDetails + 场景/弧摘要）。 */
+  private async buildWorldSeederPayload(story: InterludeStory, now: Date, recentSummaries: string[]) {
+    const [entries, scene, arc] = await Promise.all([
+      this.recentEntriesForPrompt(story.id, now),
+      this.activeScene(story.id),
+      this.activeArc(story.id),
+    ])
+    const state = decodeStoryState(story.state)
+    const blockedNames = await this.worldSeederBlockedNames(story.id)
+    const compact = compactPromptEntries(entries, 2_000)
+      .slice(-14)
+      .map(entry => ({ kind: entry.kind, at: entry.occurredAt.toISOString(), text: entry.content.slice(0, 240) }))
+    const month = Number(new Intl.DateTimeFormat('en-US', { month: 'numeric', timeZone: story.setting.timezone }).format(now))
+    const season = month >= 3 && month <= 5 ? 'spring' : month >= 6 && month <= 8 ? 'summer' : month >= 9 && month <= 11 ? 'autumn' : 'winter'
+    return JSON.stringify({
+      nowLocal: new Intl.DateTimeFormat('en-US', { dateStyle: 'full', timeStyle: 'short', timeZone: story.setting.timezone }).format(now),
+      timezone: story.setting.timezone,
+      season,
+      worldSetting: {
+        characterName: story.setting.character?.name ?? '',
+        characterProfile: (story.setting.character?.profile ?? '').slice(0, 600),
+        world: (story.setting.world ?? '').slice(0, 800),
+        location: (story.setting.location ?? '').slice(0, 300),
+        supportingCast: (story.setting.supportingCast ?? '').slice(0, 400),
+      },
+      currentScene: scene?.summary?.slice(0, 500) ?? '',
+      currentArc: arc?.summary?.slice(0, 500) ?? '',
+      recentEstablishedLife: compact,
+      workingDetails: (state.workingDetails ?? []).map(detail => ({ label: detail.label, value: detail.value })).slice(-8),
+      blockedNames,
+      recentlySeededEvents: recentSummaries.slice(-10),
+      constraints: {
+        maxHorizonHours: this.worldSeederRuntime.maxHorizonHours,
+        dailyBudget: this.worldSeederRuntime.dailyCap,
+        note: 'BLOCKED NAMES are off-limits; offline channels only; most runs return empty events.',
+      },
+    })
+  }
+
+  private async worldSeederBlockedNames(storyId: string) {
+    const participants = await this.participants(storyId)
+    return participants
+      .map(item => item.displayName?.trim() ?? '')
+      .filter(name => name.length >= 2)
+  }
+
+  /** 到期排水：claim-then-append，先进账的条目本回合 recentScript 即可见。
+   * 低重要性只在推进/跟进回合注入，避免劫持对话回合。 */
+  private async drainDueSeededEvents(story: InterludeStory, now: Date, includeLow: boolean) {
+    if (!this.worldSeederRuntime.enabled) return
+    try {
+      const rows = await this.dbGet('interlude_seeded_event', { storyId: story.id, status: 'scheduled', occursAt: { $lte: now } })
+      const due = rows
+        .map(row => normalizeDatabaseRow('interlude_seeded_event', row) as SeededWorldEvent)
+        .sort((left, right) => left.occursAt.getTime() - right.occursAt.getTime())
+      for (const row of due) {
+        if (row.expiresAt && row.expiresAt.getTime() <= now.getTime()) {
+          await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'expired', updatedAt: now })
+          continue
+        }
+        if (row.importance === 'low' && !includeLow) continue
+        await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'injected', updatedAt: now })
+        const entry = await this.appendEntry(story.id, {
+          kind: 'world-event', actor: 'system',
+          content: `[世界事件] ${row.summary}`,
+          occurredAt: row.occursAt.toISOString(),
+          metadata: { seededEventId: row.id, importance: row.importance },
+        }, now)
+        await this.dbSet('interlude_seeded_event', { id: row.id }, { injectedEntryId: entry.id, updatedAt: now })
+        this.reportOperation('standard', 'info', story, 'advance', '世界事件已注入 条目=%d 重要性=%s 摘要=%s', entry.id, row.importance, row.summary.slice(0, 60))
+      }
+    } catch (error) {
+      this.report('warn', story, 'advance', '世界事件排水失败（不阻断回合）错误=%s', error)
+    }
+  }
+
   private async compactStories() {
     if (this.desktopRuntimePhase === 'paused' || (!this.memoryConfig.enabled && !this.schedulePreplanConfig.enabled) || this.compactionSweepRunning) return
     this.compactionSweepRunning = true
@@ -5998,6 +6589,23 @@ export class InterludeService extends Service {
     } finally {
       this.compactionSweepRunning = false
     }
+  }
+
+  /** Fix#8: 复核退避/对话推迟会让 materializedDays 的 [今天,明天] 槽位缺失，窗口静默变空。
+   * 取记录时若两个槽位都没有物化天，先本地无模型重物化（锚定今天）再算窗口。 */
+  private async currentSchedulePreplanWindow(story: InterludeStory, at: Date) {
+    if (!this.schedulePreplanConfig.enabled) return schedulePreplanWindow(undefined, at, story.setting.timezone, 12, this.schedulePreplanConfig)
+    const record = await this.getSchedulePreplan(story.id)
+    if (!record) return schedulePreplanWindow(record, at, story.setting.timezone, 12, this.schedulePreplanConfig)
+    const local = storyLocalTimeContext(at, story.setting.timezone)
+    const tomorrow = storyLocalTimeContext(new Date(at.getTime() + 86_400_000), story.setting.timezone).date
+    if (record.materializedDays.some(day => day.date === local.date || day.date === tomorrow)) {
+      return schedulePreplanWindow(record, at, story.setting.timezone, 12, this.schedulePreplanConfig)
+    }
+    const refreshed = refreshSchedulePreplan(record, local.date, story.setting.timezone, resolveSchedulePreplanConfig(this.schedulePreplanConfig), at)
+    await this.saveSchedulePreplan(refreshed)
+    this.reportOperation('standard', 'info', story, 'advance', '日程物化已滞后于今天，本地重物化锚定=%s', local.date)
+    return schedulePreplanWindow(refreshed, at, story.setting.timezone, 12, this.schedulePreplanConfig)
   }
 
   private async getSchedulePreplan(storyId: string) {
@@ -6457,6 +7065,19 @@ export class InterludeService extends Service {
       if (nextScene) await this.dbSet('interlude_scene', { id: nextScene.id }, { lastEntryId: entries.at(-1)!.id })
     }
     const presenceUpdates = normalizeScenePresenceDrafts(scenePatch.presence, entries, now)
+    // 压缩器附带的主角注意力状态（群聊意愿 auto 档输入）：合法三值才落库，
+    // 无效/缺失保持旧值——状态不是本轮压缩的产物时不应被清空。
+    const nextLifeStatus = normalizeLifeStatusDraft(decision.lifeStatus)
+    if (nextLifeStatus) {
+      const current = await this.getStory(story.id)
+      const state = decodeStoryState(current.state)
+      if (state.lifeStatus?.status !== nextLifeStatus) {
+        await this.dbSet('interlude_story', { id: current.id }, {
+          state: encodeStoryState({ ...state, lifeStatus: { status: nextLifeStatus, updatedAt: now.toISOString() } }), updatedAt: now,
+        })
+        this.reportOperation('diagnostic', 'debug', story, 'advance', '生活状态已更新 状态=%s', nextLifeStatus)
+      }
+    }
     if (presenceUpdates.length) {
       const current = await this.getStory(story.id)
       const state = decodeStoryState(current.state)
@@ -7006,6 +7627,14 @@ export class InterludeService extends Service {
   }
 }
 
+function mergeForwardContent(existing: string, forward: string) {
+  const base = String(existing ?? '')
+    .replace(/<forward\b[^>]*\/?>(?:<\/forward>)?/gi, '')
+    .replace(/\[CQ:forward,[^\]]*\]/gi, '')
+    .trim()
+  return base ? `${base}\n${forward}` : forward
+}
+
 function storyIdForCharacter(platform: string, selfId: string) { return `character:${platform}:${selfId}` }
 
 function legacyStoryIdFor(platform: string, selfId: string, userId: string) { return `${platform}:${selfId}:${userId}` }
@@ -7387,9 +8016,9 @@ export function extractUserReportedTimes(content: string, now: Date, timezone: s
   }
     // 中文数字钟点（“八点”“八点半”“九点一刻”）：口语消息最常用的写法，此前
   // 只有守卫的正则认识它们，prompt 侧的 userReportedTimes 反而漏掉。
-  for (const match of text.matchAll(/([零一二三四五六七八九十两]+)点(?:(?:零|([一二三四五六七八九十两]+))分?|半)?/g)) {
+  for (const match of text.matchAll(/([零一二三四五六七八九十两]+)点(?:(?:零|([一二三四五六七八九十两]+))分?|(半))?/g)) {
     const hour = chineseClockNumber(match[1])
-    const minute = match[2] === '半' ? 30 : match[2] ? chineseClockNumber(match[2]) : 0
+    const minute = match[3] === '半' ? 30 : match[2] ? chineseClockNumber(match[2]) : 0
     if (hour == null || minute == null) continue
     add(hour, minute, text.slice(Math.max(0, match.index! - 48), Math.min(text.length, match.index! + match[0].length + 96)))
   }
@@ -7540,7 +8169,7 @@ export function normalizeGroupChatActions(
 
   const rawReplyTo = decision.groupReply?.mode === 'immediate'
     ? decision.groupReply.replyTo
-    : decision.interaction?.reply.mode === 'immediate'
+    : decision.interaction?.reply?.mode === 'immediate'
       ? decision.interaction.reply.replyTo
       : undefined
   const replyMessageId = capabilities.quoteReply && typeof rawReplyTo === 'string' ? targets.get(rawReplyTo) : undefined
@@ -7582,13 +8211,41 @@ function mentionsBot(session: Session) {
   return content.includes(selfId) || new RegExp(`<at[^>]+id=["']?${selfId}["']?`, 'i').test(content)
 }
 
-export function normalizeGroupVisibleReply(raw: NarrativeDecision['groupReply'], interaction: NarrativeDecision['interaction'], maxCharacters: number, separator = '<sep/>') {
-  return normalizeGroupReply(raw, maxCharacters, separator) || normalizeGroupInteractionReply(interaction, maxCharacters, separator)
+export function normalizeGroupVisibleReply(raw: NarrativeDecision['groupReply'], interaction: NarrativeDecision['interaction'], maxCharacters: number, separator = '<sep/>', splitEnabled = true) {
+  const content = normalizeGroupReply(raw, maxCharacters, separator) || normalizeGroupInteractionReply(interaction, maxCharacters, separator)
+  // 与私聊同合约：只把空行（段落边界）视作气泡边界，单个换行留在一条消息内。
+  // 拆条关闭时不做转换，保持原始段落格式。
+  if (!splitEnabled || !content) return content
+  const canonical = separator?.trim() || '<sep/>'
+  return content.includes(canonical) ? content : content.replace(/\s*\r?\n\s*\r?\n+/g, canonical)
 }
 
-function requiresVisibleReplyRecovery(phase: NarrativeRequest['phase'], groupContext: GroupContext | undefined, decision: NarrativeDecision) {
+/** 无 participant 回合的 interaction 容错：群聊回合（user-message 且无 participant）
+ * 把 immediate 的 interaction 回复提升为 groupReply 参与提交与投递——简洁协议把
+ * interaction 形态写在最前，弱模型常在群聊照抄私聊形态。不提升时 commit-builder
+ * 会为无 participant 的 interaction 生成 outgoing-message 事件，结构校验失败导致
+ * 整回合静默。其余无 participant 相位（advance 等）本无回复通道，携带内容的
+ * interaction 一律剥离，同样避免校验失败。 */
+export function hoistParticipantlessInteraction<T extends NarrativeDecision>(decision: T, phase: NarrativeRequest['phase']): T {
+  const reply = decision.interaction?.reply
+  if (!reply || reply.mode === 'none' || !reply.content?.trim()) return decision
+  if (reply.mode === 'immediate' && phase === 'user-message' && !hasStructuredGroupReplyField(decision.groupReply)) {
+    return {
+      ...decision,
+      groupReply: { mode: 'immediate', content: reply.content, ...(reply.replyTo ? { replyTo: reply.replyTo } : {}) },
+      interaction: undefined,
+    }
+  }
+  return { ...decision, interaction: undefined }
+}
+
+export function requiresVisibleReplyRecovery(phase: NarrativeRequest['phase'], groupContext: GroupContext | undefined, decision: NarrativeDecision) {
   if (phase !== 'user-message') return false
-  return groupContext ? !hasStructuredGroupReply(decision) : !hasStructuredInteraction(decision.interaction)
+  if (groupContext) return !hasStructuredGroupReply(decision)
+  // mode=none+actionId 的弱模型矛盾形态不在此处理：能锚定 say 行动的由
+  // reconcileTransportReferences 就地救援为 immediate，锚不定的按合法沉默放行
+  // （重写无法改变模型的稳定输出习惯，只会把"静默不发"恶化成"整回合失败"）。
+  return !hasStructuredInteraction(decision.interaction)
 }
 
 export function visibleReplyMode(decision: NarrativeDecision, phase: NarrativeRequest['phase'], groupContext?: GroupContext) {
@@ -7638,15 +8295,15 @@ function safeJsonPreview(value: unknown) {
 
 function normalizeGroupReply(raw: NarrativeDecision['groupReply'], maxCharacters: number, separator = '<sep/>') {
   if (!raw || raw.mode !== 'immediate') return ''
-  return normalizeVisibleMessageContent(raw.content, maxCharacters, separator)
+  return sanitizeAndClampVisibleContent(raw.content, maxCharacters, separator)
 }
 
 function normalizeGroupInteractionReply(raw: NarrativeDecision['interaction'], maxCharacters: number, separator = '<sep/>') {
-  if (!raw || raw.reply.mode !== 'immediate') return ''
-  return normalizeVisibleMessageContent(raw.reply.content, maxCharacters, separator)
+  if (!raw || !raw.reply || raw.reply.mode !== 'immediate') return ''
+  return sanitizeAndClampVisibleContent(raw.reply.content, maxCharacters, separator)
 }
 
-function normalizeVisibleMessageContent(value: unknown, maxCharacters: number, separator = '<sep/>') {
+function sanitizeAndClampVisibleContent(value: unknown, maxCharacters: number, separator = '<sep/>') {
   return String(value ?? '')
     // Providers occasionally drop the slash or emit full-width brackets while
     // copying the contract. Normalize only structured visible replies; script
@@ -7718,9 +8375,6 @@ export function resolveBlindModeConfig(value?: Partial<BlindModeConfig>): BlindM
     healthReportMinutes: Math.max(1, Math.min(1_440, Math.floor(value?.healthReportMinutes ?? 10))),
   }
 }
-
-/** @deprecated Renamed to resolveBlindModeConfig. */
-export const resolveBlackBoxConfig = resolveBlindModeConfig
 
 function isAutomaticNarrativePhase(phase: NarrativeRequest['phase']) {
   return phase === 'advance' || phase === 'conversation-follow-up'
@@ -7832,8 +8486,8 @@ function hasExplicitPresenceEvidence(status: ScenePresenceState['status'], entri
   return /一起|同行|身边|来到|抵达|进入|走进|拉着|坐在|站在|陪着/.test(text)
 }
 
-function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig, refreshContinuity = false) {
-  raw = resolveAuthoredActions(raw, false, runtime.messageSeparator)
+function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permitMessages: boolean, runtime: RuntimeConfig, shared: SharedStoryConfig, currentParticipantId: string, permittedParticipantIds: Set<string>, permittedGroupIds: Set<string>, phase: NarrativeRequest['phase'] = 'advance', memory?: MemoryConfig, refreshContinuity = false) {
+  raw = reconcileTransportReferences(raw, false, runtime.messageSeparator)
   const script = typeof raw?.script === 'string'
     ? raw.script.trim().slice(0, runtime.maxScriptCharacters)
     : ''
@@ -7859,7 +8513,7 @@ function normalizeDecision(raw: NarrativeDecision, from: Date, now: Date, permit
   const agencyGatedProactive = proactive && !isRecord(raw?.proactiveContact)
   const crossConversationActions = permitMessages && shared.allowCrossConversationMessages && Array.isArray(raw?.crossConversationActions)
     ? raw.crossConversationActions
-      .map(action => normalizeConversationAction(action, runtime, permittedParticipantIds, currentParticipantId, now, agencyGatedProactive))
+      .map(action => normalizeConversationAction(action, runtime, permittedParticipantIds, permittedGroupIds, currentParticipantId, now, agencyGatedProactive))
       .filter((action): action is NonNullable<ReturnType<typeof normalizeConversationAction>> => !!action)
       .slice(0, Math.max(0, shared.maxCrossConversationActions))
     : []
@@ -7967,9 +8621,23 @@ function webObservationEntryContent(observation: WebObservation) {
 
 export function normalizeInteraction(value: unknown, now: Date, runtime: RuntimeConfig): NarrativeInteraction | undefined {
   if (!isRecord(value) || typeof value.seen !== 'boolean' || !isRecord(value.reply)) return undefined
-  const mode = value.reply.mode
-  if (mode !== 'none' && mode !== 'immediate' && mode !== 'delayed') return undefined
-  const content = typeof value.reply.content === 'string' ? normalizeVisibleMessageContent(value.reply.content, runtime.maxMessageCharacters, runtime.messageSeparator) : undefined
+  let mode: string | undefined = typeof value.reply.mode === 'string' ? value.reply.mode : undefined
+  if (mode !== 'none' && mode !== 'immediate' && mode !== 'delayed') {
+    // 弱模型常输出 mode:"text"/"send"/"reply" 或漏掉 mode——只要带了 content 就视为 immediate，
+    // 不要丢弃整个剧本（原行为是 return undefined → 触发重写循环）。
+    const hasContent = typeof value.reply.content === 'string' && value.reply.content.trim()
+    if (hasContent && (mode === undefined || mode === 'text' || mode === 'send' || mode === 'reply' || mode === 'message')) mode = 'immediate'
+    else if (mode === undefined && !hasContent) mode = 'none'
+    else return undefined
+  }
+  const separator = runtime.messageSeparator?.trim() || '<sep/>'
+  let content = typeof value.reply.content === 'string' ? sanitizeAndClampVisibleContent(value.reply.content, runtime.maxMessageCharacters, separator) : undefined
+  // 弱模型常把气泡间隔写成换行而不是分隔符。只把空行（段落边界）视作气泡
+  // 边界：单个换行留在一条消息内——否则任何两行草稿都会被机械拆成两条，
+  // 把"恰好两段"固化成每回合的定式（实测 24/24 回合精确 2.0 段）。
+  if (content && runtime.splitReplyMessages !== false && separator && !content.includes(separator)) {
+    content = content.replace(/\s*\r?\n\s*\r?\n+/g, separator)
+  }
   const sendAt = toDate(value.reply.sendAt)
   // seen 只描述是否读了新消息；reply 是独立的发送通道。跟进/到期回合协议
   // 规定 seen=false，若在此处因 seen 抹掉回复，“稍后读到再回”的自救路径
@@ -7977,10 +8645,10 @@ export function normalizeInteraction(value: unknown, now: Date, runtime: Runtime
   const seen = value.seen === true
   if (mode === 'none') return { seen, reply: { mode: 'none' } }
   if (!content) return { seen, reply: { mode: 'none' } }
-  if (mode === 'immediate') return { seen, reply: { mode, content } }
+  if (mode === 'immediate') return { seen, reply: { mode: 'immediate', content } }
   const delay = sendAt?.getTime() - now.getTime()
   if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return { seen, reply: { mode: 'none' } }
-  return { seen, reply: { mode, content, sendAt: sendAt.toISOString() } }
+  return { seen, reply: { mode: 'delayed', content, sendAt: sendAt.toISOString() } }
 }
 
 function validMemory(value: unknown): value is MemoryDraft {
@@ -8042,12 +8710,15 @@ function hasCompactionEvidence(sourceEntryIds: number[] | undefined, entries: Sc
   return sourceEntryIds.some(id => ids.has(id))
 }
 
-function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, permittedParticipantIds: Set<string>, currentParticipantId: string, now = new Date(), proactive = false) {
+function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, permittedParticipantIds: Set<string>, permittedGroupIds: Set<string>, currentParticipantId: string, now = new Date(), proactive = false) {
   if (!isRecord(value) || typeof value.participantId !== 'string' || !value.participantId || value.participantId === currentParticipantId) return undefined
-  if (!permittedParticipantIds.has(value.participantId) || (value.mode !== 'immediate' && value.mode !== 'delayed')) return undefined
+  const groupTarget = value.participantId.startsWith('group:')
+  const targetId = groupTarget ? normalizeGroupId(value.participantId.slice('group:'.length)) : value.participantId
+  if ((groupTarget ? !permittedGroupIds.has(targetId) : !permittedParticipantIds.has(targetId)) || (value.mode !== 'immediate' && value.mode !== 'delayed')) return undefined
+  if (groupTarget && value.mode !== 'immediate') return undefined
   // 主动联系与私聊回复共用同一可见文本合约：括号表情标签等不得漏出到投递。
   const content = typeof value.content === 'string'
-    ? normalizeVisibleMessageContent(value.content, runtime.maxMessageCharacters, runtime.messageSeparator)
+    ? sanitizeAndClampVisibleContent(value.content, runtime.maxMessageCharacters, runtime.messageSeparator)
     : ''
   if (!content) return undefined
   const willingness = typeof value.willingness === 'number' && Number.isFinite(value.willingness)
@@ -8055,11 +8726,11 @@ function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, per
     : undefined
   if (proactive && (willingness === undefined || willingness < (runtime.proactiveWillingnessThreshold ?? 0.65))) return undefined
   const reason = typeof value.reason === 'string' ? clip(value.reason, 300) : undefined
-  if (value.mode === 'immediate') return { participantId: value.participantId, mode: value.mode, content, ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
+  if (value.mode === 'immediate') return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
   const sendAt = toDate(value.sendAt)
   const delay = sendAt?.getTime() - now.getTime()
   if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return undefined
-  return { participantId: value.participantId, mode: value.mode, content, sendAt: sendAt.toISOString(), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
+  return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, sendAt: sendAt.toISOString(), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
 }
 
 function permittedOrGlobal(value: unknown, fallback: string, permittedParticipantIds: Set<string>) {
@@ -8135,9 +8806,7 @@ export function shouldSupersedeNarrativeRequest(
   firstMessageCommittedRequestId: number | undefined,
   obsoleteRequestIds: ReadonlySet<number>,
 ) {
-  return !!inFlightRequestId
-    && firstMessageCommittedRequestId !== inFlightRequestId
-    && !obsoleteRequestIds.has(inFlightRequestId)
+  return shouldSupersedeRequest(inFlightRequestId, firstMessageCommittedRequestId, obsoleteRequestIds)
 }
 
 function toDate(value: unknown) {
@@ -8160,6 +8829,7 @@ const DATABASE_DATE_FIELDS: Record<string, string[]> = {
   interlude_overlay_snapshot: ['periodStart', 'periodEnd', 'createdAt', 'updatedAt'],
   interlude_sticker: ['createdAt', 'updatedAt'],
   interlude_web_observation: ['accessedAt', 'createdAt'],
+  interlude_seeded_event: ['occursAt', 'expiresAt', 'createdAt', 'updatedAt'],
   interlude_schedule_preplan: ['createdAt', 'updatedAt'],
 }
 
@@ -8226,7 +8896,10 @@ function limitEntriesByCharacters(entries: ScriptEntry[], limit: number) {
 }
 
 function factScore(fact: NarrativeFact, config: MemoryConfig, queryEmbedding: number[] = [], query = '') {
-  const ageDays = Math.max(0, (Date.now() - fact.lastSeenAt.getTime()) / (24 * Time.hour))
+  // lastSeenAt 可能为 null（rc2/rc3 补充事实或旧数据未写入）——回退到 updatedAt/createdAt，
+  // 不能让检索排序因空时间崩溃。
+  const lastSeen = fact.lastSeenAt ?? fact.updatedAt ?? fact.createdAt ?? new Date()
+  const ageDays = Math.max(0, (Date.now() - lastSeen.getTime()) / (24 * Time.hour))
   const recency = Math.exp(-ageDays / 30)
   const similarity = cosineSimilarity(queryEmbedding, fact.embedding ?? [])
   // Negative similarity is treated as no semantic support. This prevents an
@@ -8405,7 +9078,7 @@ function clocksIn(text: string): Array<{ hour: number, minute: number, around: s
     if (hour > 23 || minute > 59) continue
     found.push({ hour, minute, around: contextAround(text, match.index!, match[0].length) })
   }
-  for (const match of text.matchAll(/([零一二三四五六七八九十两]+)点(?:(?:零|([一二三四五六七八九十两]+))分?|半)?/g)) {
+  for (const match of text.matchAll(/([零一二三四五六七八九十两]+)点(?:(?:零|([一二三四五六七八九十两]+))分?|(半))?/g)) {
     const hour = chineseClockNumber(match[1])
     const minute = match[2] ? chineseClockNumber(match[2]) : 0
     if (hour == null || minute == null || hour > 23 || minute > 59) continue

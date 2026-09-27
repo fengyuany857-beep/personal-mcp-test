@@ -40,6 +40,14 @@ test('chat action validation accepts only advertised actions and supplied messag
   assert.deepEqual(normalizeGroupChatActions(valid, undefined, context), { reactions: [] })
 })
 
+test('group replies tolerate an incomplete compatibility interaction object', () => {
+  const decision: NarrativeDecision = {
+    groupReply: { mode: 'immediate', content: '收到' },
+    interaction: {} as NarrativeDecision['interaction'],
+  }
+  assert.deepEqual(normalizeGroupChatActions(decision, capabilities, context), { reactions: [] })
+})
+
 test('reaction allowlist is semantic, deduplicated and bounded', () => {
   assert.deepEqual(normalizeAllowedReactions(['like', 'like', 'unknown', 'heart']), ['like', 'heart'])
 })

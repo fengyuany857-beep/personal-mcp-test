@@ -31,7 +31,6 @@ export declare function completeAlterAnalysis(state: AlterSystemState, descripti
     lastAnalysisAttemptAt?: string;
 };
 export declare function emotionalOffsetForPrompt(state: AlterSystemState | undefined, config: AlterSystemConfig): EmotionalOffsetPrompt | null;
-export declare function alterAnalysisCoolingDown(state: AlterSystemState, now?: Date, cooldownMs?: number): boolean;
 /** The current scope has its own retry gate, so a failed relationship-local
  * analysis does not suppress an unrelated piece of independent life. */
 export declare function alterScopeCoolingDown(state: AlterSystemState, participantId?: string, now?: Date, cooldownMs?: number): boolean;

@@ -21,7 +21,7 @@ export interface ScriptFirstDecisionInput {
  * decisions; it gives the existing single response stable commit/event ids.
  */
 export declare function decisionToScriptCommit(input: ScriptFirstDecisionInput): ScriptCommitDraft;
-export declare function findOutgoingScriptEvent(commit: ScriptCommitDraft, participantId: string, mode?: ScriptDeliveryMode, content?: string, separator?: string): ScriptEventDraft;
+export declare function findPrivateOutgoingMessageEvent(commit: ScriptCommitDraft, participantId: string, mode?: ScriptDeliveryMode, content?: string, separator?: string): ScriptEventDraft;
 export declare function findGroupScriptEvent(commit: ScriptCommitDraft): ScriptEventDraft;
 /** Bind an immediate transport action to the unique literal message text in
  * the current script without interpreting prose or adding another model task.

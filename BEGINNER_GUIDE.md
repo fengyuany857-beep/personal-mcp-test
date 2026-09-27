@@ -1,6 +1,6 @@
 # HDS Interlude 新手引导
 
-适用版本：`1.0.1-beta6-rebuild`
+适用版本：`1.0.1-rc24`
 
 HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前活动场景；主模型在同一次请求中续写已经发生的生活，并决定是否发送、延迟发送或暂不发送消息。实时写作读取一条按时间排序的活动场景记录：最近剧本文字、真实用户消息和已经成功投递的角色消息在同一条线上。剧本引子、场景外近期事实和长期记忆负责更早的历史。
 
@@ -62,7 +62,7 @@ model.embedding.enabled: false
 model.vision.enabled: false # 视觉主模型用 native；纯文本主模型可改为 true 并配置 sidecar + useForVision
 ```
 
-主叙事把 `runtime.contextEntryLimit` 的条目下限与 `contextTimeWindowMinutes` 的时间窗口取并集。默认至少保留 50 条，并额外保护最近 60 分钟的真实用户/角色消息；普通剧本文字仍受固定字符预算约束。更早内容由 continuity、场景摘要和长期事实衔接。
+主叙事把 `runtime.contextEntryLimit` 的条目下限与 `contextTimeWindowMinutes` 的时间窗口取并集。默认至少保留 35 条，并额外保护最近 45 分钟的真实用户/角色消息；普通剧本文字仍受固定字符预算约束。更早内容由 continuity、场景摘要和长期事实衔接。
 
 
 每条模型连接只配置一次；用用途开关决定它服务哪些任务：
@@ -169,6 +169,10 @@ runtime.autoCreate: true
 onebot.voiceTranscription.enabled: false # 使用 SnowLuma 私聊语音转写时改为 true
 runtime.ignoreCommandMessages: true
 runtime.userMessageDebounceSeconds: 2
+runtime.forwardMessage.enabled: true # 读取 QQ 合并转发正文；需要时可关闭
+runtime.forwardMessage.maxNodes: 30
+runtime.forwardMessage.maxCharacters: 8000
+runtime.forwardMessage.maxDepth: 3
 runtime.cancelDelayedRepliesOnUserMessage: true
 runtime.splitReplyMessages: true
 runtime.messageSeparator: '<sep/>'
@@ -178,8 +182,8 @@ runtime.typingMaxDelaySeconds: 12
 runtime.typingJitterRatio: 0.3
 runtime.narrativeRetryDelaySeconds: 60
 runtime.narrativeRetryMaxAttempts: 6
-runtime.contextEntryLimit: 50
-runtime.contextTimeWindowMinutes: 60
+runtime.contextEntryLimit: 35
+runtime.contextTimeWindowMinutes: 45
 runtime.memoryLimit: 20
 
 runtime.autoAdvanceEnabled: true

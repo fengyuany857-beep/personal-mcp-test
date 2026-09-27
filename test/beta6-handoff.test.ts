@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { resolveAuthoredActions } from '../src/script/authored-actions'
+import { reconcileTransportReferences } from '../src/script/authored-actions'
 import { decisionToScriptCommit } from '../src/script/commit-builder'
 import { validateScriptCommit } from '../src/script/validator'
 import { deliveryReality } from '../src/script/delivery-reality'
@@ -31,10 +31,10 @@ const request = (entries: ScriptEntry[]): any => ({
 test('authored reference supplies exact words before normalization, across repeated resolver calls', () => {
   const raw: NarrativeDecision = { script: '  她记起上次的“在吗”，又写下<say id="r">在吗</say>。  ',
     interaction: { seen: false, reply: { mode: 'immediate', actionId: 'r', content: '另一份答案' } } }
-  const resolved = resolveAuthoredActions(raw)
+  const resolved = reconcileTransportReferences(raw)
   assert.equal(resolved.interaction?.reply.content, '在吗')
   assert.equal(resolved.script, '她记起上次的“在吗”，又写下在吗。')
-  assert.deepEqual(resolveAuthoredActions(resolved), resolved)
+  assert.deepEqual(reconcileTransportReferences(resolved), resolved)
   const result = commit(resolved)
   assert.equal(validateScriptCommit(result).valid, true)
   assert.equal(result.events.find(event => event.kind === 'outgoing-message')?.scriptBinding?.status, 'bound')
@@ -43,39 +43,39 @@ test('authored reference supplies exact words before normalization, across repea
 
 test('bad explicit ids and duplicate authored ids never create guessed outgoing text', () => {
   for (const script of ['她想问问。', '<say id="r">甲</say><say id="r">乙</say>']) {
-    const result = resolveAuthoredActions({ script, interaction: { seen: false, reply: { mode: 'immediate', actionId: 'r', content: '代猜' } } })
+    const result = reconcileTransportReferences({ script, interaction: { seen: false, reply: { mode: 'immediate', actionId: 'r', content: '代猜' } } })
     assert.equal(result.interaction?.reply.mode, 'none')
   }
-  const forged = resolveAuthoredActions({ script: '只是旧话', authoredActions: [{ id: 'r', start: 0, end: 4, content: '只是旧话' }],
+  const forged = reconcileTransportReferences({ script: '只是旧话', authoredActions: [{ id: 'r', start: 0, end: 4, content: '只是旧话' }],
     interaction: { seen: false, reply: { mode: 'immediate', actionId: 'r' } } })
   assert.equal(forged.interaction?.reply.mode, 'none')
 })
 
 test('a sole authored action rescues example-copied or omitted action ids in single-recipient private turns', () => {
   // 模型照抄协议示例的 id 字面量（reply）而剧本写的是自己的 id：
-  const mismatched = resolveAuthoredActions({ script: '她回道：<say id="s1">在呢</say>',
+  const mismatched = reconcileTransportReferences({ script: '她回道：<say id="s1">在呢</say>',
     interaction: { seen: true, reply: { mode: 'immediate', actionId: 'reply' } } })
   assert.equal(mismatched.interaction?.reply.mode, 'immediate')
   assert.equal(mismatched.interaction?.reply.content, '在呢')
   // 模型写了 say 行动与 immediate，但完全省略了引用：
-  const omitted = resolveAuthoredActions({ script: '她回道：<say id="s1">在呢</say>',
+  const omitted = reconcileTransportReferences({ script: '她回道：<say id="s1">在呢</say>',
     interaction: { seen: true, reply: { mode: 'immediate' as const } } })
   assert.equal(omitted.interaction?.reply.content, '在呢')
   // 已有 content 的 legacy 镜像不被兜底覆盖（无引用时 content 原样保留）：
-  const legacy = resolveAuthoredActions({ script: '她回道：<say id="s1">在呢</say>',
+  const legacy = reconcileTransportReferences({ script: '她回道：<say id="s1">在呢</say>',
     interaction: { seen: true, reply: { mode: 'immediate', content: '旧镜像原话' } } })
   assert.equal(legacy.interaction?.reply.content, '旧镜像原话')
 })
 
 test('the sole-action rescue stays private-scoped and never grabs a multi-channel action', () => {
   // 群回复在场时不是单接收者回合，兜底不启用：
-  const withGroup = resolveAuthoredActions({ script: '她回道：<say id="s1">在呢</say>',
+  const withGroup = reconcileTransportReferences({ script: '她回道：<say id="s1">在呢</say>',
     groupReply: { mode: 'immediate', actionId: 's1' },
     interaction: { seen: true, reply: { mode: 'immediate', actionId: 'reply' } } })
   assert.equal(withGroup.interaction?.reply.mode, 'none')
   assert.equal(withGroup.groupReply?.content, '在呢')
   // 跨关系行动在场时同样不启用：
-  const withCross = resolveAuthoredActions({ script: '她回道：<say id="s1">在呢</say>',
+  const withCross = reconcileTransportReferences({ script: '她回道：<say id="s1">在呢</say>',
     crossConversationActions: [{ participantId: 'bob', mode: 'delayed' as const, content: '晚点说', sendAt: '2026-09-05T13:00:00Z' }],
     interaction: { seen: true, reply: { mode: 'immediate', actionId: 'reply' } } })
   assert.equal(withCross.interaction?.reply.mode, 'none')
@@ -84,17 +84,17 @@ test('the sole-action rescue stays private-scoped and never grabs a multi-channe
 test('legacy, delayed and already-streamed delivery keep existing content and scheduling', () => {
   const delayed = { mode: 'delayed' as const, content: '晚点回答', sendAt: '2026-09-05T13:00:00Z' }
   const raw: NarrativeDecision = { script: '她暂时记下这个问题。', interaction: { seen: false, reply: delayed } }
-  assert.deepEqual(resolveAuthoredActions(raw).interaction?.reply, delayed)
+  assert.deepEqual(reconcileTransportReferences(raw).interaction?.reply, delayed)
   assert.equal(commit(raw).events.find(event => event.kind === 'outgoing-message')?.scriptBinding?.status, 'future')
-  const streamed = resolveAuthoredActions({ script: '<say id="r">晚生成的话</say>', interaction: { seen: true,
+  const streamed = reconcileTransportReferences({ script: '<say id="r">晚生成的话</say>', interaction: { seen: true,
     reply: { mode: 'immediate', actionId: 'r', content: '已发出的原话' } } }, true)
-  assert.equal(resolveAuthoredActions(streamed).interaction?.reply.content, '已发出的原话')
-  const legacy = resolveAuthoredActions({ script: '她回答了。', interaction: { seen: true, reply: { mode: 'immediate', content: '好' } } })
+  assert.equal(reconcileTransportReferences(streamed).interaction?.reply.content, '已发出的原话')
+  const legacy = reconcileTransportReferences({ script: '她回答了。', interaction: { seen: true, reply: { mode: 'immediate', content: '好' } } })
   assert.equal(legacy.interaction?.reply.content, '好')
 })
 
 test('group and cross-contact references preserve scope and multi-bubble delivery ledger', () => {
-  const resolved = resolveAuthoredActions({ script: '她写下<say id="g">群里说</say>，又私发<say id="p">想好了||选第一个</say>。',
+  const resolved = reconcileTransportReferences({ script: '她写下<say id="g">群里说</say>，又私发<say id="p">想好了||选第一个</say>。',
     groupReply: { mode: 'immediate', actionId: 'g' },
     crossConversationActions: [{ participantId: 'bob', mode: 'immediate', actionId: 'p', content: '' }] })
   assert.equal(resolved.groupReply?.content, '群里说')
@@ -265,7 +265,7 @@ test('40 dense dialogue steps keep one original chain and preserve source-bound 
   const rows: ScriptEntry[] = []
   for (let turn = 0; turn < 40; turn++) {
     const text = `第${turn + 1}次新的判断`
-    const resolved = resolveAuthoredActions({ script: `她接着刚才的动作说<say id="r">${text}</say>。`,
+    const resolved = reconcileTransportReferences({ script: `她接着刚才的动作说<say id="r">${text}</say>。`,
       interaction: { seen: true, reply: { mode: 'immediate', actionId: 'r' } } })
     const result = commit(resolved, { phase: 'user-message' })
     assert.equal(result.events.find(event => event.kind === 'outgoing-message')?.scriptBinding?.status, 'bound')
@@ -276,4 +276,72 @@ test('40 dense dialogue steps keep one original chain and preserve source-bound 
     assert.equal(view.relevantEstablishedEpisodes.recentScript.at(-1).content, result.prose)
   }
   assert.equal(rows.length, 40)
+})
+
+test('a silent reply carrying a resolvable actionId is rescued to immediate in place', () => {
+  // 弱模型矛盾形态：mode=none + actionId，但剧本里确实写了对应 id 的 say 行动。
+  const rescued = reconcileTransportReferences({
+    script: '她想了想，回了句：<say id="reply-17734">干嘛，又想出什么暴论了？</say>',
+    interaction: { seen: true, reply: { mode: 'none', actionId: 'reply-17734' } },
+  })
+  assert.equal(rescued.interaction?.reply.mode, 'immediate')
+  assert.equal(rescued.interaction?.reply.content, '干嘛，又想出什么暴论了？')
+  // 锚定不到（自造 id、剧本无对应 say）时维持 none，绝不升级为失败。
+  const unresolved = reconcileTransportReferences({
+    script: '她笑了笑，打字回复：“在呢在呢。”',
+    interaction: { seen: true, reply: { mode: 'none', actionId: 'reply-99999' } },
+  })
+  assert.equal(unresolved.interaction?.reply.mode, 'none')
+})
+
+test('group replies nested inside interaction are promoted to top-level groupReply', () => {
+  // 实测 Gemini 3.7 Flash 群聊 mention-only 形态：群回复嵌套在 interaction.groupReply。
+  const promoted = reconcileTransportReferences({
+    script: '她想了想，回了句：<say id="reply">你才是猪 早睡早起懂不懂</say>',
+    interaction: { groupReply: { mode: 'immediate', content: '你才是猪 早睡早起懂不懂' } },
+  } as any)
+  assert.equal((promoted as any).groupReply?.mode, 'immediate')
+  assert.equal((promoted as any).groupReply?.content, '你才是猪 早睡早起懂不懂')
+  // 顶层已有 groupReply 时嵌套不覆盖。
+  const existing = reconcileTransportReferences({
+    script: '她回了。',
+    groupReply: { mode: 'none' },
+    interaction: { groupReply: { mode: 'immediate', content: '嵌套不应覆盖' } },
+  } as any)
+  assert.equal((existing as any).groupReply?.mode, 'none')
+})
+
+test('soleActionReply survives undefined reply without crashing', () => {
+  // beta9 回归：interaction 存在但 reply 为 undefined 时 soleActionReply(undefined)
+  // 直接读 reply.mode 崩溃，被 failover 当成 provider 失败 → All providers failed。
+  const noCrash = reconcileTransportReferences({
+    script: '她回了：<say id="s1">在呢</say>',
+    interaction: { seen: true } as any,
+  })
+  assert.equal(noCrash.interaction?.seen, true)
+  // 正常唯一行动兜底不受影响。
+  const normal = reconcileTransportReferences({
+    script: '她回了：<say id="s1">在呢</say>',
+    interaction: { seen: true, reply: { mode: 'immediate', actionId: 'reply' } },
+  })
+  assert.equal(normal.interaction?.reply.content, '在呢')
+})
+
+test('agency-approved proactive contact synthesizes crossAction from script say actions', () => {
+  // 复现 12:04 场景：模型输出了 proactiveContact(send-now) 但没输出
+  // crossConversationActions——Agency 通过但消息发不出去。
+  // reconcileTransportReferences 应产出 authoredActions 供合成路径读取。
+  const resolved = reconcileTransportReferences({
+    script: '她想了想，发了条消息：<say id="r1">你是打算睡到明天吗<sep/>再不醒饺子都要凉透了</say>',
+  } as any)
+  assert.ok(Array.isArray((resolved as any).authoredActions))
+  assert.equal((resolved as any).authoredActions.length, 1)
+  assert.equal((resolved as any).authoredActions[0].content, '你是打算睡到明天吗<sep/>再不醒饺子都要凉透了')
+})
+
+test('scripts without say markup produce no authoredActions for synthesis', () => {
+  const resolved = reconcileTransportReferences({
+    script: '她写了句话发过去，但没用标记。',
+  } as any)
+  assert.equal((resolved as any).authoredActions?.length ?? 0, 0)
 })

@@ -1,8 +1,14 @@
 # 开发与维护资料
 
-当前版本为 `1.0.0-beta16`。当前行为以源码、[当前架构](../ARCHITECTURE.md)、[V2 实施表](../V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md) 与 beta10 发布记录为准；以下 beta6/M10 文档用于追溯，不能覆盖当前实现。
+当前发布基线为 `1.0.1-rc12`。当前行为以源码、[当前架构](../ARCHITECTURE.md)、[V2 实施表](../V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md) 与[更新记录](../CHANGELOG.md)为准；以下 beta6/M10 文档用于追溯，不能覆盖当前实现。
 
-## beta10 当前增量
+## 当前发布与近期增量
+
+- [FUNCTION_CONFLICT_AUDIT_2026-09-17.md](FUNCTION_CONFLICT_AUDIT_2026-09-17.md)：功能交接小修、日志证据与待决的大问题清单。
+
+- 2026-09-17 未发布修正：时间导演请求/解析错误分流、游标无关冷却与重载恢复，见 [更新记录](../CHANGELOG.md)。发布包仍为 rc12，未重新构建部署。
+
+- [ANTHROPIC_MESSAGES_RC12.md](ANTHROPIC_MESSAGES_RC12.md)：rc12 协议选择、缓存与群音频接入边界。
 
 - [../CHANGELOG.md](../CHANGELOG.md)：生活剧本展开、消息感知提示词与发布记录。
 - [EVENT_LED_SCRIPT_REPAIR.md](EVENT_LED_SCRIPT_REPAIR.md)：事件优先续写、Alter 收束与关系学习证据边界。

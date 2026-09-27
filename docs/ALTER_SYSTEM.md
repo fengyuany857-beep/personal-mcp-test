@@ -1,6 +1,6 @@
 # Alter System
 
-适用版本：`1.0.1-beta6-rebuild`
+适用版本：`1.0.1-rc24`
 
 ## 定位
 

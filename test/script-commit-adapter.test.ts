@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { decisionToScriptCommit as legacyDecisionToScriptCommit, findGroupScriptEvent, findOutgoingScriptEvent } from '../src/script/commit-builder'
+import { decisionToScriptCommit as legacyDecisionToScriptCommit, findGroupScriptEvent, findPrivateOutgoingMessageEvent } from '../src/script/commit-builder'
 import { unboundImmediateMessageEvents } from '../src/script/commit-builder'
 import { messageEventReference } from '../src/script/contract'
 import { validateScriptCommit } from '../src/script/validator'
@@ -29,7 +29,7 @@ test('script-first output becomes one deterministic host-owned commit with causa
     decision: { ...input.decision, interaction: { seen: true, reply: { mode: 'immediate', content: '不同的实际消息' } } },
   }).commitId, first.commitId)
 
-  const outgoing = findOutgoingScriptEvent(first, 'alice', 'immediate', '我看见了<sep/>让我想一下')
+  const outgoing = findPrivateOutgoingMessageEvent(first, 'alice', 'immediate', '我看见了<sep/>让我想一下')
   assert.deepEqual(outgoing?.bubbles, ['我看见了', '让我想一下'])
   assert.equal(outgoing?.causedByEventIds.length, 1)
   assert.equal(outgoing?.scriptBinding?.status, 'bound')
@@ -54,6 +54,6 @@ test('an absent or ambiguous prose action is diagnostic and keeps compatibility 
   const unbound = unboundImmediateMessageEvents(commit)
   assert.equal(unbound.length, 1)
   assert.equal(unbound[0].scriptBinding?.status, 'unbound')
-  assert.equal(findOutgoingScriptEvent(commit, 'alice')?.content, '知道了')
+  assert.equal(findPrivateOutgoingMessageEvent(commit, 'alice')?.content, '知道了')
   assert.deepEqual(validateScriptCommit(commit), { valid: true, errors: [] })
 })

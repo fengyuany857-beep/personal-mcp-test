@@ -123,7 +123,7 @@ V2 按 [高度剧本化架构重设计](SCRIPT_CENTRIC_ARCHITECTURE_REDESIGN.md)
 ### 2.14 统一模型路由与 payload 缓存友好序
 
 - **beta10**：`configuredProviders`/`effectiveMainModelId` 分散于 narrator；payload 键序为构建顺序的结果。
-- **现在**：`src/model-routing.ts` 统一路由；payload 支持 cache-first 键序（稳定前缀命中服务商前缀缓存，currentEvent 位于末尾 recency 位，新增 recentExchange 块），默认 legacy 键序逐字节兼容。
+- **现在**：`src/model-routing.ts` 统一路由；payload 支持 cache-first 键序（稳定前缀命中服务商前缀缓存，currentEvent 位于末尾 recency 位，新增 recentExchange 块），当前默认使用 cache-first；仍可切回 legacy 键序以兼容旧行为。
 - **示例**：cache-first 下 setting/memories/recentScript 等低频层位于前缀，currentEvent 与 recentExchange 位于末尾；长故事运行时前缀缓存命中率随轮次累积。
 - **拟真性收益**：稳定前缀缓存降低长故事运行的边际成本，使每轮携带完整原文历史在经济上可持续。
 

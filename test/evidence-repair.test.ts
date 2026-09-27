@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { normalizeKnowledgeEvidence, supportsRecordedOutcome, contactEvidenceThreads, factEvidenceForPrompt } from '../src/script/knowledge-evidence'
-import { resolveAuthoredActions } from '../src/script/authored-actions'
+import { reconcileTransportReferences } from '../src/script/authored-actions'
 import { decisionToScriptCommit } from '../src/script/commit-builder'
 import { validateScriptCommit } from '../src/script/validator'
 import { scriptEntryDraftForCommit } from '../src/turn-persistence'
@@ -111,10 +111,10 @@ test('unclassified or imagined completion cannot close a promise, and repeated b
 test('17:38 regression: a two-bubble terminal script block becomes one complete delivery event', () => {
   const raw: NarrativeDecision = { script: '她拿起手机。\n\n牛逼<sep/>你继续勿扰吧',
     interaction: { seen: true, reply: { mode: 'immediate', content: '牛逼' } } }
-  const decision = resolveAuthoredActions(raw)
+  const decision = reconcileTransportReferences(raw)
   assert.equal(decision.interaction?.reply.content, '牛逼<sep/>你继续勿扰吧')
   assert.equal(decision.script, raw.script)
-  assert.deepEqual(resolveAuthoredActions(decision), decision)
+  assert.deepEqual(reconcileTransportReferences(decision), decision)
   const commit = decisionToScriptCommit({ storyId: 'story', participantId: 'alice', phase: 'user-message', from: now, now, decision, frameId: 'frame', burstId: 'burst' })
   assert.equal(validateScriptCommit(commit).valid, true)
   const event = commit.events.find(event => event.kind === 'outgoing-message')!
@@ -127,19 +127,19 @@ test('17:38 regression: a two-bubble terminal script block becomes one complete 
 
 test('tail repair respects non-actions, explicit action ids, custom separators and early-delivery idempotency', () => {
   const raw: NarrativeDecision = { script: '她拿起手机。\n\n甲||乙', interaction: { seen: true, reply: { mode: 'immediate', content: '甲' } } }
-  assert.equal(resolveAuthoredActions(raw, false, '||').interaction?.reply.content, '甲||乙')
-  const sent = resolveAuthoredActions(raw, true, '||')
-  assert.equal(resolveAuthoredActions(sent, false, '||').interaction?.reply.content, '甲')
+  assert.equal(reconcileTransportReferences(raw, false, '||').interaction?.reply.content, '甲||乙')
+  const sent = reconcileTransportReferences(raw, true, '||')
+  assert.equal(reconcileTransportReferences(sent, false, '||').interaction?.reply.content, '甲')
   for (const script of ['她想起“甲||乙”。', '她拿起手机。\n\n甲||乙\n然后放下手机。'])
-    assert.equal(resolveAuthoredActions({ ...raw, script }, false, '||').interaction?.reply.content, '甲')
+    assert.equal(reconcileTransportReferences({ ...raw, script }, false, '||').interaction?.reply.content, '甲')
   const none: NarrativeDecision = { ...raw, interaction: { seen: true, reply: { mode: 'none' } } }
-  assert.equal(resolveAuthoredActions(none).interaction?.reply.mode, 'none')
+  assert.equal(reconcileTransportReferences(none).interaction?.reply.mode, 'none')
   const tagged: NarrativeDecision = { script: '她发出<say id="r">甲||乙</say>。', interaction: { seen: true, reply: { mode: 'immediate', actionId: 'r' } } }
-  assert.equal(resolveAuthoredActions(tagged, false, '||').interaction?.reply.content, '甲||乙')
-  const partial = resolveAuthoredActions({ ...tagged, script: '她拿起手机。\n\n<say id="r">甲</say>||乙' }, false, '||')
+  assert.equal(reconcileTransportReferences(tagged, false, '||').interaction?.reply.content, '甲||乙')
+  const partial = reconcileTransportReferences({ ...tagged, script: '她拿起手机。\n\n<say id="r">甲</say>||乙' }, false, '||')
   assert.equal(partial.interaction?.reply.content, '甲||乙')
   assert.equal(partial.authoredActions?.[0].content, '甲||乙')
-  assert.deepEqual(resolveAuthoredActions(partial, false, '||'), partial)
+  assert.deepEqual(reconcileTransportReferences(partial, false, '||'), partial)
 })
 
 test('legacy knowledge rows persisted as empty objects never crash evidence reads', () => {

@@ -1,5 +1,5 @@
 import { Context } from 'koishi';
-import { InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, StatePatchProposal, StickerAsset, WebObservation } from './types';
+import { InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, SeededWorldEvent, StatePatchProposal, StickerAsset, WebObservation } from './types';
 declare module 'koishi' {
     interface Tables {
         interlude_story: InterludeStory;
@@ -15,6 +15,7 @@ declare module 'koishi' {
         interlude_sticker: StickerAsset;
         interlude_web_observation: WebObservation;
         interlude_schedule_preplan: SchedulePreplanRecord;
+        interlude_seeded_event: SeededWorldEvent;
     }
 }
 export declare function registerTables(ctx: Context): void;

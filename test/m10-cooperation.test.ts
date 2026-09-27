@@ -34,8 +34,9 @@ for (const phase of ['user-message', 'conversation-follow-up', 'intent-due', 'ad
 test('live turns never consume pending promises or host-owned executor tasks', () => {
   const types = ['follow-up-commitment', 'split-message', 'browser-research', 'proactive-check', 'active-consequence', 'delayed-reply', 'narrative-retry']
   const tasks = types.map((type, index) => intent(index + 1, type))
-  assert.deepEqual(liveNarrativeIntents(tasks).map(item => item.id), [1, 6, 7])
-  assert.deepEqual(consumedLiveIntentIds(tasks), [6, 7])
+  // Fix#7: narrative-retry 有专用执行器，不归 live 回合。
+  assert.deepEqual(liveNarrativeIntents(tasks).map(item => item.id), [1, 6])
+  assert.deepEqual(consumedLiveIntentIds(tasks), [6])
 })
 
 test('private follow-up summaries are relationship-local while independent life keeps compact contacts', () => {

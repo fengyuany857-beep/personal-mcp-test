@@ -1,5 +1,6 @@
 import { Context } from 'koishi';
-import { AlterAnalysisDecision, AlterAnalysisRequest, AlterSystemConfig, ChatActionCapabilities, CompactionDecision, CompactionRequest, NarrativeDecision, NarrativeProvider, OverlayCompactionDecision, OverlayCompactionRequest, EarlyNarrativeReply, NarrativeCompactor, NarrativeEmbedder, NarrativeImage, NarrativeRequest, SchedulePreplanProposal, SchedulePreplanReviewRequest, StickerCatalogEntry, TimelinePlan, TimelinePlanRequest } from './types';
+import { type ContractTier, type ModelFamily, type SpecialtyProfile } from './specialization';
+import { AlterAnalysisDecision, AlterAnalysisRequest, AlterSystemConfig, ChatActionCapabilities, CompactionDecision, CompactionRequest, NarrativeDecision, NarrativeProvider, OverlayCompactionDecision, OverlayCompactionRequest, EarlyNarrativeReply, NarrativeCompactor, NarrativeEmbedder, NarrativeImage, NarrativeRequest, SchedulePreplanProposal, SchedulePreplanReviewRequest, ScriptEntry, StickerCatalogEntry, TimelinePlan, TimelinePlanRequest } from './types';
 import { ModelRoutingTable } from './model-routing';
 export { configuredProviders, effectiveMainModelId, resolveModelRouting, usesRemoteProviders, ZHIPU_OFFICIAL_CHAT_ENDPOINT, } from './model-routing';
 export { storyLocalTimeContext } from './time';
@@ -24,6 +25,9 @@ export interface VisionDescriber {
     describeImages(images: NarrativeImage[], userText?: string, detail?: VisionDetail): Promise<string[] | undefined>;
 }
 export interface ProviderConfig {
+    /** Missing in historical rows means Chat Completions. */
+    protocol?: 'chat-completions' | 'anthropic-messages';
+    anthropicCache?: boolean;
     /** Legacy internal identifier. New Console rows derive identity from the model connection. */
     id?: string;
     label: string;
@@ -46,6 +50,7 @@ export interface ProviderConfig {
     useForEmbedding?: boolean;
     useForStickers?: boolean;
     useForVision?: boolean;
+    useForWorldSeeding?: boolean;
     zhipuOfficial?: boolean;
     reasoningEffort?: ZhipuReasoningEffort;
     deepseekOfficial?: boolean;
@@ -80,6 +85,10 @@ export interface ModelConfig {
     mainMaxTokens?: number;
     mainTimeout?: number;
     mainResponseFormat?: ProviderResponseFormat;
+    /** 模型特化档位：off（默认，rc12 原样）/ lite / standard / full，Console 手动选择。 */
+    specialization?: 'off' | ContractTier;
+    /** 特化家族：auto（默认，按模型名识别，仅决定特化块）或显式指定（中转别名场景）。 */
+    specializationFamily?: 'auto' | ModelFamily;
     /** Manual opt-in for streaming JSON transport; unavailable providers remain on full-response mode. */
     mainStreamingMode?: 'off' | 'experimental';
     /** cache-first reorders the user payload so stable blocks (history, memory layers) precede
@@ -200,6 +209,11 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
      */
     private cooldownUntil;
     private roundRobinOffset;
+    private lastSpecialtyKey;
+    /** 侧端任务（压缩/时间导演）共用同一手动档位。 */
+    private sideSpecialty;
+    /** 手动特化：档位由 Console 显式选择（默认 off=rc12 原样）；家族默认按模型名识别。 */
+    private resolveSpecialty;
     private readonly logger?;
     private readonly routing;
     constructor(ctx: Context, config: ModelConfig, silentLogs?: boolean, onUsage?: (record: TokenUsageRecord) => void, routing?: ModelRoutingTable);
@@ -207,12 +221,18 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
     available(): boolean;
     visionAvailable(): boolean;
     decide(request: NarrativeRequest): Promise<NarrativeDecision>;
+    /** 独立配置块（世界播种器等）复用侧任务请求链：提供商与参数显式传入，
+     * 不经主叙事/压缩路由。JSON 合约与压缩器一致（json-object + 宽容解析）。 */
+    customSideTask<T>(provider: ProviderConfig, task: string, timeout: number, temperature: number, maxTokens: number, system: string, user: string): Promise<T>;
     /** 思考型网关把 reasoning 计入 completion 预算：带小 cap 的侧端 JSON 任务
      * 会被推理挤到只剩残句（invalid JSON / Unterminated string at position N）。
      * 首次解析失败时去掉 max_tokens 原样重试一次；成功路径不多发任何请求。
      * 非流式响应逐一尝试全部文本字段（content/reasoning_content 等），与
      * parseChatJsonResponse 的宽容度一致。 */
     private sideTaskJson;
+    /** P2 Fix: 侧端任务成败在 sideTaskJson 内直接上报——不依赖调用方改用新入口。 */
+    onSideTaskHealth?: (task: string, ok: boolean) => void;
+    setSideTaskHealthReporter(reporter: (task: string, ok: boolean) => void): void;
     compact(request: CompactionRequest): Promise<CompactionDecision>;
     planTimeline(request: TimelinePlanRequest): Promise<TimelinePlan | undefined>;
     planSchedulePreplan(request: SchedulePreplanReviewRequest): Promise<SchedulePreplanProposal | undefined>;
@@ -223,6 +243,7 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
     /** Record one provider response's token usage (if the provider reports any). */
     private collectUsage;
     private emitUsage;
+    private postChat;
     private selectRouteProviders;
     private requestProvider;
 }
@@ -271,8 +292,23 @@ export declare function computeTokenCost(record: TokenUsageRecord): {
 /** One human-readable log line: usage numbers, cache hit rate, and optional
  * billing. Absent fields are simply omitted instead of printed as zero. */
 export declare function formatTokenUsageLine(record: TokenUsageRecord): string;
-export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions']): string;
+export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile): string;
 export declare function writingAffordances(options?: NarrativeRequest['writingOptions']): string;
+/** A guard paragraph rendered into the writing affordances when the host has
+ * detected a fixed bubble-count run in her recent delivered replies. */
+export declare function repetitionGuardInstruction(repetition?: {
+    bubbles: number;
+    consecutive: number;
+}): string;
+/** Detect a fixed bubble-count run in her recent delivered private replies.
+ * Walks backward over the entries that will become recentScript; a batch
+ * leader’s delivery metadata (bubbleIndex 0 with bubbleCount) is authoritative
+ * for its whole batch, and entries without it fall back to contiguous
+ * character-message runs bounded by any other entry kind. */
+export declare function detectMessageRepetition(entries: ReadonlyArray<Pick<ScriptEntry, 'kind' | 'actor' | 'metadata'>>): {
+    bubbles: number;
+    consecutive: number;
+} | undefined;
 export declare function storyStateForPrompt(state: NarrativeRequest['story']['state']): {
     schemaVersion?: number;
     extensions?: Record<string, unknown>;
@@ -293,6 +329,12 @@ export declare function toPromptPayload(request: NarrativeRequest, options?: {
 /** Compact ownership tags for cache-first payloads: one short label replaces the
  * kind/actor/participantId triple. Distinctions the ownership label alone would
  * lose (group posting, platform actions) survive as suffixes. */
-export declare function compactScriptTag(kind: string, actor: string): "system" | "user" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member";
+export declare function compactScriptTag(kind: string, actor: string): "user" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member" | "system";
 export declare function promptVisibleMessageContent(content: string, ownership: RecentScriptOwnership): string;
-export declare function compactPromptEntries(entries: NarrativeRequest['recentEntries'], characterBudget: number, protectedSince?: Date): import("./types").ScriptEntry[];
+export declare function compactPromptEntries(entries: NarrativeRequest['recentEntries'], characterBudget: number, protectedSince?: Date): ScriptEntry[];
+export declare function compactionPrompt(fixedPrompt: string, compactionMainPrompt?: string, compactionFixedPrompt?: string, compactionStylePrompt?: string, specialty?: {
+    tier?: string;
+}): string;
+export declare function timelineDirectorPrompt(specialty?: {
+    tier?: string;
+}): string;

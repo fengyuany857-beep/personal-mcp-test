@@ -25,4 +25,4 @@ export declare function episodeExcerpt(rows: Array<[number, EpisodeSource]>, anc
 };
 /** Tags are literal navigation spans, never generated summaries or facts. */
 export declare function groundedEpisodeTags(content: string, draft: Record<string, unknown>): Record<string, string[]>;
-export declare function episodeTagScore(query: string, tags?: string[]): 0.8 | 0;
+export declare function episodeTagScore(query: string, tags?: string[]): 0 | 0.8;

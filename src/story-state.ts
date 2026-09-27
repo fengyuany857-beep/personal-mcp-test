@@ -16,7 +16,7 @@ const KNOWN_STORY_STATE_KEYS = new Set([
   'continuitySnapshot', 'narrativeUpdateCount', 'lastContinuityUpdateAt',
   'continuityDirty', 'automation', 'alterSystem', 'agencyWindow', 'scenePresence',
   'automaticDeliverySummaries', 'workingDetails', 'timelineCarry', 'chatRhythm',
-  'sceneFrame', 'dialogueBurst', 'workingDetailResolutions',
+  'sceneFrame', 'dialogueBurst', 'workingDetailResolutions', 'lifeStatus',
 ])
 
 export interface StoryStateMigrationInspection {
@@ -86,6 +86,7 @@ export function upgradeStoryState(value: unknown): StoryState {
       .filter(([label, id]) => label.length <= 80 && typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
       .slice(-32).map(([label, id]) => [label, Number(id)])),
     timelineCarry: normalizeTimelineCarry(record.timelineCarry),
+    lifeStatus: normalizeLifeStatus(record.lifeStatus),
     automaticDeliverySummaries: normalizeAutomaticDeliverySummaries(record.automaticDeliverySummaries),
     // beta10 declared this field but its old decoder forgot to return it.
     chatRhythm: isRecord(record.chatRhythm) ? record.chatRhythm as unknown as StoryState['chatRhythm'] : undefined,
@@ -96,6 +97,7 @@ export function upgradeStoryState(value: unknown): StoryState {
       nextAdvanceAt: textOrUndefined(automation.nextAdvanceAt),
       timelineRetryAt: textOrUndefined(automation.timelineRetryAt),
       timelineRetryFrom: textOrUndefined(automation.timelineRetryFrom),
+      timelineDirectorFailures: Math.max(0, Math.min(6, Math.floor(finiteNumber(automation.timelineDirectorFailures) ?? 0))),
       lastAutoAdvanceAt: textOrUndefined(automation.lastAutoAdvanceAt),
       lastUserMessageAt: textOrUndefined(automation.lastUserMessageAt),
       conversationFollowUpAt: Array.isArray(automation.conversationFollowUpAt)
@@ -222,6 +224,14 @@ export function normalizeWorkingDetails(value: unknown): WorkingDetail[] {
     })
   }
   return [...latest.values()].slice(-10)
+}
+
+export function normalizeLifeStatus(value: unknown): StoryState['lifeStatus'] {
+  if (!isRecord(value)) return undefined
+  const status = value.status
+  if (status !== 'busy' && status !== 'asleep' && status !== 'idle') return undefined
+  const updatedAt = typeof value.updatedAt === 'string' && !Number.isNaN(Date.parse(value.updatedAt)) ? value.updatedAt : undefined
+  return updatedAt ? { status, updatedAt } : undefined
 }
 
 export function normalizeTimelineCarry(value: unknown): string[] {

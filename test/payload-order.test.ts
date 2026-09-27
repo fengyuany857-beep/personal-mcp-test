@@ -35,6 +35,20 @@ function commonPrefixLength(left: string, right: string) {
   return index
 }
 
+test('eligible group targets survive both payload orders without copying group history', () => {
+  const targets = [{ participantId: 'group:12345', groupId: '12345', label: '技术群' }]
+  for (const cacheFirst of [false, true]) {
+    const payload = toPromptPayload(request([], '去技术群发个消息', { availableGroupTargets: targets }), { cacheFirst }) as any
+    assert.deepEqual(payload.ongoingThreads.availableGroupTargets, targets)
+    assert.equal(payload.incomingEvent.groupContext, undefined)
+    assert.deepEqual((toPromptPayload(request([]), { cacheFirst }) as any).ongoingThreads.availableGroupTargets, [])
+  }
+  const prompt = systemPrompt('user-message', '', '', '', '', '')
+  assert.match(prompt, /interaction describes ONLY messages to the current private participant/)
+  assert.match(prompt, /A promise to send later is not a completed send/)
+  assert.match(prompt, /crossConversationActions/)
+})
+
 test('both payload modes use the seven-part script continuation scaffold', () => {
   const req = request([entry(1, 'character-message', '拿到了。确实挺大杯。', 50)], '你健忘吗')
   const legacy = toPromptPayload(req) as Record<string, unknown>

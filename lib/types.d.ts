@@ -17,6 +17,10 @@ export interface StorySetting {
     world: string;
     /** Independent outer layer: the protagonist's values and way of seeing the world. */
     perspective: string;
+    /** Multiple independent perspective entries; each stays a separate prompt item. */
+    perspectives?: string[];
+    /** Supplementary facts: complex world/character/relationship truths seeded as initial durable facts. */
+    supplementaryFacts?: string[];
     supportingCast: string;
     location: string;
     style: string;
@@ -50,6 +54,11 @@ export interface StoryState {
     workingDetails?: WorkingDetail[];
     /** Source revisions prevent a delayed background review reopening settled details. */
     workingDetailResolutions?: Record<string, number>;
+    /** 压缩器写入的主角注意力状态（busy/asleep/idle）；群聊意愿 auto 档读取。 */
+    lifeStatus?: {
+        status: 'busy' | 'asleep' | 'idle';
+        updatedAt: string;
+    };
     /** Host-owned unresolved state carried forward from the latest completed
      * automatic event ledger. This outranks prose-derived scratchpad wording. */
     timelineCarry?: string[];
@@ -154,6 +163,21 @@ export interface SchedulePreplanDay {
     date: string;
     blocks: SchedulePreplanBlock[];
 }
+/** 世界事件播种器排程行：模型生成、宿主校验入库、到点注入为 world-event 条目。 */
+export interface SeededWorldEvent {
+    id: number;
+    storyId: string;
+    summary: string;
+    importance: 'low' | 'medium' | 'high';
+    occursAt: Date;
+    expiresAt?: Date;
+    status: 'scheduled' | 'injected' | 'expired' | 'dropped';
+    subjects: string[];
+    sourcePayload: Record<string, unknown>;
+    injectedEntryId?: number;
+    createdAt: Date;
+    updatedAt: Date;
+}
 export interface SchedulePreplanRecord {
     storyId: string;
     revision: number;
@@ -227,6 +251,7 @@ export interface StoryAutomationState {
      * or immediately recur after a process restart. */
     timelineRetryAt?: string;
     timelineRetryFrom?: string;
+    timelineDirectorFailures?: number;
     lastAutoAdvanceAt?: string;
     lastUserMessageAt?: string;
     /** Short continuity passes scheduled from the latest conversation endpoint. */
@@ -717,6 +742,12 @@ export interface NarrativeRequest {
     participant: InterludeParticipant | null;
     /** Other currently enrolled relationship branches, ordered by relevance. */
     participants: InterludeParticipant[];
+    /** Public routing hints only; not group history or proof of delivery. */
+    availableGroupTargets?: Array<{
+        participantId: string;
+        groupId: string;
+        label: string;
+    }>;
     /** Sensitive details of other participants are opt-in because the model may be remote. */
     shareParticipantDetails: boolean;
     dueIntents: NarrativeIntent[];
@@ -731,6 +762,11 @@ export interface NarrativeRequest {
         messageSeparator: string;
         splitReplyMessages: boolean;
         browserMode: 'disabled' | 'deferred-only' | 'allow-immediate';
+        /** Host-detected fixed bubble-count run in her recent delivered replies; conversation turns only. */
+        messageRepetition?: {
+            bubbles: number;
+            consecutive: number;
+        };
     };
     /** Raw chat entries at or after this point survive the normal prose budget. */
     recentProtectionSince?: Date;
@@ -946,6 +982,8 @@ export interface CompactionDecision {
     statePatches?: StatePatchDraft[];
     workingDetails?: WorkingDetailDraft[];
     schedulePreplan?: SchedulePreplanProposal;
+    /** 主角当前注意力状态（群聊意愿 auto 档输入）；由压缩器附带返回。 */
+    lifeStatus?: 'busy' | 'asleep' | 'idle';
 }
 export interface WorkingDetailDraft {
     /** Explicit rename of the same evidenced matter; never fuzzy deduplication. */

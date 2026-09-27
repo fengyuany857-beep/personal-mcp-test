@@ -1,11 +1,12 @@
 import { Context, Service, Session } from 'koishi';
+import { HealthMonitor } from './health';
 import { UrgeConfig } from './urge';
 import { ModelConfig } from './narrator';
 import { GroupWillingnessConfig } from './group-willingness';
 import { SchedulePreplanConfig } from './schedule-preplan';
 import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeDecision, NarrativeFact, NarrativeIntent, GroupContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, ScriptEntry, StatePatchProposal, StorySetting, StoryState, OverlaySnapshot, AlterSystemConfig, ChatRhythmConfig, AgencyConfig, ScenePresenceState, ChatActionCapabilities, ChatReactionName, MessageReactionDraft, NativeFaceSemantic, QuotedMessageContext, SchedulePreplanRecord, TimelinePlan, UserReportedTime } from './types';
 import type { DesktopInboundEvent, DesktopRuntimePhase } from './desktop-bridge';
-export type DesktopTimelineTrack = 'script' | 'messages' | 'system' | 'scenes' | 'facts' | 'preplan';
+export type DesktopTimelineTrack = 'script' | 'messages' | 'system' | 'scenes' | 'facts' | 'preplan' | 'alter' | 'compaction';
 export interface DesktopTimelineRangeRequest {
     from?: string;
     to?: string;
@@ -15,7 +16,18 @@ export interface DesktopTimelineRangeRequest {
     detailLevel?: 'summary' | 'full';
     limit?: number;
 }
+/** Fix#9: 分页游标改为 occurredAt+id 双键（与排序键一致）；旧 entry:<id> 继续兼容。 */
+export interface TimelineCursor {
+    occurredAt?: Date;
+    id?: number;
+}
+export declare function parseTimelineCursor(cursor: string | undefined): TimelineCursor | undefined;
+export declare function timelineEntryQueryAfter(base: Record<string, unknown>, cursor: TimelineCursor | undefined): Record<string, unknown>;
 export declare function desktopTimelineEntryView(entry: ScriptEntry): {
+    alterOffset?: string;
+    alterValue?: number;
+    audioCount?: number;
+    imageCount?: number;
     sceneCheckpoint?: {
         boundarySourceEntryIds?: number[];
         lastEntryId?: number;
@@ -65,6 +77,10 @@ export interface Config {
     sharedStory?: SharedStoryConfig;
     /** Optional, read-only browser observations powered by koishi-plugin-puppeteer. */
     browser?: BrowserConfig;
+    /** 世界事件播种器：独立提供商配置块；未选模型即视为关闭。 */
+    worldSeeder?: unknown;
+    /** 顶层主提示词（Console 最底部）：非空时覆盖 model.mainPrompt。 */
+    mainPrompt?: string;
     /** Optional OneBot/NapCat account gate. It only affects the onebot platform. */
     onebot?: OneBotNapCatConfig;
     /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
@@ -138,6 +154,14 @@ export interface GroupChatRule {
     contextLimit: number;
     debounceSeconds: number;
     cooldownSeconds: number;
+    /** 档位化的群聊意愿门：off/quiet/reserved/normal/active/eager/auto/custom。 */
+    willingnessPreset?: string;
+    /** auto 档三态（busy/asleep/idle）各自使用的档位。 */
+    willingnessAuto?: {
+        busy?: string;
+        idle?: string;
+        asleep?: string;
+    };
     willingness?: Partial<GroupWillingnessConfig>;
 }
 export interface MemoryConfig {
@@ -222,6 +246,12 @@ export interface RuntimeConfig {
     typingJitterRatio?: number;
     /** Wait after the newest user message before starting a writing request. */
     userMessageDebounceSeconds?: number;
+    forwardMessage?: {
+        enabled?: boolean;
+        maxNodes?: number;
+        maxCharacters?: number;
+        maxDepth?: number;
+    };
     /** @deprecated Ignored since 0.1.2; requests remain replaceable until the first reply is committed. */
     staleNarrativeRequestWindowSeconds?: number;
     /** 新版自动推进调度；旧版 minimumAdvanceMinutes 仍保留兼容。 */
@@ -305,6 +335,8 @@ export interface StoryDefaults {
     characterName: string;
     characterProfile: string;
     perspective: string;
+    perspectives?: string[];
+    supplementaryFacts?: string[];
     userProfile: string;
     relationship: string;
     world: string;
@@ -349,6 +381,8 @@ export declare class InterludeService extends Service {
     static inject: string[];
     private narrator;
     private compactor;
+    private worldSeeder;
+    private worldSeederRuntime;
     private embedder;
     private stickerDescriber;
     private visionDescriber;
@@ -357,6 +391,10 @@ export declare class InterludeService extends Service {
      * minimal content. Loaded lazily on first recall and extended incrementally
      * by the background backfill; never persisted. */
     private historyVectors;
+    /** 桥接幂等（轻量修复）：桌面 30s 超时后入 inbox 重放时，同一消息会再次到达。
+     * 用内存 Map 按 platform:messageId 去重——进程生命周期内有效，重启后由
+     * script_entry.metadata.messageId 的磁盘记录兜底（重放场景不会跨重启）。 */
+    private seenIncomingMessages;
     private historyVectorsReady;
     private historyVectorLoads;
     private historyBackfills;
@@ -377,7 +415,7 @@ export declare class InterludeService extends Service {
      * 取消旧延迟回复”可能与定时发送同时发生，造成过期消息仍被发出。
      */
     private queues;
-    private bufferedNarrativeTurns;
+    private turnEngine;
     private bufferedGroupTurns;
     /** Short-lived group-member display names. QQ number remains the stable key. */
     private groupMemberNameCache;
@@ -389,7 +427,6 @@ export declare class InterludeService extends Service {
     /** Synchronously marks a relationship whose current typing chain was interrupted by new input. */
     private interruptedTypingParticipants;
     /** Prevent a background life turn from racing an unlocked live model call. */
-    private narratingStories;
     private factBackfills;
     /** Coalesce repeated post-turn compaction requests into one queued pass. */
     private scheduledCompactions;
@@ -416,6 +453,14 @@ export declare class InterludeService extends Service {
     private cachedAgencyConfig?;
     private cachedSchedulePreplanConfig?;
     private cachedBlindModeConfig?;
+    /** P3: Console 健康面板的内存滚动指标（重载后归零）。 */
+    readonly health: HealthMonitor;
+    /** Token 用量到达时可能尚未有 canonical story——用最近活跃的 storyId 记账。
+     * P3 Fix: constructor 末尾初始化为当前 canonical story，减少首轮漏记。 */
+    private lastActiveStoryId?;
+    private get canonicalStoryIdForHealth();
+    /** P2 Fix: 主动联系计数——发送动作入列后待平台确认的数量。 */
+    private pendingProactiveCount;
     private cachedAutoAdvanceConfig?;
     private cachedSharedStoryConfig?;
     private cachedMemoryConfig?;
@@ -544,6 +589,10 @@ export declare class InterludeService extends Service {
         updatedAt: any;
         timezone: any;
         entries: {
+            alterOffset?: string;
+            alterValue?: number;
+            audioCount?: number;
+            imageCount?: number;
             sceneCheckpoint?: {
                 boundarySourceEntryIds?: number[];
                 lastEntryId?: number;
@@ -597,8 +646,34 @@ export declare class InterludeService extends Service {
             validThrough: any;
             materializedDays: any;
         };
+        alter: {
+            value: number;
+            alterWeight: number;
+            emotionalOffset: {
+                direction: "serious" | "relaxed";
+                intensity: number;
+                description: string;
+            };
+            lastUpdatedAt: string;
+            history: {
+                value: number;
+                alter: number;
+                at: string;
+            }[];
+        };
+        compaction: {
+            activeSceneId: number;
+            sceneHook: string;
+            entryCount: number;
+            lastCompactionAt: string;
+            isDirty: boolean;
+        };
         nextCursor: string;
     }>;
+    /** Project alterSystem state for the desktop alter track. */
+    private projectAlterForDesktop;
+    /** Project compaction status for the desktop compaction track. */
+    private projectCompactionForDesktop;
     /** Accept an already-normalized typ-0 event without introducing a second narrative path. */
     /** 批次 4：桌面设置叙事游标（分支截断后回拨到 forkPoint）。串行队列内执行。 */
     setDesktopCursorAt(cursorAt: Date): Promise<void>;
@@ -724,6 +799,7 @@ export declare class InterludeService extends Service {
     private lookupGroupMemberName;
     private bufferGroupMessage;
     private flushGroupTurn;
+    private flushGroupTurnUnlocked;
     private groupMessages;
     private groupCooldownActive;
     private groupChatCapabilities;
@@ -752,6 +828,7 @@ export declare class InterludeService extends Service {
      * attachments ride their own native channels, the stored content keeps a
      * place-holder fact so history and the desktop timeline stay readable. */
     private describeUserEvent;
+    private readForward;
     private scanStickerLibrary;
     private refreshStickerCatalog;
     private semanticStickerEmbeddingEnabled;
@@ -837,15 +914,12 @@ export declare class InterludeService extends Service {
     /** Refresh continuity only on the first automatic pass or every fifteenth
      * successful narrative write. Ordinary turns reuse the last snapshot. */
     private shouldRefreshContinuity;
-    /** Automatic prose no longer invents the world timeline by itself. The
-     * compaction route first returns a tiny relative-time ledger; if it cannot,
-     * preserving the current cursor is safer than writing an ungrounded future. */
+    /** The optional director supplies a relative-time ledger. Its failures cool
+     * down independently while the main author may continue without that ledger. */
     private planAutomaticTimeline;
     /** 熔断判定：连续失败达到阈值即熔断；熔断有 2h 冷却，到期自动重试一次完整路径。 */
     private isTimelineDirectorFused;
-    /** Persist the retry gate once per unchanged cursor. The in-memory map is
-     * retained for fast checks inside a live turn, while the story state makes
-     * the guard survive a plugin reload/restart. */
+    /** Persist director health independently from the narrative cursor. */
     private persistTimelineRetry;
     private tryDecide;
     private persistDecision;
@@ -908,6 +982,10 @@ export declare class InterludeService extends Service {
     private findCachedWebObservation;
     private withBrowserSlot;
     /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
+    /** 用户回合成功后的清理：遗留的 narrative-retry 已无意义——其入站消息早已
+     * 被本轮覆盖或消化，保留只会到期再跑一轮完整回合（userInitiated 允许投递）
+     * 并给用户送去一条重复回复。 */
+    private cancelPendingNarrativeRetries;
     private scheduleNarrativeRetry;
     private dueIntents;
     private upcomingNarrativeIntents;
@@ -923,6 +1001,10 @@ export declare class InterludeService extends Service {
     private applyFollowUpResolutions;
     private deferUnresolvedDueFollowUps;
     private appendProactiveCheck;
+    /** Fix#2: schedule_preplan 的主键就是 storyId，Minato 拒绝含主键的 update——
+     * 混在改写循环里必抛，导致后续 participantId 回填被跳过（隐私脱敏失效）。
+     * 改为读旧行→建新行→删旧行（每故事仅一行，无并发窗口问题）。 */
+    private migrateSchedulePreplanRecord;
     private cancelPendingOutgoingMessages;
     private sendScheduledMessages;
     /**
@@ -931,6 +1013,12 @@ export declare class InterludeService extends Service {
      * This is the boundary that prevents a shared story from accidentally
      * sending every reply back to the account that happened to trigger the turn.
      */
+    /** When Agency approves a proactive contact but the model omitted the
+     * crossConversationAction field, synthesize one from the script's say
+     * actions. The model wrote what she sends in the script; the host only
+     * fills the transport envelope. Never invents words not in the script. */
+    private synthesizeCrossActionFromScript;
+    private sendCrossGroupMessage;
     private sendOutgoingMessages;
     /** Confirm visible delivery only after the platform accepted the message.
      * Failed attempts become explicit system evidence rather than fictional
@@ -949,6 +1037,10 @@ export declare class InterludeService extends Service {
     private recordAutomaticDelivery;
     private splitOutgoingMessage;
     private typingDelayMilliseconds;
+    /** 首条发言的打字时间下限：以叙事请求发起时刻为基准，模型耗时不足
+     * typingDelay(首条字数) 时返回需补足的毫秒数；耗时已超过则返回 0（立即发送）。
+     * elapsed 以 0 为下限——起点时间戳异常（时钟偏差）不会反向放大等待。 */
+    private firstMessageTypingHoldMs;
     private findBotForParticipant;
     private get autoAdvanceConfig();
     private get urgeConfig();
@@ -1002,7 +1094,19 @@ export declare class InterludeService extends Service {
      * token-burning loop this guard is meant to stop. */
     private compactionCheckpointAdvanced;
     private scheduleCompaction;
+    private worldSeederSweepRunning;
+    private worldSeederSweep;
+    /** 上下文 payload：环境（时区/季节/世界设定）、历史剧本（压缩摘录）、
+     * 关系网（拉黑名单）、主角所为（workingDetails + 场景/弧摘要）。 */
+    private buildWorldSeederPayload;
+    private worldSeederBlockedNames;
+    /** 到期排水：claim-then-append，先进账的条目本回合 recentScript 即可见。
+     * 低重要性只在推进/跟进回合注入，避免劫持对话回合。 */
+    private drainDueSeededEvents;
     private compactStories;
+    /** Fix#8: 复核退避/对话推迟会让 materializedDays 的 [今天,明天] 槽位缺失，窗口静默变空。
+     * 取记录时若两个槽位都没有物化天，先本地无模型重物化（锚定今天）再算窗口。 */
+    private currentSchedulePreplanWindow;
     private getSchedulePreplan;
     private schedulePreplanEvidence;
     private saveSchedulePreplan;
@@ -1135,12 +1239,18 @@ export declare function describeTimelinePlanRejection(value: unknown): string;
 export declare function timelineEntryPromptProjection(entry: ScriptEntry): ScriptEntry;
 export declare function normalizeGroupChatActions(decision: NarrativeDecision, capabilities: ChatActionCapabilities | undefined, context: GroupContext): ExecutableGroupChatActions;
 export declare function formatGroupSpeaker(senderName: string, senderId: string): string;
-export declare function normalizeGroupVisibleReply(raw: NarrativeDecision['groupReply'], interaction: NarrativeDecision['interaction'], maxCharacters: number, separator?: string): string;
+export declare function normalizeGroupVisibleReply(raw: NarrativeDecision['groupReply'], interaction: NarrativeDecision['interaction'], maxCharacters: number, separator?: string, splitEnabled?: boolean): string;
+/** 无 participant 回合的 interaction 容错：群聊回合（user-message 且无 participant）
+ * 把 immediate 的 interaction 回复提升为 groupReply 参与提交与投递——简洁协议把
+ * interaction 形态写在最前，弱模型常在群聊照抄私聊形态。不提升时 commit-builder
+ * 会为无 participant 的 interaction 生成 outgoing-message 事件，结构校验失败导致
+ * 整回合静默。其余无 participant 相位（advance 等）本无回复通道，携带内容的
+ * interaction 一律剥离，同样避免校验失败。 */
+export declare function hoistParticipantlessInteraction<T extends NarrativeDecision>(decision: T, phase: NarrativeRequest['phase']): T;
+export declare function requiresVisibleReplyRecovery(phase: NarrativeRequest['phase'], groupContext: GroupContext | undefined, decision: NarrativeDecision): boolean;
 export declare function visibleReplyMode(decision: NarrativeDecision, phase: NarrativeRequest['phase'], groupContext?: GroupContext): string;
 export declare function hasRequiredNarrativeScript(value: NarrativeDecision | undefined | null): boolean;
 export declare function resolveBlindModeConfig(value?: Partial<BlindModeConfig>): BlindModeConfig;
-/** @deprecated Renamed to resolveBlindModeConfig. */
-export declare const resolveBlackBoxConfig: typeof resolveBlindModeConfig;
 /** Scene compaction may update a tiny roster only with explicit observed
  * evidence. This keeps named supporting cast available without treating them
  * as automatically present. */

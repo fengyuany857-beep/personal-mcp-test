@@ -598,6 +598,208 @@ async function apifyTranscriptFallback(
 }
 
 
+function timestampToSeconds(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value);
+  const raw = String(value ?? "").trim();
+  if (!raw) return 0;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) return Math.max(0, Number(raw));
+  const parts = raw.split(":").map(Number);
+  if (parts.some((part) => !Number.isFinite(part))) return 0;
+  let seconds = 0;
+  for (const part of parts) seconds = seconds * 60 + part;
+  return Math.max(0, seconds);
+}
+
+export function parseNoteGptTranscriptForTest(
+  payload: unknown,
+  requestedLanguage?: string,
+): { language: string | null; variant: string | null; segments: TranscriptSegment[] } {
+  if (!payload || typeof payload !== "object") {
+    return { language: null, variant: null, segments: [] };
+  }
+
+  const root = payload as Record<string, unknown>;
+  const data = root.data && typeof root.data === "object"
+    ? (root.data as Record<string, unknown>)
+    : null;
+  const transcripts =
+    data?.transcripts && typeof data.transcripts === "object"
+      ? (data.transcripts as Record<string, unknown>)
+      : null;
+  if (!transcripts) return { language: null, variant: null, segments: [] };
+
+  const keys = Object.keys(transcripts);
+  const preferred = requestedLanguage?.trim().toLowerCase();
+  const rankLanguage = (key: string): number => {
+    const code = key.toLowerCase();
+    if (!preferred) return 10;
+    if (code === preferred) return 0;
+    if (code.startsWith(preferred + "_") || code.startsWith(preferred + "-")) return 1;
+    if (code.split(/[_-]/)[0] === preferred.split("-")[0]) return 2;
+    return 100;
+  };
+
+  const orderedLanguages = [...keys].sort((a, b) => rankLanguage(a) - rankLanguage(b));
+  const variants = ["default", "auto", "custom"] as const;
+
+  for (const language of orderedLanguages) {
+    const track = transcripts[language];
+    if (!track || typeof track !== "object") continue;
+    const trackRecord = track as Record<string, unknown>;
+
+    for (const variant of variants) {
+      const rows = trackRecord[variant];
+      if (!Array.isArray(rows) || !rows.length) continue;
+
+      const segments: TranscriptSegment[] = [];
+      for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const record = row as Record<string, unknown>;
+        const text = String(record.text ?? "").replace(/\s+/g, " ").trim();
+        if (!text) continue;
+        const start = timestampToSeconds(record.start);
+        const end = timestampToSeconds(record.end);
+        const durationRaw = Number(record.duration ?? 0);
+        const duration = end > start
+          ? end - start
+          : Number.isFinite(durationRaw)
+            ? Math.max(0, durationRaw)
+            : 0;
+        segments.push({ start, duration, text });
+      }
+
+      if (segments.length) {
+        return { language, variant, segments };
+      }
+    }
+  }
+
+  return { language: null, variant: null, segments: [] };
+}
+
+async function noteGptTranscriptFallback(
+  videoId: string,
+  language: string | undefined,
+  maxCharacters: number,
+): Promise<TranscriptSuccess | TranscriptFailure> {
+  const endpoint = new URL("https://notegpt.io/api/v2/video-transcript-v2");
+  endpoint.searchParams.set("platform", "youtube");
+  endpoint.searchParams.set("video_id", videoId);
+
+  let lastFailure: TranscriptFailure | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await timedFetch(
+        endpoint,
+        {
+          headers: {
+            Accept: "application/json",
+            Cookie: "anonymous_user_id=" + crypto.randomUUID(),
+            "User-Agent": "Lattice-MCP/1.6 YouTubeTranscript",
+          },
+        },
+        15_000,
+      );
+
+      if (!response.ok) {
+        lastFailure = {
+          ok: false,
+          source: "youtube",
+          videoId,
+          provider: "notegpt-transcript-v2",
+          code: response.status === 429 ? "UPSTREAM_UNAVAILABLE" : "UPSTREAM_UNAVAILABLE",
+          message: "NoteGPT transcript fallback returned HTTP " + response.status + ".",
+          fallbackAttempted: true,
+        };
+        continue;
+      }
+
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch {
+        return {
+          ok: false,
+          source: "youtube",
+          videoId,
+          provider: "notegpt-transcript-v2",
+          code: "UPSTREAM_PROTOCOL_ERROR",
+          message: "NoteGPT returned non-JSON transcript output.",
+          fallbackAttempted: true,
+        };
+      }
+
+      const root = payload && typeof payload === "object"
+        ? (payload as Record<string, unknown>)
+        : {};
+      if (Number(root.code) !== 100000) {
+        const message = String(root.message ?? "unknown response");
+        lastFailure = {
+          ok: false,
+          source: "youtube",
+          videoId,
+          provider: "notegpt-transcript-v2",
+          code: /transcript|caption|subtitle|not available/i.test(message)
+            ? "NO_TRANSCRIPT"
+            : "UPSTREAM_UNAVAILABLE",
+          message: "NoteGPT transcript fallback failed: " + message.slice(0, 240),
+          fallbackAttempted: true,
+        };
+        continue;
+      }
+
+      const parsed = parseNoteGptTranscriptForTest(payload, language);
+      if (!parsed.segments.length) {
+        return {
+          ok: false,
+          source: "youtube",
+          videoId,
+          provider: "notegpt-transcript-v2",
+          code: "NO_TRANSCRIPT",
+          message: "NoteGPT returned no usable transcript segments.",
+          fallbackAttempted: true,
+        };
+      }
+
+      const capped = capTranscript(parsed.segments, maxCharacters);
+      return {
+        ok: true,
+        source: "youtube",
+        videoId,
+        provider: "notegpt-transcript-v2",
+        language: parsed.language,
+        isAutoGenerated: parsed.language?.toLowerCase().includes("auto") ?? null,
+        text: capped.text,
+        segments: capped.segments,
+        totalCharacters: capped.totalCharacters,
+        truncated: capped.truncated,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastFailure = {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "notegpt-transcript-v2",
+        code: /abort|timeout/i.test(message) ? "UPSTREAM_TIMEOUT" : "UPSTREAM_UNAVAILABLE",
+        message: "NoteGPT transcript fallback failed: " + message.slice(0, 240),
+        fallbackAttempted: true,
+      };
+    }
+  }
+
+  return lastFailure ?? {
+    ok: false,
+    source: "youtube",
+    videoId,
+    provider: "notegpt-transcript-v2",
+    code: "UPSTREAM_UNAVAILABLE",
+    message: "NoteGPT transcript fallback did not return a result.",
+    fallbackAttempted: true,
+  };
+}
+
+
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = "";
@@ -867,12 +1069,13 @@ export function registerVideoTools(server: McpServer, env: VideoEnv) {
     "video.youtube_transcript",
     {
       description:
-        "Read the spoken text of a public YouTube video. It uses manual/auto captions first, an optional Apify caption fallback, then bounded Workers AI Whisper ASR when captions are unavailable. ASR fetches an audio-only stream and is capped by duration and file-size safety limits.",
+        "Read the spoken text of a public YouTube video. It tries YouTube captions first, then a bounded third-party transcript fallback, optional Apify, and finally Workers AI Whisper ASR. The returned provider field identifies which path produced the text.",
       inputSchema: z.object({
         url: z.string().min(1).max(2_000),
         language: z.string().min(2).max(35).optional(),
         includeTimestamps: z.boolean().optional(),
         maxCharacters: z.number().int().min(1_000).max(HARD_MAX_CHARACTERS).optional(),
+        allowThirdParty: z.boolean().optional(),
         allowAsr: z.boolean().optional(),
         maxAsrMinutes: z.number().int().min(1).max(120).optional(),
       }),
@@ -883,7 +1086,7 @@ export function registerVideoTools(server: McpServer, env: VideoEnv) {
         destructiveHint: false,
       },
     },
-    async ({ url, language, includeTimestamps, maxCharacters, allowAsr, maxAsrMinutes }) => {
+    async ({ url, language, includeTimestamps, maxCharacters, allowThirdParty, allowAsr, maxAsrMinutes }) => {
       const videoId = parseYoutubeVideoId(url);
       if (!videoId) {
         const failure: TranscriptFailure = {
@@ -903,9 +1106,12 @@ export function registerVideoTools(server: McpServer, env: VideoEnv) {
       const limit = Math.min(maxCharacters ?? DEFAULT_MAX_CHARACTERS, HARD_MAX_CHARACTERS);
       let result = await directYoutubeTranscript(url, videoId, language, limit);
 
+      if (!result.ok && result.code !== "INVALID_URL" && (allowThirdParty ?? true)) {
+        result = await noteGptTranscriptFallback(videoId, language, limit);
+      }
+
       if (
         !result.ok &&
-        result.code !== "NO_TRANSCRIPT" &&
         result.code !== "INVALID_URL" &&
         env.APIFY_TOKEN
       ) {

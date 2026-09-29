@@ -62,7 +62,7 @@ const init = await mcpFetch("initialize", {
   capabilities: {},
   clientInfo: { name: "research-live-smoke", version: "1.0.0" },
 });
-assert.equal(init?.serverInfo?.name, "personal-mcp-test");
+assert.equal(init?.serverInfo?.name, "lattice-mcp");
 console.log(`MCP_INITIALIZE=PASS version=${init?.serverInfo?.version}`);
 
 await mcpFetch("notifications/initialized", {}, true);

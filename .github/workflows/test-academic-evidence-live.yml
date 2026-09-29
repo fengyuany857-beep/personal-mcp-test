@@ -10,7 +10,9 @@ on:
       - scripts/research-live-smoke.mjs
       - scripts/research-mcp-live-smoke.mjs
       - src/research/**
+      - src/video/**
       - src/index.ts
+      - scripts/video-mcp-live-smoke.mjs
 
 permissions:
   contents: read

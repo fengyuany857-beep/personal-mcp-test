@@ -4,9 +4,10 @@ import { z } from "zod";
 import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
 import { registerResearchTools } from "./research/tools.ts";
 import type { ResearchEnv } from "./research/types.ts";
+import { registerVideoTools, type VideoEnv } from "./video/tools.ts";
 
 const SERVER_NAME = "lattice-mcp" as const;
-const SERVER_VERSION = "1.4.0" as const;
+const SERVER_VERSION = "1.5.0" as const;
 const EXA_TOOL = "web_search_exa" as const;
 const EXA_ENDPOINT = `https://mcp.exa.ai/mcp?tools=${EXA_TOOL}`;
 const FIRECRAWL_TOOL = "firecrawl_scrape" as const;
@@ -16,7 +17,7 @@ const APIFY_DETAILS_TOOL = "fetch-actor-details" as const;
 const APIFY_ENDPOINT = `https://mcp.apify.com?tools=${APIFY_SEARCH_TOOL},${APIFY_DETAILS_TOOL}`;
 const MAX_PROXY_TEXT_CHARS = 32_000;
 
-type Env = ResearchEnv & {
+type Env = ResearchEnv & VideoEnv & {
   EXA_API_KEY?: string;
   EXA_RELAY_URL?: string;
   HUB_RELAY_TOKEN?: string;
@@ -449,6 +450,7 @@ function createServer(env: Env) {
   );
 
   registerResearchTools(server, env);
+  registerVideoTools(server, env);
 
   return server;
 }

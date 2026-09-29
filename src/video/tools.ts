@@ -8,8 +8,13 @@ const HARD_MAX_CHARACTERS = 200_000;
 const APIFY_ACTOR_ID = "apidojo~youtube-transcript-scraper";
 const APIFY_MAX_TOTAL_CHARGE_USD = "0.01";
 
+type WorkersAiBinding = {
+  run(model: string, input: Record<string, unknown>): Promise<unknown>;
+};
+
 export type VideoEnv = {
   APIFY_TOKEN?: string;
+  AI?: WorkersAiBinding;
 };
 
 type CaptionTrack = {
@@ -53,7 +58,10 @@ type TranscriptFailure = {
     | "UPSTREAM_TIMEOUT"
     | "UPSTREAM_UNAVAILABLE"
     | "UPSTREAM_PROTOCOL_ERROR"
-    | "APIFY_AUTH_REQUIRED";
+    | "APIFY_AUTH_REQUIRED"
+    | "ASR_UNAVAILABLE"
+    | "ASR_TOO_LONG"
+    | "ASR_TOO_LARGE";
   message: string;
   fallbackAttempted?: boolean;
 };
@@ -589,17 +597,231 @@ async function apifyTranscriptFallback(
   };
 }
 
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const step = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += step) {
+    const chunk = bytes.subarray(offset, Math.min(offset + step, bytes.length));
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function normalizeAsrSegments(payload: Record<string, unknown>): TranscriptSegment[] {
+  const raw = Array.isArray(payload.segments) ? payload.segments : [];
+  const segments: TranscriptSegment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const text = String(row.text ?? "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const start = Number(row.start ?? row.start_time ?? 0);
+    const end = Number(row.end ?? row.end_time ?? start);
+    const duration = Number(row.duration ?? (Number.isFinite(end) ? end - start : 0));
+    segments.push({
+      start: Number.isFinite(start) ? Math.max(0, start) : 0,
+      duration: Number.isFinite(duration) ? Math.max(0, duration) : 0,
+      text,
+    });
+  }
+  return segments;
+}
+
+async function youtubeAudioAsr(
+  env: VideoEnv,
+  videoId: string,
+  language: string | undefined,
+  maxCharacters: number,
+  maxAsrMinutes: number,
+): Promise<TranscriptSuccess | TranscriptFailure> {
+  if (!env.AI) {
+    return {
+      ok: false,
+      source: "youtube",
+      videoId,
+      provider: "workers-ai-whisper-large-v3-turbo",
+      code: "ASR_UNAVAILABLE",
+      message: "Workers AI binding is not configured for audio transcription.",
+    };
+  }
+
+  try {
+    const youtubeModule = await import("youtubei.js/cf-worker");
+    const Innertube = youtubeModule.Innertube;
+    const yt = await Innertube.create({
+      enable_session_cache: false,
+      generate_session_locally: true,
+      retrieve_player: true,
+    });
+
+    const info = await yt.getBasicInfo(videoId);
+    const format = info.chooseFormat({ type: "audio", quality: "bestefficiency" });
+    const approxDurationMs = Number(format.approx_duration_ms ?? 0);
+    const durationMinutes = approxDurationMs > 0 ? approxDurationMs / 60_000 : 0;
+
+    if (durationMinutes > maxAsrMinutes) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "ASR_TOO_LONG",
+        message:
+          "Video is about " +
+          durationMinutes.toFixed(1) +
+          " minutes, above the configured ASR limit of " +
+          maxAsrMinutes +
+          " minutes.",
+      };
+    }
+
+    const declaredBytes = Number(format.content_length ?? 0);
+    const maxAudioBytes = 32 * 1024 * 1024;
+    if (declaredBytes > maxAudioBytes) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "ASR_TOO_LARGE",
+        message: "Selected audio stream exceeds the 32 MiB ASR safety bound.",
+      };
+    }
+
+    const audioUrl = await format.decipher(yt.session.player);
+    if (!audioUrl) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "youtubei.js",
+        code: "UPSTREAM_PROTOCOL_ERROR",
+        message: "YouTube audio format could not be deciphered.",
+      };
+    }
+
+    const audioResponse = await timedFetch(
+      audioUrl,
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36",
+        },
+      },
+      45_000,
+    );
+    if (!audioResponse.ok) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "youtubei.js",
+        code: audioResponse.status === 403 || audioResponse.status === 429 ? "YOUTUBE_BLOCKED" : "UPSTREAM_UNAVAILABLE",
+        message: "YouTube audio stream returned HTTP " + audioResponse.status + ".",
+      };
+    }
+
+    const headerBytes = Number(audioResponse.headers.get("content-length") ?? 0);
+    if (headerBytes > maxAudioBytes) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "ASR_TOO_LARGE",
+        message: "Fetched audio stream exceeds the 32 MiB ASR safety bound.",
+      };
+    }
+
+    const audio = await audioResponse.arrayBuffer();
+    if (audio.byteLength > maxAudioBytes) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "ASR_TOO_LARGE",
+        message: "Fetched audio stream exceeds the 32 MiB ASR safety bound.",
+      };
+    }
+
+    const raw = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+      audio: arrayBufferToBase64(audio),
+      task: "transcribe",
+      ...(language ? { language: language.split("-")[0].toLowerCase() } : {}),
+      vad_filter: true,
+      condition_on_previous_text: true,
+    });
+
+    if (!raw || typeof raw !== "object") {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "UPSTREAM_PROTOCOL_ERROR",
+        message: "Workers AI returned no structured transcription.",
+      };
+    }
+
+    const payload = raw as Record<string, unknown>;
+    const text = String(payload.text ?? "").replace(/\s+/g, " ").trim();
+    let segments = normalizeAsrSegments(payload);
+    if (!segments.length && text) {
+      segments = [{ start: 0, duration: Math.max(0, approxDurationMs / 1000), text }];
+    }
+    if (!text) {
+      return {
+        ok: false,
+        source: "youtube",
+        videoId,
+        provider: "workers-ai-whisper-large-v3-turbo",
+        code: "NO_TRANSCRIPT",
+        message: "Workers AI completed but returned no speech text.",
+      };
+    }
+
+    const capped = capTranscript(segments, maxCharacters);
+    return {
+      ok: true,
+      source: "youtube",
+      videoId,
+      provider: "youtubei.js+workers-ai-whisper-large-v3-turbo",
+      language: language ?? null,
+      isAutoGenerated: true,
+      text: capped.text,
+      segments: capped.segments,
+      totalCharacters: capped.totalCharacters,
+      truncated: capped.truncated,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+    return {
+      ok: false,
+      source: "youtube",
+      videoId,
+      provider: "youtubei.js+workers-ai-whisper-large-v3-turbo",
+      code: /abort|timeout/i.test(message) ? "UPSTREAM_TIMEOUT" : "UPSTREAM_UNAVAILABLE",
+      message: "ASR fallback failed: " + message,
+    };
+  }
+}
+
 export function registerVideoTools(server: McpServer, env: VideoEnv) {
   server.registerTool(
     "video.youtube_transcript",
     {
       description:
-        "Read the spoken text of a public YouTube video from its available manual or auto-generated captions. Uses direct caption extraction first and an optional Apify fallback when APIFY_TOKEN is configured. It does not download the full video and does not invent speech when captions are unavailable.",
+        "Read the spoken text of a public YouTube video. It uses manual/auto captions first, an optional Apify caption fallback, then bounded Workers AI Whisper ASR when captions are unavailable. ASR fetches an audio-only stream and is capped by duration and file-size safety limits.",
       inputSchema: z.object({
         url: z.string().min(1).max(2_000),
         language: z.string().min(2).max(35).optional(),
         includeTimestamps: z.boolean().optional(),
         maxCharacters: z.number().int().min(1_000).max(HARD_MAX_CHARACTERS).optional(),
+        allowAsr: z.boolean().optional(),
+        maxAsrMinutes: z.number().int().min(1).max(120).optional(),
       }),
       annotations: {
         readOnlyHint: true,
@@ -608,7 +830,7 @@ export function registerVideoTools(server: McpServer, env: VideoEnv) {
         destructiveHint: false,
       },
     },
-    async ({ url, language, includeTimestamps, maxCharacters }) => {
+    async ({ url, language, includeTimestamps, maxCharacters, allowAsr, maxAsrMinutes }) => {
       const videoId = parseYoutubeVideoId(url);
       if (!videoId) {
         const failure: TranscriptFailure = {
@@ -635,6 +857,16 @@ export function registerVideoTools(server: McpServer, env: VideoEnv) {
         env.APIFY_TOKEN
       ) {
         result = await apifyTranscriptFallback(env, url, videoId, language, limit);
+      }
+
+      if (!result.ok && result.code !== "INVALID_URL" && (allowAsr ?? true)) {
+        result = await youtubeAudioAsr(
+          env,
+          videoId,
+          language,
+          limit,
+          Math.min(maxAsrMinutes ?? 30, 120),
+        );
       }
 
       if (!result.ok) {

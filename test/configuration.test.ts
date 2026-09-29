@@ -10,7 +10,7 @@ const now = new Date('2026-09-09T12:00:00Z')
 test('Console sections follow the documented setup order', () => {
   assert.deepEqual(Object.keys(Config.dict), [
     'storyDefaults', 'model', 'onebot', 'sharedStory', 'runtime', 'urge', 'schedulePreplan', 'timelineDirector', 'agency',
-    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'worldSeeder', 'blindMode', 'logging', 'mainPrompt', 'chatRhythm',
+    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'worldSeeder', 'qzone', 'blindMode', 'logging', 'mainPrompt', 'chatRhythm',
   ])
   // 分类前缀让配置页按 必填→结构→节奏→表达→内在→扩展→维护 分组可读。
   const headers = Object.values(Config.dict).map((item: any) => String(item.meta?.description ?? ''))
@@ -21,8 +21,9 @@ test('Console sections follow the documented setup order', () => {
   assert.match(headers[11], /^【内在 12】/)
   assert.match(headers[13], /^【扩展 14】/)
   assert.match(headers[14], /^【扩展 15】/)
-  assert.match(headers[15], /^【维护 15】/)
-  assert.match(headers[16], /^【维护 16】/)
+  assert.match(headers[15], /^【扩展 16】/)
+  assert.match(headers[16], /^【维护 15】/)
+  assert.match(headers[17], /^【维护 16】/)
 })
 
 test('chat actions are opt-in and platform-scoped', () => {
@@ -60,7 +61,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '1.0.1-rc24')
+  assert.equal(version, '1.0.1-rc28')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {
@@ -132,9 +133,12 @@ test('Agency Window exposes only the four bounded scheduling controls', () => {
   const agency = Config.dict.agency.dict
   assert.deepEqual(Object.keys(agency), [
     'enabled', 'maxWindowMinutes', 'minimumProactiveIntervalMinutes', 'maxCandidateHours',
+    'contactMode', 'naturalWillingnessThreshold', 'naturalMinimumIntervalMinutes', 'proactiveDailyCap',
   ])
   assert.equal(agency.enabled.meta.default, true)
   assert.equal(agency.maxWindowMinutes.meta.default, 240)
+  assert.equal(agency.contactMode.meta.default, 'strict')
+  assert.equal(agency.proactiveDailyCap.meta.default, 3)
 })
 
 test('Schedule Preplan is lightweight, enabled by default and reuses the compaction provider', () => {
@@ -231,6 +235,13 @@ test('normalizeInteraction keeps seen and reply independent so unread silence ca
   assert.deepEqual(normalizeInteraction({ seen: false, reply: { mode: 'immediate' } }, now, runtime as any),
     { seen: false, reply: { mode: 'none' } })
   assert.equal(normalizeInteraction({ seen: true, reply: { mode: 'later' } }, now, runtime as any), undefined)
+  // DeepSeek V4.1 修复：漏 seen 布尔不得丢弃整条回复（否则剧本有回复、传输变 none）。
+  assert.deepEqual(normalizeInteraction({ reply: { mode: 'immediate', content: '漏了seen但回复有效' } }, now, runtime as any),
+    { seen: true, reply: { mode: 'immediate', content: '漏了seen但回复有效' } })
+  assert.deepEqual(normalizeInteraction({ reply: { mode: 'none' } }, now, runtime as any),
+    { seen: true, reply: { mode: 'none' } })
+  // reply 不是对象仍整体无效（无从恢复）。
+  assert.equal(normalizeInteraction({ seen: true, reply: 'immediate' }, now, runtime as any), undefined)
 })
 
 test('delayed replies outside the allowed window still collapse to none regardless of seen', () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  parseWorldSeedEvents, resolveWorldSeederRuntime, summaryJaccard,
+  parseWorldSeedEvents, resolveWorldSeederRuntime, seedDomainForRun, summaryJaccard, WORLD_SEED_DOMAINS,
   validateSeedEvent, worldSeederSystemPrompt, type SeedValidationInput, type WorldSeedEventDraft,
 } from '../src/world-seeder'
 
@@ -88,4 +88,30 @@ test('seeder prompt teaches the critical rules', () => {
   assert.match(prompt, /External facts only/)
   assert.match(prompt, /MOST RUNS MUST RETURN an empty events array/)
   assert.match(prompt, /high is rare/)
+})
+
+test('世界切面轮换：同槽稳定、跨槽前进、一个周期覆盖全部切面', () => {
+  const storyId = 'fixture-story'
+  const slot = new Date('2026-09-29T01:50:00+08:00')
+  const a = seedDomainForRun(storyId, slot, 45)
+  assert.equal(seedDomainForRun(storyId, slot, 45).key, a.key, '同参数确定性（同一轮 sweep 的多次调用一致）')
+  const next = seedDomainForRun(storyId, new Date(slot.getTime() + 45 * 60_000), 45)
+  assert.notEqual(next.key, a.key, '相邻槽前进一格')
+  const seq = Array.from({ length: 6 }, (_, i) => seedDomainForRun(storyId, new Date(slot.getTime() + i * 45 * 60_000), 45).key)
+  assert.equal(new Set(seq).size, 6, '一个完整周期覆盖六个切面')
+  assert.equal(seedDomainForRun(storyId, new Date(slot.getTime() + 6 * 45 * 60_000), 45).key, a.key, '周期回到起点')
+  // 不同剧本相位不同：全部故事不会同步走同一切面
+  const keys = new Set(['s1', 's2', 's3', 's4', 's5', 's6'].map(id => seedDomainForRun(id, slot, 45).key))
+  assert.ok(keys.size > 1, '跨剧本相位错开')
+})
+
+test('播种提示词按切面提问且每轮至多一事件', () => {
+  const plain = worldSeederSystemPrompt()
+  assert.match(plain, /Output at most 1 event/)
+  assert.doesNotMatch(plain, /SLICE OF THE WORLD/, '无切面时保持通用形态（兼容旧调用）')
+  const sliced = worldSeederSystemPrompt(WORLD_SEED_DOMAINS[2])
+  assert.match(sliced, /THIS RUN'S SLICE OF THE WORLD: 生计与日常事务/)
+  assert.match(sliced, /Originate this run's event from this slice only/)
+  assert.match(sliced, /If nothing genuine fits the slice right now, return an empty array/)
+  assert.match(sliced, /never import real-world institutions into a world that does not have them/, '异世界兼容：切面按世界语汇本地化')
 })

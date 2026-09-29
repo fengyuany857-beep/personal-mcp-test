@@ -1,6 +1,6 @@
 # HDS Interlude 文档索引
 
-当前发布基线为 `1.0.1-rc24`。根目录 README、新手指南、配置指南和命令文档面向使用者；本目录保存当前架构、设计依据、发布增量与维护记录。判断当前行为优先阅读“当前实现”，历史报告只用于追溯，不覆盖源码与当前架构。
+当前发布基线为 `1.0.1-rc28`。根目录 README、新手指南、配置指南和命令文档面向使用者；本目录保存当前架构、设计依据、发布增量与维护记录。判断当前行为优先阅读“当前实现”，历史报告只用于追溯，不覆盖源码与当前架构。
 
 ## 当前实现
 
@@ -11,6 +11,10 @@
 - [FORWARD_MESSAGE_READING_DESIGN.md](FORWARD_MESSAGE_READING_DESIGN.md)：QQ 合并转发读取现状、SnowLuma 接口依据与 HDSI 接入方案。
 - [WORLD_EVENT_SEEDER_DESIGN.md](WORLD_EVENT_SEEDER_DESIGN.md)：世界事件播种器（已随 rc23 发布；rc24 起模型选择为用途勾选）——外部事件源、事实权威/反应自由语义、生成回路与注入管线。
 - [GROUP_WILLINGNESS_TIERS.md](GROUP_WILLINGNESS_TIERS.md)：群聊意愿档位化与 auto 档（已随 rc23 发布）。
+- [WECHAT_CHANNEL_PLAN.md](WECHAT_CHANNEL_PLAN.md)：微信接入总体方案（v2）——onebots + OneBot v11 文本私聊 POC 路线与原生渠道适配层长期架构；POC 工作区 `C:\dev\onebots-wechat-poc`，未开始写码。
+- [QZONE_FEED_DESIGN.md](QZONE_FEED_DESIGN.md)：QQ 空间（说说）通道——感知-行动分离架构、qzone-action 意图、好友动态轮询、限流与安全边界（按端点分桶；工作区增量，随下个 rc 发布）。
+- [MULTI_CHANNEL_SINGLE_STORY_DESIGN.md](MULTI_CHANNEL_SINGLE_STORY_DESIGN.md)：单剧本多通道设计（QQ + 微信，v3 实现规格）——UUID 端点身份与注册表、入站反向解析链、三维端点状态时效、canonical 别名迁移与回滚、M1a/M1b 拆分路线。
+- [MULTI_CHANNEL_IMPLEMENTATION_ROADMAP.md](MULTI_CHANNEL_IMPLEMENTATION_ROADMAP.md)：M2-M4 实施路线（执行计划；M1 已完成并通过安全审计）——双 QQ 号作 M2 验证载体、端点管理/用户链接/回合 sources 语义详细设计、微信 POC 补完步骤、M3/M4 概要与节点事务。
 
 ## 发布增量与维护记录
 
@@ -37,3 +41,5 @@
 ## 阅读原则
 
 判断当前行为时只以 `src/`、根目录四份用户文档以及本目录的当前文档为准。`dustbin/` 中的内容都不是当前实现说明。
+
+> **仓库统一（2026-09-29）**：自本版起 `hds-interlude` 主仓为唯一操作目标——cev 独有功能（SharedWorks 共同作品 / 模型特化）已并入本仓（模块+表+测试就位，narrator 集成接线待后续版本），cev 仓转为只读存档。桌面壳以 typ0-cev 的 UI_DESIGN_SPEC_V2 实现为标准。

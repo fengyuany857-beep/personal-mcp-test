@@ -1,4 +1,6 @@
 import { Context, Service, Session } from 'koishi';
+import { type QzoneActionKind } from './qzone';
+import { type StoryAliasRecord } from './endpoints';
 import { HealthMonitor } from './health';
 import { UrgeConfig } from './urge';
 import { ModelConfig } from './narrator';
@@ -79,6 +81,8 @@ export interface Config {
     browser?: BrowserConfig;
     /** 世界事件播种器：独立提供商配置块；未选模型即视为关闭。 */
     worldSeeder?: unknown;
+    /** QQ 空间（说说）通道：SnowLuma qzone 扩展动作的限流与审计。 */
+    qzone?: unknown;
     /** 顶层主提示词（Console 最底部）：非空时覆盖 model.mainPrompt。 */
     mainPrompt?: string;
     /** Optional OneBot/NapCat account gate. It only affects the onebot platform. */
@@ -383,6 +387,7 @@ export declare class InterludeService extends Service {
     private compactor;
     private worldSeeder;
     private worldSeederRuntime;
+    private qzoneRuntime;
     private embedder;
     private stickerDescriber;
     private visionDescriber;
@@ -406,8 +411,6 @@ export declare class InterludeService extends Service {
     private timelineBackoff;
     /** Consecutive timeline-director failures per story; drives exponential backoff and the fuse. */
     private timelineDirectorFailures;
-    /** Per-story guard for a failed/partially persisted scene compaction. */
-    private compactionBackoff;
     private stickerById;
     private stickerScanRunning;
     /**
@@ -416,20 +419,26 @@ export declare class InterludeService extends Service {
      */
     private queues;
     private turnEngine;
+    private scheduler;
+    /** 端点注册表内存缓存（M1a）：行来自 interlude_endpoint；状态为进程内三维时效。 */
+    private endpointRows;
+    private endpointStates;
+    private endpointRegistryReady;
+    /** M1b 剧本别名缓存（interlude_story_alias），随注册表一同加载。 */
+    private storyAliasRows;
+    /** M2 §1.3：入站接收序号（进程内单调递增；双端点回合排序依据）。 */
+    private inboundSeq;
+    private storyAliasProblems;
     private bufferedGroupTurns;
     /** Short-lived group-member display names. QQ number remains the stable key. */
     private groupMemberNameCache;
     private groupMemberNameLookups;
     /** Ephemeral, per-group willingness score. It never touches private turns or durable story state. */
     private groupWillingness;
-    /** Earliest wake-up for persisted typing segments; one timer per story. */
-    private dueIntentWakeTimers;
     /** Synchronously marks a relationship whose current typing chain was interrupted by new input. */
     private interruptedTypingParticipants;
     /** Prevent a background life turn from racing an unlocked live model call. */
     private factBackfills;
-    /** Coalesce repeated post-turn compaction requests into one queued pass. */
-    private scheduledCompactions;
     /** Coalesce low-frequency atmosphere analysis without delaying the visible reply. */
     private scheduledAlterAnalyses;
     /** sql.js/SQLite has one writable connection; serialize writes globally. */
@@ -442,6 +451,11 @@ export declare class InterludeService extends Service {
     private readonly serviceLogger;
     private backgroundStarted;
     private databaseResetting;
+    /** Invalidates model work that was prepared against a story before purge,
+     * pause, or a runtime reset. The token is in-memory and intentionally does
+     * not become part of the story schema. */
+    private runtimeGeneration;
+    private storyTaskGenerations;
     private sweepRunning;
     private compactionSweepRunning;
     private blindModeHealthIssue;
@@ -776,6 +790,7 @@ export declare class InterludeService extends Service {
      * Console configuration, so an old profile cannot survive in later prompts.
      */
     purgeAllStoryData(storyId: string): Promise<void>;
+    private purgeAllStoryDataUnlocked;
     /** Reset all platforms, retaining exactly one empty global canonical story. */
     purgeAllData(preferredStoryId?: string): Promise<any>;
     /** Delete one adapter/platform's records without touching other platforms. */
@@ -791,6 +806,7 @@ export declare class InterludeService extends Service {
     }>;
     /** Remove script and derived memory records whose timestamps overlap a range. */
     purgeStoryRange(storyId: string, from: Date, to: Date): Promise<void>;
+    private purgeStoryRangeUnlocked;
     /** Entry point for configured OneBot group chats. Group members do not need
      * private-message authorization; the group allowlist controls access. */
     receiveGroup(session: Session, receivedAt?: Date): Promise<boolean>;
@@ -889,6 +905,9 @@ export declare class InterludeService extends Service {
     /** Prevent timers or already-returning model calls from resurrecting data
      * after an administrator resets the story or clears HDSI tables. */
     private invalidateBufferedNarratives;
+    private invalidateStoryTasks;
+    private taskGeneration;
+    private taskGenerationCurrent;
     /** True while a live or debounced conversation should take priority over background work. */
     private hasPendingNarrative;
     private flushBufferedNarrative;
@@ -992,6 +1011,8 @@ export declare class InterludeService extends Service {
     /** Wake the scheduler close to a short typing delay instead of waiting for
      * the normal background sweep. The due intent remains the source of truth. */
     private scheduleDueIntentWake;
+    /** 到期唤醒的执行体：分段消息直投；sweep 繁忙或前台回合未结束时返回 'busy'，由 scheduler 短候重排。 */
+    private wakeDueIntents;
     private scheduleNextSplitWake;
     /** Deliver already-decided <sep/> segments without invoking the narrator. */
     private deliverDueSplitSegments;
@@ -1094,6 +1115,142 @@ export declare class InterludeService extends Service {
      * token-burning loop this guard is meant to stop. */
     private compactionCheckpointAdvanced;
     private scheduleCompaction;
+    /** 从当前在线的 OneBot（SnowLuma/NapCat）连接取通用动作调用口。
+     * 指定 preferSelfId 时严格匹配该账号——空间动作落在别的 QQ 上比失败更糟。 */
+    private qzoneCaller;
+    /**
+     * 执行一条空间动作（发帖/评论/点赞）：限流门 → pending 审计行（在故事串行
+     * 队列内原子预留配额）→ SnowLuma 动作（网络调用留在队列外）→ 回写
+     * confirmed/failed/unknown。传输类异常与“成功帧但无 tid”都记 unknown——
+     * 结果不明按已发生保守计入配额，且绝不自动重试非幂等动作。
+     */
+    qzoneExecute(story: InterludeStory, kind: QzoneActionKind, input: {
+        content?: string;
+        tid?: string;
+        targetUin?: string;
+        ugcRight?: number;
+    }, preferSelfId?: string): Promise<{
+        ok: boolean;
+        tid?: string;
+        error?: string;
+    }>;
+    /** 通道能力探测（只读）：SnowLuma 的 qzone 扩展是否可用。 */
+    qzoneAvailable(preferSelfId?: string): Promise<boolean>;
+    /**
+     * 到期 qzone-action 意图的执行侧：payload 校验 → 限流门 → 动作 → 完成意图。
+     * 坏 payload / 限流 / 通道失败都直接完成意图（成败进审计表），不回流叙事。
+     */
+    private executeQzoneIntent;
+    /** 好友动态轮询：感知零模型调用——新鲜说说写成 [好友动态] 条目，反应留给回合内决策。 */
+    private qzoneFeedSweepRunning;
+    private qzoneFeedSweep;
+    /** 加载并补齐端点注册表（幂等）：active 故事/参与者/启用的群规则派生行。 */
+    /** 加载并补齐端点注册表（幂等 + 单飞：并发调用共享同一次 reconcile）。 */
+    private endpointRegistryInFlight;
+    /** 端点/别名运行期写队列（P1-2）：所有注册表变更串行执行，杜绝并发"查后写"重复。 */
+    private endpointWriteQueue;
+    private enqueueEndpointWrite;
+    private ensureEndpointRegistry;
+    private reconcileEndpointRegistry;
+    /** 运行期增量登记（P1-2）：故事/参与者创建时同步 upsert 端点行。
+     * P1-1/P1-2：经写队列串行执行；先落库成功才进内存；失败置脏（下次 reconcile
+     * 重试）——绝不留下"进程内有、重启即无"的幽灵端点，也不让登记失败被静默
+     * 吞掉后触发陌生账号拒绝（置脏保证 findStory 下次会重新 reconcile 补上）。 */
+    private registerStoryRoleEndpointRow;
+    private registerParticipantUserEndpointRow;
+    /** qzone 审计行 endpointId 回填：旧行按 storyId → 该故事角色端点归因。 */
+    private backfillQzoneEndpointIds;
+    /**
+     * 登记剧本别名（幂等）：既有行指向相同 canonical → 无操作；指向不同
+     * canonical → 冲突告警一次且不覆盖（人工裁决）；成功则落行并更新缓存。
+     */
+    private recordStoryAlias;
+    /** 别名解析：链式（双射失败）或悬空（canonical 无故事）→ undefined + 一次性告警。 */
+    private resolveStoryIdAlias;
+    /** M1b 回滚：删除一条别名重定向并留审计。行删除即回滚生效（双向可达由 canonicalStoryId 索引保证）。 */
+    removeStoryAlias(aliasStoryId: string, reason?: string): Promise<{
+        ok: boolean;
+        error?: string;
+    }>;
+    /** M1b 只读视图：列出当前别名（管理命令用）。 */
+    listStoryAliases(): StoryAliasRecord[];
+    /** 注册一个角色端点到既有故事（幂等；accountKey 被其他故事占用时拒绝）。
+     * P1-2：经写队列串行执行——并发 add 不会双双重叠冲突检查；P1-1：落库失败
+     * 不进内存且返回失败。 */
+    addStoryEndpoint(story: InterludeStory, platform: string, selfId: string, channelKind?: 'qq' | 'wechat'): Promise<{
+        ok: boolean;
+        endpointId?: string;
+        error?: string;
+    }>;
+    /** 停用一个角色端点（身份与历史保留；enabled=false 后其消息按陌生账号处理）。 */
+    disableStoryEndpoint(endpointId: string): Promise<{
+        ok: boolean;
+        error?: string;
+    }>;
+    /** M3 §八：解析参与者最近活跃端点（EndpointState.connection.observedAt 最新；无则 undefined）。 */
+    private resolveMostActiveEndpointId;
+    /**
+     * Decide whether the narrator needs the multi-platform transport contract.
+     * One platform, including several accounts on that platform, keeps the
+     * lightweight legacy prompt. Only enabled endpoints that are legal targets
+     * for this request are considered; the complete registry is never exposed.
+     */
+    private narrativeEndpointSelection;
+    /** 链接用户端点到既有参与者（幂等；accountKey+userId 已属其他参与者时拒绝）。 */
+    linkParticipantEndpoint(participant: InterludeParticipant, platform: string, userId: string): Promise<{
+        ok: boolean;
+        endpointId?: string;
+        error?: string;
+    }>;
+    /** 解除链接（可撤销；身份与历史保留，enabled=false）。 */
+    unlinkParticipantEndpoint(endpointId: string): Promise<{
+        ok: boolean;
+        error?: string;
+    }>;
+    /** 列出参与者名下全部用户端点（含启用状态）。 */
+    listParticipantEndpoints(participantId: string): {
+        endpointId: string;
+        platform: string;
+        userId: string;
+        enabled: boolean;
+    }[];
+    /** 解析故事的任一角色端点的 accountKey（供用户端点确定通道归属）。 */
+    private resolveRoleAccountKey;
+    /** 列出故事的全部角色端点（含在线状态）。 */
+    listStoryEndpoints(storyId: string): {
+        endpointId: string;
+        platform: string;
+        selfId: string;
+        channelKind: import("./endpoints").EndpointChannelKind;
+        enabled: boolean;
+        online: boolean;
+        lastInboundAt: number;
+    }[];
+    /** 入站反向解析（v3 §三）：accountKey → 端点行；未注册返回 undefined（回落旧路径）。 */
+    resolveInboundEndpointFor(source: {
+        platform: string;
+        selfId: string;
+        userId?: string;
+        groupId?: string;
+        channelId?: string;
+    }): Promise<import("./endpoints").InboundResolution>;
+    /** 条目通道上下文（v3 §十）：注册表命中才返回；未迁移/陌生账号不标注（单平台零影响）。 */
+    private channelMetadataFor;
+    /** 入站触达端点状态：连接在线 + 可投递 + 微信主动资格刷新（v3 §四）。 */
+    private touchEndpointStateInbound;
+    /** 连接器在线状态回写（连接/断开事件；v3 §四 connection 维）。 */
+    noteEndpointConnection(accountKey: string, online: boolean): void;
+    private endpointDriftWarned;
+    /**
+     * M1a 出站地址解析（v3 §五）：注册表命中且启用时以注册表为准，并核对旧字段
+     * （漂移只告警一次）；未命中/注册表未加载时回落旧字段——单平台零影响。
+     * P2-11：同一 owner 多行时不再"取第一行"——优先最近观测过连接的端点，
+     * 平手按 createdAt 稳定排序，并一次性告警（M2 起多端点归因的正确性基础）。
+     */
+    private endpointAddressSync;
+    /** 出站结果回写端点状态（v3 §四 deliverable 维；内存无副作用）。
+     * P2-11：提供 address 时只更新地址匹配的端点——多端点下不串刷兄弟端点。 */
+    private noteEndpointOutbound;
     private worldSeederSweepRunning;
     private worldSeederSweep;
     /** 上下文 payload：环境（时区/季节/世界设定）、历史剧本（压缩摘录）、

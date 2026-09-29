@@ -83,6 +83,50 @@ test('invalidateNarratives cancels timers and clears turns for target story', ()
   assert.equal(groupInvalidated, true)
 })
 
+test('bufferUserNarrative keeps endpoint identity on each message and active batch metadata', () => {
+  const { engine } = fixture()
+  engine.bufferUserNarrative(noopStory, noopParticipant, { content: 'qq' } as any, new Date(), [], 'qq', [], [], undefined, () => {}, 'ep-qq')
+  engine.bufferUserNarrative(noopStory, noopParticipant, { content: 'wechat' } as any, new Date(), [], 'wechat', [], [], undefined, () => {}, 'ep-wx')
+  const turn = engine.getTurn('p1')!
+  assert.deepEqual(turn.messages.map(message => message.endpointId), ['ep-qq', 'ep-wx'])
+  const flushed = engine.beginFlush('p1', 2, () => {})!
+  const batch = flushed.messages.splice(0)
+  flushed.activeBatchEndpointIds = [...new Set(batch.map(message => message.endpointId).filter(Boolean))] as string[]
+  flushed.activeBatchMessageCount = batch.length
+  assert.deepEqual(flushed.activeBatchEndpointIds, ['ep-qq', 'ep-wx'])
+  assert.equal(flushed.activeBatchMessageCount, 2)
+})
+
+test('recordSource keeps the first source after the turn has been created', () => {
+  const { engine } = fixture()
+  engine.recordSource('p1', 'ep-before-buffer', 1)
+  assert.deepEqual(engine.getTurn('p1'), undefined, 'recording before buffering is intentionally a no-op')
+  engine.bufferUserNarrative(noopStory, noopParticipant, { content: '你好' } as any, new Date(), [], '你好', [], [], undefined, () => {})
+  engine.recordSource('p1', 'ep-first', 2)
+  engine.recordSource('p1', 'ep-second', 3)
+  engine.recordSource('p1', 'ep-first', 4)
+  assert.deepEqual(engine.getTurn('p1')!.sources, [
+    { endpointId: 'ep-first', receivedSeq: 2 },
+    { endpointId: 'ep-second', receivedSeq: 3 },
+  ])
+})
+
+test('invalidateNarratives keeps an in-flight owner until endFlush releases narrating', () => {
+  const { engine } = fixture()
+  const session = { content: 'x' } as any
+  engine.bufferUserNarrative(noopStory, noopParticipant, session, new Date(), [], 'x', [], [], undefined, () => {})
+  const turn = engine.beginFlush('p1', 1, () => {})!
+  turn.inFlightRequestId = 1
+  engine.invalidateNarratives('s1')
+  assert.equal(engine.isNarrating('s1'), true)
+  assert.equal(engine.pendingTurnCount(), 1)
+  assert.equal(turn.messages.length, 0)
+  assert.equal(turn.discardedRequestIds.has(1), true)
+  engine.endFlush('p1', 1)
+  assert.equal(engine.isNarrating('s1'), false)
+  assert.equal(engine.pendingTurnCount(), 0)
+})
+
 test('shouldSupersedeRequest pure function covers the three guard conditions', () => {
   // 正常在途：应取代
   assert.equal(shouldSupersedeRequest(5, undefined, new Set()), true)

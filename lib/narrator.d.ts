@@ -292,7 +292,7 @@ export declare function computeTokenCost(record: TokenUsageRecord): {
 /** One human-readable log line: usage numbers, cache hit rate, and optional
  * billing. Absent fields are simply omitted instead of printed as zero. */
 export declare function formatTokenUsageLine(record: TokenUsageRecord): string;
-export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile): string;
+export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile, proactiveContactMode?: 'strict' | 'natural' | 'balanced', channelSelectionEnabled?: boolean): string;
 export declare function writingAffordances(options?: NarrativeRequest['writingOptions']): string;
 /** A guard paragraph rendered into the writing affordances when the host has
  * detected a fixed bubble-count run in her recent delivered replies. */
@@ -329,7 +329,7 @@ export declare function toPromptPayload(request: NarrativeRequest, options?: {
 /** Compact ownership tags for cache-first payloads: one short label replaces the
  * kind/actor/participantId triple. Distinctions the ownership label alone would
  * lose (group posting, platform actions) survive as suffixes. */
-export declare function compactScriptTag(kind: string, actor: string): "user" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member" | "system";
+export declare function compactScriptTag(kind: string, actor: string): "system" | "user" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member";
 export declare function promptVisibleMessageContent(content: string, ownership: RecentScriptOwnership): string;
 export declare function compactPromptEntries(entries: NarrativeRequest['recentEntries'], characterBudget: number, protectedSince?: Date): ScriptEntry[];
 export declare function compactionPrompt(fixedPrompt: string, compactionMainPrompt?: string, compactionFixedPrompt?: string, compactionStylePrompt?: string, specialty?: {

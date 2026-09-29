@@ -54,6 +54,13 @@ export interface StoryState {
     workingDetails?: WorkingDetail[];
     /** Source revisions prevent a delayed background review reopening settled details. */
     workingDetailResolutions?: Record<string, number>;
+    /** 主动联系审计窗（最近 20 条）：每参与者每日上限的计数来源，不进模型上下文。 */
+    proactiveContactLog?: Array<{
+        participantId: string;
+        at: string;
+        endpointId?: string;
+        channelReason?: string;
+    }>;
     /** 压缩器写入的主角注意力状态（busy/asleep/idle）；群聊意愿 auto 档读取。 */
     lifeStatus?: {
         status: 'busy' | 'asleep' | 'idle';
@@ -292,6 +299,15 @@ export interface AgencyConfig {
     maxWindowMinutes: number;
     minimumProactiveIntervalMinutes: number;
     maxCandidateHours: number;
+    /** 主动联系温度：strict=现状（字节不变）；natural/balanced 放宽动机教义、
+     * 意愿阈值与安全间隔。容量门（设备/隐私/负荷）三模式全保。 */
+    contactMode?: 'strict' | 'natural' | 'balanced';
+    /** 非严格模式的意愿阈值（默认 0.25）。 */
+    naturalWillingnessThreshold?: number;
+    /** 非严格模式的安全间隔分钟（默认 30；仅当小于严格间隔时生效）。 */
+    naturalMinimumIntervalMinutes?: number;
+    /** 每参与者每 24 小时主动联系上限，全模式生效（默认 3；0 = 不限）。 */
+    proactiveDailyCap?: number;
 }
 export interface StorySettingOverlay {
     characterProfile?: string;
@@ -508,6 +524,8 @@ export interface IntentUpdateDraft {
 export interface OutgoingMessageDraft {
     participantId: string;
     content: string;
+    /** M3 §八：出站端点——省略 = 本回合来源端点（由 resolveDeliveryTarget 兜底）。 */
+    endpointId?: string;
     /** Attached only to no-current-user background deliveries. */
     automaticDelivery?: Pick<AutomaticDeliverySummary, 'summary' | 'sourceEntryId'>;
     /** The visible reply contract is recorded only after transport succeeds. */
@@ -546,6 +564,8 @@ export interface ConversationActionDraft {
     mode: 'immediate' | 'delayed';
     content: string;
     sendAt?: string;
+    /** M3 §八：模型可选渠道——省略时由最近活跃端点解析（渠道选择审计）。 */
+    endpointId?: string;
     /** 0..1: how strongly the protagonist actually wants to initiate contact now. */
     willingness?: number;
     /** Short audit note explaining the concrete reason for this contact. */
@@ -562,6 +582,41 @@ export interface NarrativeInteraction {
         /** Opaque current-turn message reference; accepted only when the host advertises quote reply. */
         replyTo?: string;
     };
+}
+/** Host-owned channel facts supplied to the writer for one narrative turn.
+ * These values are routing/evidence metadata, not dialogue or story prose. */
+export interface NarrativeChannelData {
+    turnSources?: Array<{
+        endpointId: string;
+        channelKind: 'qq' | 'wechat';
+        receivedSeq: number;
+    }>;
+    /** True only when the currently flushed debounce batch contains multiple endpoints. */
+    batchMultiEndpoint?: boolean;
+    lastEntryChannel?: {
+        endpointId?: string;
+        channelKind?: 'qq' | 'wechat';
+        conversationKind?: 'private' | 'group';
+    };
+    currentChannel?: {
+        endpointId?: string;
+        channelKind?: 'qq' | 'wechat';
+        conversationKind?: 'private' | 'group';
+    };
+    replyEndpoint?: {
+        endpointId?: string;
+        channelKind?: 'qq' | 'wechat';
+    };
+}
+/** Host-filtered transport choice exposed only when multiple channel kinds
+ * are active. endpointId is opaque and may only be copied from this list. */
+export interface NarrativeEndpointOption {
+    endpointId: string;
+    targetId: string;
+    targetKind: 'participant' | 'group';
+    channelKind: 'qq' | 'wechat';
+    conversationKind: 'private' | 'group';
+    online: boolean;
 }
 /** A complete transport field decoded before the streamed narrative script. */
 export interface EarlyNarrativeReply {
@@ -748,6 +803,10 @@ export interface NarrativeRequest {
         groupId: string;
         label: string;
     }>;
+    /** Host-filtered transport choices; omitted in single-platform mode. */
+    availableOutgoingEndpoints?: NarrativeEndpointOption[];
+    /** Enabled when the story has usable endpoints on multiple channel kinds. */
+    channelSelectionEnabled?: boolean;
     /** Sensitive details of other participants are opt-in because the model may be remote. */
     shareParticipantDetails: boolean;
     dueIntents: NarrativeIntent[];
@@ -757,6 +816,8 @@ export interface NarrativeRequest {
     activeConsequences: NarrativeIntent[];
     supersededIntents: NarrativeIntent[];
     recentEntries: ScriptEntry[];
+    /** 主动联系温度（宿主配置直通提示词教义；strict/undefined = 现状）。 */
+    proactiveContactMode?: 'strict' | 'natural' | 'balanced';
     /** Executable writing affordances; prompt and host share the same switches. */
     writingOptions?: {
         messageSeparator: string;
@@ -809,6 +870,8 @@ export interface NarrativeRequest {
     /** Deterministic M4 continuation scaffold; the model cannot directly rewrite it. */
     sceneFrame?: SceneFrame;
     dialogueBurst?: DialogueBurstState;
+    /** Ephemeral host-owned channel metadata; never persisted as story prose. */
+    channelData?: NarrativeChannelData;
 }
 export interface UserReportedTime {
     localTime: string;

@@ -1,5 +1,88 @@
 # 版本记录
 
+## 1.0.1-rc28（2026-09-30）
+
+rc27 以来增量：单剧本多通道 M2/M3/M4 全量落地 + DeepSeek V4.1 修复 + 世界事件架构修订 + 文档补全。
+
+- **多通道 M2/M3/M4**：回合来源端点追踪（`sources`/`activeSources`，flush 转移）；用户端点链接命令（`interlude.participant.link/unlink/endpoints`）；显式端点投递（`ConversationActionDraft.endpointId`，私聊按参与者所有权校验、群按 story-role/group 所有权校验，平台精确匹配 bot）；确定性通道标注五规则（`projectChannelContext` + `NarrativeChannelData`，群聊批缓冲回退）；CHANNELS 作者视角规则 + CHANNEL CONTEXT 宿主元数据规则；多平台端点选择教学（opt-in：注册端点覆盖 ≥2 平台才注入，`availableOutgoingEndpoints` 随载荷投影）。链路修复：来源先建回合后写入、lastEntryChannel 区分有无新入站批、群消息指定端点所有权校验与显式失败、batch-multi-endpoint 独立语义。
+- **DeepSeek V4.1 回复模式 none**：归一化 seen 宽容（漏 seen 不再丢弃整条有效回复、不再误触重写环）；DeepSeek 家族专属 TRANSPORT IS PER-TURN 行（interaction 每回合必需、历史条目不是模板）。standard/full/lite 其余家族提示词字节不变。
+- **世界事件复读架构修订**：反馈环切断（播种器生活摘录排除自身 world-event 产出）；通用世界切面确定性轮换（六方面，任意世界观适用，禁止现实建制移植）；去重视野纳入排期中事件；单轮至多一事件。Jaccard 安全网与提示词规则原样。
+- **文档补全**：command.md 补 `interlude.story.endpoint`（账号迁移唯一显式途径）与 `interlude.reset`；CONFIGURATION_GUIDE 新增 §17 世界播种器与 §18 QQ 空间通道两节。
+- 测试基线：503 项（499 通过 / 0 失败 / 4 环境跳过）；tsc 零错误。
+
+## 世界事件复读架构修复（2026-09-30）
+
+- 用户反馈：世界事件重复率高（同一"宿管贴国庆通知"换皮 4 连）。按"架构层解决、不做下游外部限定"处置：
+- **反馈环切断**：播种器的生活摘录排除自己已注入的 world-event 条目——灵感来源回归她本人的生活，自身产出只留在 recentlySeededEvents 记忆清单，自馈坍缩从结构上不可能。
+- **切面轮换**：六个**通用切面**（天象与环境/居所与近邻/生计与日常事务/亲近之人/途中与陌生人/小意外与际遇）——切面是世界的一个方面而非题材，具体面貌由各剧本 worldSetting 渲染并明令禁止现实建制移植，异世界/古代世界观同等适用；按 (剧本哈希+时间槽) 确定性轮换，相邻两轮必不同、一周期全覆盖、跨剧本相位错开；单轮至多一事件。零新增持久状态。
+- **记忆完整性**：去重视野并入排期中事件（此前事件到点前模型拿到空清单——这正是 45 分钟 4 连的直接通道）。
+- Jaccard 0.6 安全网与提示词规则原样保留。测试 +2（轮换确定性/周期覆盖/跨剧本相位 + 切面提问形态）；全量 503 通过、0 失败、4 跳过。
+
+
+## DeepSeek V4.1 回复模式 none 修复（2026-09-30）
+
+- 用户反馈（beta6-rebuild + deepseek-chat V4.1）：首轮回复正常，后续轮"剧本里写了回复但回复模式 none / 结构化回复缺失"。按"仅 DeepSeek 出问题、不给弱注意力模型通用加料"的原则收窄修复——
+- **宿主侧（非破坏式，零提示词成本）**：`normalizeInteraction` 原先在 `seen` 非布尔时丢弃整个 interaction——V4.1 偶发漏 seen 时，有效 immediate 回复被打成 none，且恰好落进 requiresVisibleReplyRecovery 重写环（模型稳定复现同形态、重写无效）。现 reply 对象有效时 seen 缺省按已读处理，不再丢弃也不再触发无谓重写。
+- **DeepSeek 家族专属行**（familyOverrides.extraAfterPhase，仅 deepseek 家族注入）：`TRANSPORT IS PER-TURN`——interaction 每个活跃回合必需；recentScript 历史回复是纯剧本文本、无传输对象形态，是历史不是模板，禁止照抄或因此视字段可选；`interaction.seen` 为必需布尔。针对缓存命中率高企后纪律随尾段漂移、历史条目形态污染的实测行为。GLM/Kimi/Gemini 等 standard 家族与 full/lite 档提示词字节不变（测试钉死）。
+- 测试：normalize 漏 seen 三例 + deepseek 注入/GLM 不注入/full 原样/lite 不变四档断言；全量 501 通过、0 失败、4 跳过。
+
+
+## M4 链路修复（2026-09-29）
+
+- 修复首条入站消息的回合来源丢失：先创建 TurnEngine 回合再写入 `sources`，首轮通道上下文现在与后续消息一致。
+- 修复通道上下文的“上一条”取值：当前入站条目不再被误当作历史上一条；来源端点集在命中其他通道规则时也会保留。
+- 增加 `channelData` 的类型化 narrator 载荷，并补齐群聊端点回退、同批多端点标记和回复目标端点信息。
+- 重写 `CHANNELS` 提示为作者视角，明确 `incomingEvent.channelContext` 是宿主事实元数据，不是对话指令或新事件。
+- 修复显式 `ConversationActionDraft.endpointId` 在归一化和投递阶段被丢弃的问题，并限制私聊端点只能属于目标参与者；原生平台端点按平台精确匹配。
+- 增加多平台模式探测：仅当当前故事的合法目标端点同时覆盖 QQ 与微信时，才向 narrator 暴露 `availableOutgoingEndpoints` 并启用 `endpointId` 选择契约；单平台（包括同平台多账号）继续使用原有轻量协议。
+- 修复根目录运行端点测试时的相对路径错误；新增首条来源回归测试。插件全量测试：490 通过、0 失败、4 跳过。
+
+## M4 叙事增强（2026-09-29）
+
+- **确定性标注五规则（V3 §十）**：`projectChannelContext()` 纯函数——回合内端点切换（turn.sources>1）/同批多端点/私↔群切换/同人异端连续/回复目标≠来源，命中即注入 `channelContext`（简短标记 `[微信·私]` + 规则列表 + 来源端点集），service 侧从回合 sources + 条目 metadata.channel 提取、经 payload `_channel*` 字段透传到编译器。投递不依赖标注，漏标后果限质感层面。
+- **CHANNELS 常设规则行**：narrator 提示词新增——"同时生活在 QQ 和微信；同一朋友两个平台是同一个人；标记告诉你在哪发生的就在哪回；主动换渠道需要自然动机；不同平台不发重复内容"。
+
+## 仓库统一（2026-09-29）
+
+- **cev 独有功能并入主仓**：`src/works.ts`（SharedWorks 共同作品——252 行纯模块，不可变版本树 + CAS 并发控制 + 独立写手接口）与 `src/specialization.ts`（模型特化——150 行，lite/standard/full 三档合约块 + 家族偏移）已复制到主仓；`interlude_work` 表已注册；4 个纯模块测试 + 6 个 SharedWorks 行为测试全部通过。**narrator/service 的 SharedWorks 集成接线留后续版本**（需要合并 cev 的 narrator 变更到主仓已演化的 narrator，涉及 generateWork 独立写手、内联写作模式等）。模型特化块的 narrator 注入同样待接线。
+- **自本版起主仓为唯一操作目标**：cev 仓转为只读存档，不再接收新功能；桌面壳以 typ0-cev 的 UI_DESIGN_SPEC_V2 实现为标准。
+
+## 工作区（未发布；2026-09-29，M2+M3）
+
+- **M3 出站与主动（v3 §八）**：`OutgoingMessageDraft` / `ConversationActionDraft` 增加 `endpointId?`（省略 = 本回合来源端点）；出站投递显式端点优先（精确匹配该端点 bot，失败回落默认路径不硬断）；主动联系渠道选择——`resolveMostActiveEndpointId()`（最近活跃端点解析：EndpointState.connection.observedAt 最新，无在线取首个启用端点保守尝试）；`proactiveContactLog` 每条记录 `endpointId`（渠道选择审计）。`appendProactiveContact` 签名扩展第 4 参 endpointId，normalizer 透传新字段。
+
+## 工作区（未发布；2026-09-29，M2 机制构建）
+
+- **单剧本多通道 M2（机制构建，零微信依赖）**：用户端点链接——`interlude.participant.link/unlink/endpoints` 命令族，把"同一个人的另一个号"链入既有参与者（participant-user 端点行，一人格一处约束，审计条目）；`sameParticipantEndpoint` 从单点比对升级为**端点集合匹配**（注册表优先，冷表回落旧字段——单平台等价）；回合 sources 语义——`BufferedNarrativeTurn` 增加 `sources: [{endpointId, receivedSeq}]`，入站记录来源端点与接收序号（同回合第二端点追加而非新回合，v3 §七"合并"决策），`recordSource` 幂等且按序号排序；`channelKindForAccount()` 判别函数（onebots 别名路线的唯一通道判别，未注册默认 qq）。测试：12/12 endpoints 专项 + 全量 466 绿。
+
+## 1.0.1-rc27：QQ 空间说说通道、单剧本多通道 M1 与三轮审计修复（2026-09-29）
+
+- **单剧本多通道 M1a（兼容解析层）**：新增 `src/endpoints.ts`（UUID 身份/地址分离、唯一键约束、入站反向解析 accountKey→端点→故事、三维端点状态时效——过期即保守/重启归零）与 `interlude_endpoint` 注册表（双路径建表）；幂等迁移（active 故事/参与者/启用群规则 → 派生端点行）；私聊与群聊入站条目附规范化 `metadata.channel`（注册表未命中不标注）；端点状态随入站刷新；`repairCanonicalOneBotStoryTransport` 改造为注册表优先+投影同步（单角色端点保持漂移自愈，多端点下不再改写故事主身份）。单平台零影响纪律：未命中一律回落旧路径，投递/回合/查找路径未动，迁移只增不改。规格见 [MULTI_CHANNEL_SINGLE_STORY_DESIGN.md](MULTI_CHANNEL_SINGLE_STORY_DESIGN.md) v3。
+- **M1a 收尾（八条出站路径接入）**：`endpointAddressSync` 同步解析器（注册表命中以注册表为准、旧字段漂移只告警一次、冷注册表/未命中回落旧字段）接入四个收口点——`findBotForParticipant`（即时/延迟/主动/分段私聊投递的唯一 bot 收口）、`sendGroupMessage` 兜底分支（实时群会话仍最优先）、`canHandleStory` 白名单判定、`qzoneExecute` 账号选择；出站成功/失败回写端点 deliverable 状态（私聊/群两条链）；`startBackgroundTasks` 预热注册表使同步解析器在首入站前可用。桌面 bridge 出站经同一收口、群成员名查询按实时会话账号——两者由构造保证等价。收口等价性测试锚定（一致=同 bot、冷=旧路径、漂移=注册表优先且告警一次）。
+- **M1 安全审计修复二批（10 项，2026-09-29 三轮审计）**：**P1**——端点/别名全部写入改为**先落库后进内存**（失败不产生"进程内有、重启即无"的幽灵行，增量登记失败置脏由下次 reconcile 重试）；运行期注册表变更经**串行写队列**（并发 add/登记不再叠查后写）；注册表就绪后的解析异常**拒绝入站**（不再回落全局故事查找，堵住陌生账号借数据故障绕过隔离的通道）；qzone `preferSelfId` 改为 **accountKey 精确匹配**（指定未注册账号直接失败，绝不自动切换执行账号）。**P2**——即时会话投递成功回写端点状态（三条私聊路径一致）；投递门控（isEndpointDeliverable）明确声明为 M3 范围、M1/M2 仅展示用；好友动态轮询经注册表选端点并随行 endpointId；群投递状态按实际使用的 bot 归因；群号派生/解析双侧归一化（`group:`/`guild:` 前缀配置不再永不命中）；连接器生命周期事件（bot-status-updated/removed）接入端点在线状态；重复角色端点在解析结果中显式暴露并一次性告警（不再静默取首行）。
+- **M1 安全审计修复（11 项，2026-09-29 二轮审计）**：**P1**——未注册 OneBot 账号在注册表就绪后直接判为无故事（不再经全局 fallback + transport 自愈把主剧本重绑到陌生账号；账号迁移的唯一途径是新命令 `interlude.story.endpoint add/list/disable`）；accountKey 平台隔离（onebot 家族折叠保持历史兼容、原生平台专属前缀，同 selfId 跨平台不再碰撞）；注册表增量登记（建故事/参与者同步 upsert 端点行与别名）+ 单飞锁 + 创建冲突容错；多角色端点时 repair 先查数量、零地址改写、仅刷新命中端点状态；`findParticipant` 注册表 user 端点优先匹配（链接端点与地址变更不再依赖旧字段）。**P2**——别名/端点迁移覆盖 paused 故事；deliverable 确认引入 24h TTL（陈旧的 allowed 按不可投递保守处理）；桌面宿主投递成功同样刷新端点状态；`interlude_qzone_post` 增加 endpointId 列（存量回填 + 限流按端点分桶，历史行保守计入）；多端点出站地址按最近连接观测选取（不再"取第一行"），状态回写按地址收窄。
+- **M1b canonical 别名迁移（零数据搬移方案）**：故事主键保持不动（即"首端点创建时固化"的稳定角色 ID），新增 `interlude_story_alias` 表登记"推导 ID → 既有剧本 ID"重定向；`findStory` 共享模式改为**端点注册表/别名优先于按账号推导**（第二端点与历史形态会话重定向到既有剧本，不再创建平行故事；重定向块带防御性 try/catch，任何异常回落旧路径）；`migrateLegacyStory` 完成搬移后把旧 ID 登记为别名（历史引用可循别名找回）；迁移幂等（与端点同一通道，前后带行数快照审计）；别名解析带双射校验（链式指向/悬空目标一次性告警并忽略）；`interlude.story.alias` 管理命令（列出/`remove <别名ID>` 回滚，回滚写剧本审计条目）。
+
+- **QQ 空间（说说）通道阶段 0+1**：POC 实测 SnowLuma qzone 全部动作（发帖→点赞→删除全链成功；feeds 间歇失败与 appid 噪声两发现已计入设计）；新增 `src/qzone.ts` 通道层（限流门/防御归一化/动作封装/能力探测）、`interlude_qzone_post` 审计表、Console【扩展 16】配置块（默认关闭）、`interlude.qzone` 手动命令（门控→审计→SnowLuma→回写全链）。
+- **QQ 空间决策流（感知-行动分离）**：`qzone-action` 意图类型——主作者在任意回合可排期发帖/评论/点赞（payload 白名单校验，post 默认好友可见、64=仅自己的日记形态；comment/like 从 [好友动态] 条目复制 tid/targetUin），到期排水一锤子执行（成败都完成意图，不回流叙事）；发帖/评论成功写 `[空间动态]` 剧本条目；好友动态轮询（appid=311 过滤 + 时间窗 + feed-seen 去重 + 好友 msg_list 按 tid 精确对齐拉正文，单轮 ≤2 条）写 `[好友动态]` 条目；主提示词新增 qzone-action 意图教学与 SOCIAL SURFACE 规则行（[空间动态]/[好友动态] 均为既成事实，动作只能走意图账本）。
+- **QQ 空间安全审计修复（六项）**：账号严格匹配（指定账号不在线直接失败，绝不落到其他 QQ）；feed-seen 只读标记不再挤占动作配额与最小间隔；限流检查与 pending 预留包进故事串行队列（并发动作原子过门，配额不可突破）；传输类异常与"成功帧无 tid"记 **unknown**（保守计入配额、禁止自动重试非幂等动作）；评论/点赞目标必须来自已入账动态（feed-seen）或自己已发帖（confirmed）的 tid，且 tid 收窄字符集；feed 正文对齐只认 tid 精确命中（移除 ±90s 近似配对，杜绝连发错配）。
+
+## 1.0.1-rc26：九项修复、TurnEngine/Scheduler 模块化与 invalidate 边界（2026-09-29）
+
+- **九项能力/边界修复**：视觉能力漏报（`createVisionDescriber` 走 `visionAvailable()`，仅勾 useForVision 可启用）；世界播种器 Provider 复用路由表规范化（endpoint/protocol/默认参数）；`purgeAllStoryData`/`purgeStoryRange`/`clearDatabase` 全部处理 `interlude_seeded_event`；**任务失效代际**（`runtimeGeneration`/`storyTaskGenerations`：故事清理入故事串行队列，暂停/清库/purge 后旧模型结果不再提交）；世界事件注入 `injecting` 状态可恢复（失败回滚 scheduled，>5 分钟旧 claim 可重处理）；Anthropic 音频路由（原生音频跳过 Messages 协议，主路由不兼容时回退兼容备援）；侧端任务总超时预算（首请求与 JSON 恢复共享 deadline）；群音频批次附件数/字节双上限。
+- **P0 TurnEngine 收编完成**：service.ts 回合状态全部改经 `turn-engine.ts` 方法（buffer/signal/invalidate/hasPending/beginFlush/endFlush/rescheduleTimers），debounce 配置改为 getter 随配置热更新；`shouldSupersedeNarrativeRequest` 委托模块实现。
+- **P1 Scheduler 抽取**：新增 `src/scheduler.ts`——每故事最早到期唤醒（keep-earliest 仲裁 + busy 1s 重排）、独占任务去重门（halted/defer 500ms 让路）、指纹冷却表；`scheduleCompaction`/`scheduleDueIntentWake`/退避全部委托，Phase 1-3 执行体与 generation 校验原样保留。
+- **invalidate 边界修复**：`invalidateNarratives` 在回合**在途**时保留 owner（消息清空、标记 `discardedRequestIds`），由 `endFlush` 正常释放 narrating——否则故事互斥标记永久滞留；flush 守卫 `requeue` 区分用户打断（保留批次）与管理端作废（不复活旧输入）。
+- 验证：typecheck 0 错；测试 420 通过（4 项环境跳过）。
+
+## 1.0.1-rc25：三模式主动联系、投递账本收紧与流式首帧守卫（2026-09-27，先同步 typ-0）
+
+- **主动联系温度**（`agency.contactMode`，默认 strict=现状字节不变）：natural/balanced 在 Agency 教义中追加"想念、好奇近况、想分享此刻也是合法动机（须剧本显示她想到对方；`participants[].lastUserMessageAt` 沉默时长作为事实）"，并放宽意愿阈值（`naturalWillingnessThreshold` 默认 0.25）与安全间隔（`naturalMinimumIntervalMinutes` 默认 30，仅当小于严格间隔时生效）；balanced 额外要求节制使用情感动机。容量硬门（设备/隐私/负荷）与 Urge 爆发间隔优先级三模式不变。
+- **每参与者每日主动联系上限**（`proactiveDailyCap` 默认 3，0=不限，全模式生效）：计数来自 `story.state.proactiveContactLog`（最近 20 条审计窗，不进模型上下文）；触顶不排重查。
+- **投递账本状态机收紧**：`cancelled` 与 `delivered` 同为终态（已撤销行动不被迟到记账复活）；`failed→pending` 重试清除上一轮 `completedAt`。
+- **Anthropic 流式首帧守卫**：网关静默时在 `min(timeout/3, 30s)` 内暴露失败而非耗满总超时。
+- 本版先同步到 typ-0 桌面壳（含 Mixer 界面适配：联系温度/自然阈值/间隔/每日上限/播种器开关与节律/主提示词编辑框 + text 控件渲染 + 联系频率预设联动 contactMode）；2026-09-27 起已安装至 Koishi Desktop 实例；Gitee 最新发布为 rc24。
+
 ## 1.0.1-rc24：播种器配置并入模型用途勾选（2026-09-27）
 
 - 世界播种器的模型选择从独立提供商配置块（worldSeeder.provider 整套表单）改为**模型中心连接行的"用于世界播种"复选框**（`useForWorldSeeding`，与 useForCompaction/useForStickers 并列）：勾选的第一个启用连接即为播种器模型，无勾选连接时总开关无效（功能关闭）。播种器分区仅保留节律参数（间隔/挂起上限/每日上限/最远时限/温度/预算/超时），Console 不再复制一份提供商表单。

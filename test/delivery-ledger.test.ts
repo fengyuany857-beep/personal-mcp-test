@@ -93,6 +93,30 @@ test('M6 ledger reports partial and terminal delivery without downgrading delive
   assert.equal(updateScriptDeliveryActions(complete, second, 'delivered', new Date()), undefined)
 })
 
+test('cancelled is terminal: later bookkeeping cannot revive a withdrawn action', () => {
+  const value = commit()
+  const event = findPrivateOutgoingMessageEvent(value, 'alice')!
+  const reference = deliveryReference(event, 42, 0)!
+  const cancelled = updateScriptDeliveryActions(createScriptDeliveryActions(value), reference, 'cancelled', new Date('2026-09-05T10:00:00.000Z'), 'delivery-target-unavailable')!
+  assert.equal(updateScriptDeliveryActions(cancelled, reference, 'pending', new Date(), 'delivery-unconfirmed-retry-scheduled'), undefined)
+  assert.equal(updateScriptDeliveryActions(cancelled, reference, 'delivered', new Date()), undefined)
+  const segment = cancelled.find(item => item.eventId === event.eventId)!.segments[0]
+  assert.equal(segment.status, 'cancelled')
+  assert.equal(segment.reason, 'delivery-target-unavailable')
+})
+
+test('returning to pending for a retry clears the previous completion timestamp', () => {
+  const value = commit()
+  const event = findPrivateOutgoingMessageEvent(value, 'alice')!
+  const reference = deliveryReference(event, 42, 0)!
+  const failed = updateScriptDeliveryActions(createScriptDeliveryActions(value), reference, 'failed', new Date('2026-09-05T10:00:00.000Z'), 'timeout')!
+  const retried = updateScriptDeliveryActions(failed, reference, 'pending', new Date('2026-09-05T10:00:30.000Z'), 'delivery-unconfirmed-retry-scheduled')!
+  const segment = retried.find(item => item.eventId === event.eventId)!.segments[0]
+  assert.equal(segment.status, 'pending')
+  assert.equal(segment.completedAt, undefined)
+  assert.equal(segment.reason, 'delivery-unconfirmed-retry-scheduled')
+})
+
 test('a successful retry clears an earlier transport failure reason', () => {
   const value = commit()
   const event = findPrivateOutgoingMessageEvent(value, 'alice')!

@@ -1,12 +1,21 @@
 import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { registerTables } from './database'
-import { createWorldSeeder, parseWorldSeedEvents, resolveWorldSeederRuntime, validateSeedEvent, type SeedValidationInput, type WorldSeeder } from './world-seeder'
+import { appendProactiveContact, countProactiveContactsInWindow } from './story-state'
+import { createWorldSeeder, parseWorldSeedEvents, resolveWorldSeederRuntime, seedDomainForRun, validateSeedEvent, type SeedValidationInput, type WorldSeedDomain, type WorldSeeder } from './world-seeder'
+import { callQzoneAction, evaluateQzoneGate, matchQzoneFeedContent, normalizeQzoneFeedEntry, normalizeQzoneMsgEntry, probeQzoneAvailable, qzoneFeedCandidates, qzoneIntentFromPayload, qzoneRecordsForEndpoint, qzoneVisibilityLabel, resolveQzoneConfig, QzoneActionError, type QzoneActionCaller, type QzoneActionKind, type QzoneConfig, type QzoneFeedEntry, type QzonePostRecord } from './qzone'
+import {
+  channelContextMetadata, deriveGroupEndpoint, deriveParticipantUserEndpoint, deriveStoryRoleEndpoint,
+  endpointAccountKey, endpointUniqueKey, freshEndpointState, normalizeEndpointRow, normalizeStoryAliasRow, resolveInboundEndpoint, resolveStoryAlias,
+  stateAfterConnection, stateAfterInbound, stateAfterOutbound,
+  type EndpointRow, type EndpointState, type StoryAliasRecord,
+} from './endpoints'
 import type { SeededWorldEvent } from './types'
 import { HealthMonitor } from './health'
 import { contactEvidenceThreads, knowledgeClauses, knowledgeRelatedIds, legacyConditionCue, normalizeKnowledgeEvidence, supportsRecordedOutcome } from './script/knowledge-evidence'
 import { readFile, readdir, stat } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createTurnEngine, shouldSupersedeRequest, type TurnEngine, type TurnBufferedNarrativeTurn as BufferedNarrativeTurn, type TurnBufferedUserMessage as BufferedUserMessage } from './turn-engine'
+import { createScheduler, type Scheduler } from './scheduler'
 import { UrgeConfig, resolveUrgeConfig, normalizeUrgeState, urgeUserEvent, planUrge, commitUrge, acknowledgeUrge, urgeBurstActive } from './urge'
 import { extname, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -63,7 +72,7 @@ import {
   ChatActionCapabilities, ChatReactionName, FollowUpCommitmentDraft, FollowUpResolutionDraft, LocalMediaDraft, MessageReactionDraft, NativeFaceSemantic, StickerAsset, StickerCatalogEntry,
   EarlyNarrativeReply, IndexedQuotedMessageContext, QuotedMessageContext, SchedulePreplanRecord, SchedulePreplanReviewRequest,
   PreviousSceneSummary, RecalledMoment, WorkingDetail, TimelinePlan, TimelinePlanRequest, UserReportedTime,
-  DialogueBurstState, SceneFrame,
+  DialogueBurstState, SceneFrame, NarrativeChannelData, NarrativeEndpointOption,
 } from './types'
 import type { DesktopInboundEvent, DesktopRuntimePhase } from './desktop-bridge'
 
@@ -270,11 +279,6 @@ interface PreparedCompactionRun {
   fingerprint: string
 }
 
-interface CompactionBackoff {
-  fingerprint: string
-  until: number
-}
-
 type PreparedCompaction = PreparedCompactionSkip | PreparedCompactionRun
 
 // Only QQ/OneBot CDN hosts are fetched in the native-vision path. This keeps
@@ -300,6 +304,8 @@ export interface Config {
   browser?: BrowserConfig
   /** 世界事件播种器：独立提供商配置块；未选模型即视为关闭。 */
   worldSeeder?: unknown
+  /** QQ 空间（说说）通道：SnowLuma qzone 扩展动作的限流与审计。 */
+  qzone?: unknown
   /** 顶层主提示词（Console 最底部）：非空时覆盖 model.mainPrompt。 */
   mainPrompt?: string
   /** Optional OneBot/NapCat account gate. It only affects the onebot platform. */
@@ -564,11 +570,12 @@ interface BufferedGroupTurn {
   rule: GroupChatRule
   channelId: string
   latestSession?: Session
-  messages: (GroupMessageContext & { audioSources?: string[], audioSession?: Session })[]
+  messages: (GroupMessageContext & { audioSources?: string[], audioSession?: Session, endpointId?: string })[]
   timer?: () => void
   revision: number
   mentionedBot: boolean
   quotedBot: boolean
+  activeBatchEndpointIds?: string[]
 }
 
 export interface ExecutableMessageReaction extends MessageReactionDraft {
@@ -584,11 +591,6 @@ interface GroupDeliveryResult {
   deliveredSegments: string[]
   complete: boolean
   segmentOutcomes: Array<{ index: number; content: string; status: 'delivered' | 'failed'; reason?: string }>
-}
-
-interface DueIntentWake {
-  cancel: () => void
-  dueAt: number
 }
 
 export interface StoryDefaults {
@@ -645,6 +647,7 @@ export class InterludeService extends Service {
   private compactor: NarrativeCompactor
   private worldSeeder: WorldSeeder = { available: false, generate: async () => { throw new Error('世界播种器未配置。') } }
   private worldSeederRuntime = resolveWorldSeederRuntime(undefined)
+  private qzoneRuntime = resolveQzoneConfig(undefined)
   private embedder: NarrativeEmbedder
   private stickerDescriber: StickerDescriber
   private visionDescriber: VisionDescriber
@@ -670,8 +673,6 @@ export class InterludeService extends Service {
   private timelineBackoff = new Map<string, { from: number; until: number }>()
   /** Consecutive timeline-director failures per story; drives exponential backoff and the fuse. */
   private timelineDirectorFailures = new Map<string, number>()
-  /** Per-story guard for a failed/partially persisted scene compaction. */
-  private compactionBackoff = new Map<string, CompactionBackoff>()
   private stickerById = new Map<string, StickerAsset>()
   private stickerScanRunning = false
   /**
@@ -679,21 +680,27 @@ export class InterludeService extends Service {
    * 取消旧延迟回复”可能与定时发送同时发生，造成过期消息仍被发出。
    */
   private queues = new Map<string, Promise<unknown>>()
-  private turnEngine!: TurnEngine
+  private turnEngine!: TurnEngine   // P0: 回合状态管理已抽出至 turn-engine.ts
+  private scheduler!: Scheduler     // P1: 到期唤醒/独占任务/指纹冷却已抽出至 scheduler.ts
+  /** 端点注册表内存缓存（M1a）：行来自 interlude_endpoint；状态为进程内三维时效。 */
+  private endpointRows: EndpointRow[] = []
+  private endpointStates = new Map<string, EndpointState>()
+  private endpointRegistryReady = false
+  /** M1b 剧本别名缓存（interlude_story_alias），随注册表一同加载。 */
+  private storyAliasRows: StoryAliasRecord[] = []
+  /** M2 §1.3：入站接收序号（进程内单调递增；双端点回合排序依据）。 */
+  private inboundSeq = 0
+  private storyAliasProblems = new Set<string>()
   private bufferedGroupTurns = new Map<string, BufferedGroupTurn>()
   /** Short-lived group-member display names. QQ number remains the stable key. */
   private groupMemberNameCache = new Map<string, { name: string, expiresAt: number }>()
   private groupMemberNameLookups = new Map<string, Promise<string>>()
   /** Ephemeral, per-group willingness score. It never touches private turns or durable story state. */
   private groupWillingness = new Map<string, GroupWillingnessState>()
-  /** Earliest wake-up for persisted typing segments; one timer per story. */
-  private dueIntentWakeTimers = new Map<string, DueIntentWake>()
   /** Synchronously marks a relationship whose current typing chain was interrupted by new input. */
   private interruptedTypingParticipants = new Set<string>()
   /** Prevent a background life turn from racing an unlocked live model call. */
   private factBackfills = new Set<string>()
-  /** Coalesce repeated post-turn compaction requests into one queued pass. */
-  private scheduledCompactions = new Set<string>()
   /** Coalesce low-frequency atmosphere analysis without delaying the visible reply. */
   private scheduledAlterAnalyses = new Set<string>()
   /** sql.js/SQLite has one writable connection; serialize writes globally. */
@@ -706,6 +713,11 @@ export class InterludeService extends Service {
   private readonly serviceLogger: Logger
   private backgroundStarted = false
   private databaseResetting = false
+  /** Invalidates model work that was prepared against a story before purge,
+   * pause, or a runtime reset. The token is in-memory and intentionally does
+   * not become part of the story schema. */
+  private runtimeGeneration = 0
+  private storyTaskGenerations = new Map<string, number>()
   private sweepRunning = false
   private compactionSweepRunning = false
   private blindModeHealthIssue = false
@@ -767,11 +779,23 @@ export class InterludeService extends Service {
     this.visionDescriber = createVisionDescriber(ctx, config.model, this.blindModeConfig.enabled, onUsage, this.modelRouting)
     // 播种器模型来自模型中心的“用于世界播种”勾选（useForWorldSeeding）；
     // 无勾选连接即视为关闭——不再单独复制一份提供商配置。
-    const seederProvider = (config.model.providers ?? []).find(provider => provider.enabled !== false && provider.useForWorldSeeding === true && provider.model?.trim())
+    const rawSeederProvider = (config.model.providers ?? []).find(provider => provider.enabled !== false && provider.useForWorldSeeding === true && provider.model?.trim())
+    // World seeding uses the same connection rows as the other model tasks.
+    // Resolve the row through the routing table so official presets receive
+    // their normalized endpoint/protocol/defaults before any request is made.
+    const seederProvider = rawSeederProvider
+      ? this.modelRouting.providers.find(provider => provider.id === rawSeederProvider.id)
+        ?? this.modelRouting.providers[(config.model.providers ?? []).indexOf(rawSeederProvider)]
+      : undefined
     this.worldSeederRuntime = resolveWorldSeederRuntime(config.worldSeeder, seederProvider)
     if (this.worldSeederRuntime.enabled) {
       this.worldSeeder = createWorldSeeder(ctx, config.model, this.worldSeederRuntime, onUsage)
       this.reportStandaloneOperation('standard', 'info', '世界播种器已启用 模型=%s 间隔=%d分钟', this.worldSeederRuntime.provider?.model, this.worldSeederRuntime.cadenceMinutes)
+    }
+    // QQ 空间通道：限流参数来自 Console；实际可用性在首次动作时探测（SnowLuma 离线则优雅关闭）。
+    this.qzoneRuntime = resolveQzoneConfig(config.qzone as Partial<QzoneConfig> | undefined)
+    if (this.qzoneRuntime.enabled) {
+      this.reportStandaloneOperation('standard', 'info', 'QQ 空间通道已启用 发帖/评论/点赞上限=%d/%d/%d 最小间隔=%d分钟', this.qzoneRuntime.dailyPostCap, this.qzoneRuntime.dailyCommentCap, this.qzoneRuntime.dailyLikeCap, this.qzoneRuntime.minIntervalMinutes)
     }
     // P2 Fix: 侧端任务成败上报到健康面板——注册必须在 narrator/compactor 创建之后，
     // 参数签名为 (task, ok)。narrator 和 compactor 是独立实例，都要注册。
@@ -787,14 +811,28 @@ export class InterludeService extends Service {
     // Defer timer registration by one event-loop turn. This keeps Console
     // plugin load/reload responsive while preserving the same background work.
     // TurnEngine：回合状态管理（缓冲回合容器 + narrating 标记）集中于此，
-    // service 仅通过 turnEngine.turns / turnEngine.narrating 访问。
-    this.turnEngine = createTurnEngine({
-      setTimeout: (fn: () => void, ms: number) => this.ctx.setTimeout(fn, ms),
-      userMessageDebounceSeconds: this.config.runtime.userMessageDebounceSeconds ?? 2,
-      reportOperation: (level: string, kind: string, story: InterludeStory, phase: string, message: string, ...args: unknown[]) => {
-        this.reportOperation(level as 'summary' | 'standard' | 'diagnostic', kind as 'error' | 'warn' | 'info' | 'debug', story, phase as NarrativeRequest['phase'], message, ...args)
-      },
-    })
+    // service 通过工厂返回的方法访问；getter 保证 debounce 秒数随配置热更新。
+    {
+      const service = this
+      this.turnEngine = createTurnEngine({
+        setTimeout: (fn: () => void, ms: number) => this.ctx.setTimeout(fn, ms),
+        get userMessageDebounceSeconds() { return service.config.runtime.userMessageDebounceSeconds ?? 2 },
+        reportOperation: (level: string, kind: string, story: InterludeStory, phase: string, message: string, ...args: unknown[]) => {
+          this.reportOperation(level as 'summary' | 'standard' | 'diagnostic', kind as 'error' | 'warn' | 'info' | 'debug', story, phase as NarrativeRequest['phase'], message, ...args)
+        },
+      })
+    }
+    // P1: Scheduler 初始化——到期唤醒/独占任务/指纹冷却的最小依赖注入
+    {
+      const service = this
+      this.scheduler = createScheduler({
+        setTimeout: (fn: () => void, ms: number) => this.ctx.setTimeout(fn, ms),
+        retryDelayMs: Time.second,
+        deferDelayMs: 500,
+        onWakeError: error => service.reportStandaloneOperation('diagnostic', 'debug', '到期消息唤醒失败 错误=%s', error),
+        onTaskError: error => service.reportStandaloneOperation('diagnostic', 'debug', '记忆压缩跳过 错误=%s', error),
+      })
+    }
     ctx.setTimeout(() => this.startBackgroundTasks(), 0)
     // The logger target may not be installed yet during plugin construction;
     // emit a second lifecycle record after Koishi is ready so it is visible in
@@ -807,12 +845,28 @@ export class InterludeService extends Service {
   private startBackgroundTasks() {
     if (this.backgroundStarted) return
     this.backgroundStarted = true
+    activeServiceForEndpoints = this  // M2：sameParticipantEndpoint 集合匹配读注册表
+    // M1a：预热端点注册表——同步解析器（出站收口）在首个入站前就有缓存可用。
+    void this.ensureEndpointRegistry().catch(error => this.reportStandalone('warn', '端点注册表预热失败 错误=%s', error))
+    // P2-9：连接器生命周期接入端点在线状态——连接/断开即时回写，不再只靠
+    // 出入站间接刷新（管理命令显示的在线状态因此不再滞后）。
+    this.ctx.on('bot-status-updated', bot => {
+      try { this.noteEndpointConnection(endpointAccountKey(bot.platform, String(bot.selfId ?? '')), String(bot.status) === 'active') } catch { /* 生命周期回调不抛错 */ }
+    })
+    this.ctx.on('bot-removed', bot => {
+      try { this.noteEndpointConnection(endpointAccountKey(bot.platform, String(bot.selfId ?? '')), false) } catch { /* 同上 */ }
+    })
     // Life advancement and memory compaction are both serialized per story.
     const sweepInterval = Math.max(1, this.config.runtime.sweepIntervalMinutes)
     this.ctx.setInterval(() => void this.sweep().catch(error => this.reportStandalone('warn', '后台推进失败 错误=%s', error)), sweepInterval * Time.minute)
     if (this.memoryConfig.enabled || this.schedulePreplanConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('warn', '后台整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
     if (this.worldSeederRuntime.enabled && this.worldSeeder.available) {
       this.ctx.setInterval(() => void this.worldSeederSweep().catch(error => this.reportStandalone('warn', '世界播种器运行失败 错误=%s', error)), this.worldSeederRuntime.cadenceMinutes * Time.minute)
+    }
+    // 好友动态轮询：感知窗口的一半作节律（15~60 分钟夹取），单次最多入账 2 条。
+    if (this.qzoneRuntime.enabled) {
+      const feedPollMinutes = Math.min(60, Math.max(15, Math.round(this.qzoneRuntime.feedWindowMinutes / 2)))
+      this.ctx.setInterval(() => void this.qzoneFeedSweep().catch(error => this.reportStandalone('warn', 'QQ 空间动态轮询失败 错误=%s', error)), feedPollMinutes * Time.minute)
     }
     if (this.blindModeConfig.enabled) {
       this.ctx.setInterval(() => this.reportBlindModeHealth(), this.blindModeConfig.healthReportMinutes * Time.minute)
@@ -836,10 +890,12 @@ export class InterludeService extends Service {
   setDesktopDeliveryHandler(handler?: InterludeService['desktopDeliveryHandler']) { this.desktopDeliveryHandler = handler }
   getDesktopRuntimePhase() { return this.desktopRuntimePhase }
   async setDesktopRuntimePhase(phase: DesktopRuntimePhase) {
+    if (phase === 'paused' && this.desktopRuntimePhase !== 'paused') {
+      this.runtimeGeneration += 1
+    }
     this.desktopRuntimePhase = phase
     if (phase === 'paused') {
-      for (const timer of this.dueIntentWakeTimers.values()) timer.cancel()
-      this.dueIntentWakeTimers.clear()
+      this.scheduler.cancelWakes()
       for (const turn of this.turnEngine.turns.values()) {
         if (turn.timer) turn.timer()
         turn.timer = undefined
@@ -851,11 +907,7 @@ export class InterludeService extends Service {
     } else if (phase === 'running') {
       // Resume only turns which were already persisted before pause. This
       // avoids both losing a message and manufacturing a new user event.
-      for (const [key, turn] of this.turnEngine.turns) {
-        if (turn.timer || turn.inFlightRequestId || !turn.messages.length) continue
-        const revision = ++turn.nextRevision
-        turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), 0)
-      }
+      this.turnEngine.rescheduleTimers((key, revision) => void this.flushBufferedNarrative(key, revision))
       for (const [key, turn] of this.bufferedGroupTurns) {
         if (turn.timer || !turn.messages.length) continue
         const revision = ++turn.revision
@@ -1098,13 +1150,52 @@ export class InterludeService extends Service {
     if (!isOneBotPlatform(story.platform)) return true
     const config = this.config.onebot
     if (!config?.enabled) return true
-    return isEnabledAccount(config.botAccounts, normalizeAccountId(story.selfId))
+    // M1a：白名单账号判定经端点注册表解析（路径 6/8 的账号归因同源）。
+    const address = this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
+    return isEnabledAccount(config.botAccounts, normalizeAccountId(address.selfId))
   }
 
   async findStory(session: Session) {
     if (this.sharedStoryConfig.enabled) {
       // Shared mode deliberately has one canonical active story in the whole
       // Koishi instance. Sandbox and OneBot must not run parallel lives.
+      // M1b（v3 §三/§六）+ M1 审计修复 P1-1：端点注册表与别名先于"按账号推导
+      // ID"；注册表就绪后，未注册的 OneBot 账号直接判为无故事——绝不落到
+      // 全局 fallback，也不触发 transport 自愈改绑（那会把主剧本绑到陌生
+      // 账号上）。账号迁移只能经 interlude.story.endpoint add 显式完成。
+      if (session.selfId && isOneBotPlatform(session.platform)) {
+        try {
+          const endpointHit = await this.resolveInboundEndpointFor({ platform: session.platform, selfId: String(session.selfId) })
+          const redirectId = endpointHit?.roleEndpoint.ownerId
+            ?? await this.resolveStoryIdAlias(storyIdForCharacter(session.platform, session.selfId))
+          if (redirectId) {
+            const redirected = (await this.getCanonicalStory(redirectId)) ?? await this.getPausedStory(redirectId)
+            if (redirected) {
+              const repaired = await this.repairCanonicalOneBotStoryTransport(redirected, session)
+              await this.migrateLegacyBranchIntoShared(repaired, session)
+              return repaired
+            }
+          }
+          if (this.endpointRegistryReady) {
+            // v3 §三边界行为：陌生账号不自动挂载。注册表就绪意味着所有既有
+            // 故事的账号都已登记——此刻的 miss 是真正的未知账号。
+            const warnKey = `unknown-account:${session.platform}:${session.selfId}`
+            if (!this.storyAliasProblems.has(warnKey)) {
+              this.storyAliasProblems.add(warnKey)
+              this.reportStandalone('warn', '未注册的 OneBot 账号发来消息，已拒绝挂载到主剧本（如需迁移账号请用 interlude.story.endpoint add）账号=%s 平台=%s', session.selfId, session.platform)
+            }
+            return undefined
+          }
+        } catch (error) {
+          // P1-3：注册表已就绪后的解析异常=数据/存储故障，拒绝本次入站（不落
+          // 全局 fallback，防止陌生账号绕过隔离触发重绑）；仅冷启动（注册表
+          // 自身未能加载）时回落旧路径维持可用性。
+          if (this.endpointRegistryReady) {
+            this.reportStandalone('warn', '端点解析异常，已拒绝本次入站（不回落全局故事查找）账号=%s 错误=%s', session.selfId, error)
+            return undefined
+          }
+        }
+      }
       let existing = await this.getCanonicalStory(storyIdForCharacter(session.platform, session.selfId))
       if (!existing) {
         // 暂停中的故事对 active-only 的主查询不可见，但管理命令（resume/
@@ -1169,6 +1260,15 @@ export class InterludeService extends Service {
   async findParticipant(session: Session, story?: InterludeStory) {
     const resolved = story ?? await this.findStory(session)
     if (!resolved) return undefined
+    // M1 审计修复 P1-6：注册表 user 端点优先——链接端点与地址变更后的匹配
+    // 不再依赖旧字段；未命中/异常回落旧字段比对（单平台等价）。
+    try {
+      const hit = await this.resolveInboundEndpointFor({ platform: session.platform, selfId: String(session.selfId ?? resolved.selfId), userId: String(session.userId ?? '') })
+      if (hit?.userEndpoint) {
+        const participant = await this.getParticipant(hit.userEndpoint.ownerId)
+        if (participant && participant.storyId === resolved.id && participant.status === 'active') return participant
+      }
+    } catch { /* 回落旧匹配 */ }
     // Participant ids from older betas were global to a bot/user pair.  Do
     // not trust that id alone: when shared mode is toggled or a legacy branch
     // is being migrated, the same pair can temporarily exist under another
@@ -1215,6 +1315,9 @@ export class InterludeService extends Service {
       return raced
     }
     await this.ensureContinuity(story, now)
+    // P1-2：新建故事同步登记角色端点与别名——findStory 的陌生账号拒绝
+    // （P1-1）依赖"本故事账号必然已注册"这一不变式。
+    await this.registerStoryRoleEndpointRow({ id: story.id, platform: story.platform, selfId: story.selfId })
     if (session.isDirect) await this.ensureParticipant(story, session, now)
     await this.appendEntry(story.id, {
       kind: 'setup', actor: 'system', content: `The story begins with ${setting.character.name}.`,
@@ -1347,6 +1450,8 @@ export class InterludeService extends Service {
       if (!raced) throw error
       return raced
     }
+    // P1-2：新参与者同步登记用户端点——入站匹配（P1-6）依赖注册表先行。
+    await this.registerParticipantUserEndpointRow({ id: participant.id, platform: participant.platform, selfId: participant.selfId, userId: participant.userId })
     await this.appendEntry(story.id, {
       kind: 'participant-joined', actor: 'system',
       content: `${participant.displayName} entered the character's relationship network.`,
@@ -1565,7 +1670,21 @@ export class InterludeService extends Service {
    * Console configuration, so an old profile cannot survive in later prompts.
    */
   async purgeAllStoryData(storyId: string) {
+    if (typeof (this as any).purgeAllStoryDataUnlocked !== 'function') {
+      this.invalidateBufferedNarratives(storyId)
+      this.invalidateHistoryVectors(storyId)
+      // Compatibility path for prototype-level migration tests and older
+      // embedders that only provide the original purge surface.
+      if (typeof (this as any).purgeTable === 'function') await (this as any).purgeTable('interlude_script_entry', { storyId }, {})
+      return
+    }
+    const run = () => this.purgeAllStoryDataUnlocked(storyId)
+    return typeof (this as any).serial === 'function' ? this.serial(storyId, run) : run()
+  }
+
+  private async purgeAllStoryDataUnlocked(storyId: string) {
     this.invalidateBufferedNarratives(storyId)
+    this.invalidateStoryTasks(storyId)
     // Fix#3: 软删后历史向量缓存必须失效，否则语义召回继续注入已删除内容直至重启。
     this.invalidateHistoryVectors(storyId)
     await this.purgeTable('interlude_script_entry', { storyId }, {
@@ -1580,6 +1699,7 @@ export class InterludeService extends Service {
     await this.purgeTable('interlude_overlay_snapshot', { storyId }, { status: 'superseded', summary: '[管理员已删除 overlay 归档]', majorEvents: [], sourcePatchIds: [] })
     await this.purgeTable('interlude_web_observation', { storyId }, { status: 'deleted', url: '', title: '', excerpt: '', summary: '[管理员已删除网页观察]' })
     await this.purgeTable('interlude_schedule_preplan', { storyId }, { regimes: [], exceptions: [], materializedDays: [], validFrom: '1970-01-01', validThrough: '1970-01-01', lastReviewedLocalDate: '', reviewReason: '[管理员已删除 Schedule Preplan]' })
+    await this.purgeTable('interlude_seeded_event', { storyId }, { status: 'expired', summary: '[管理员已删除世界事件]', sourcePayload: {}, subjects: [] })
     const now = new Date()
     const story = await this.getStory(storyId)
     const setting = this.initialStorySetting()
@@ -1624,6 +1744,7 @@ export class InterludeService extends Service {
   async clearDatabase() {
     if (this.databaseResetting) throw new Error('HDSI 数据库清空已经在进行中。')
     this.databaseResetting = true
+    this.invalidateStoryTasks()
     // 竞态屏障：等待在途模型回合完成——否则正在飞行的模型调用会把含旧记忆的
     // 剧本写入刚清过的数据库，下次调用读到"幽灵记忆"。
     const inFlightKeys = []
@@ -1644,7 +1765,7 @@ export class InterludeService extends Service {
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
       'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
-      'interlude_participant', 'interlude_story',
+      'interlude_participant', 'interlude_seeded_event', 'interlude_story',
     ] as const
     let removed = 0
     let logicallyCleared = 0
@@ -1679,7 +1800,9 @@ export class InterludeService extends Service {
                           ? { status: 'deleted', url: '', title: '', excerpt: '', summary: '[HDSI 数据库已清空]' }
                         : table === 'interlude_schedule_preplan'
                           ? { regimes: [], exceptions: [], materializedDays: [], validFrom: '1970-01-01', validThrough: '1970-01-01', lastReviewedLocalDate: '', reviewReason: '[HDSI 数据库已清空]' }
-                        : { status: 'rejected', proposedValue: '[HDSI 数据库已清空]', evidence: '' }
+                          : table === 'interlude_seeded_event'
+                            ? { status: 'expired', summary: '[HDSI 数据库已清空]', sourcePayload: {}, subjects: [] }
+                          : { status: 'rejected', proposedValue: '[HDSI 数据库已清空]', evidence: '' }
           await this.dbSet(table, key, fallback)
           logicallyCleared++
         }
@@ -1693,7 +1816,13 @@ export class InterludeService extends Service {
 
   /** Remove script and derived memory records whose timestamps overlap a range. */
   async purgeStoryRange(storyId: string, from: Date, to: Date) {
+    const run = () => this.purgeStoryRangeUnlocked(storyId, from, to)
+    return typeof (this as any).serial === 'function' ? this.serial(storyId, run) : run()
+  }
+
+  private async purgeStoryRangeUnlocked(storyId: string, from: Date, to: Date) {
     this.invalidateBufferedNarratives(storyId)
+    this.invalidateStoryTasks(storyId)
     this.invalidateHistoryVectors(storyId)
     const inRange = (value: Date | null | undefined) => !!value && value >= from && value <= to
     const entries = await this.dbGet('interlude_script_entry', { storyId })
@@ -1742,6 +1871,13 @@ export class InterludeService extends Service {
       }
     }
 
+    const seededEvents = await this.dbGet('interlude_seeded_event', { storyId })
+    for (const event of seededEvents) {
+      if (inRange(event.createdAt) || inRange(event.occursAt) || inRange(event.updatedAt)) {
+        await this.purgeTable('interlude_seeded_event', { id: event.id }, { status: 'expired', summary: '[管理员已删除世界事件]', sourcePayload: {}, subjects: [] })
+      }
+    }
+
     if (entryIds.size) {
       await this.dbSet('interlude_schedule_preplan', { storyId }, {
         lastReviewedLocalDate: '', validThrough: '1970-01-01', reviewReason: 'Source range was purged; Schedule Preplan requires review.', updatedAt: new Date(),
@@ -1786,6 +1922,10 @@ export class InterludeService extends Service {
         this.seenIncomingMessages.delete(oldest)
       }
     }
+    // M1a 端点层：群消息同样先在队列外解析（群端点），命中才标注与刷状态。
+    const groupSource = { platform: session.platform, selfId: String(session.selfId ?? story.selfId), groupId: String(groupId), channelId: String(session.channelId ?? '') }
+    const groupChannelMeta = await this.channelMetadataFor(groupSource, { groupId: groupSource.groupId, channelId: groupSource.channelId })
+    await this.touchEndpointStateInbound(groupSource)
     const accepted = await this.serial(story.id, async () => {
       const current = await this.getStory(story!.id)
       const entry = await this.appendEntry(current.id, {
@@ -1793,6 +1933,7 @@ export class InterludeService extends Service {
         occurredAt: now.toISOString(),
         metadata: {
           groupId, senderId, senderName, channelId: session.channelId, messageId: session.messageId,
+          ...(groupChannelMeta ? { channel: groupChannelMeta } : {}),
           ...(quote ? { quote } : {}),
         },
       }, now)
@@ -1803,9 +1944,9 @@ export class InterludeService extends Service {
     this.bufferGroupMessage(story, rule, session, {
       senderId, senderName, speaker: formatGroupSpeaker(senderName, senderId),
       ...(messageId ? { messageId, messageRef: groupMessageRef(accepted.id) } : {}),
-      ...(quote ? { quote } : {}),
-      content: messageContent, occurredAt: now, direction: 'user',
-    }, mentionedBot, quotedBot, audioSources)
+        ...(quote ? { quote } : {}),
+        content: messageContent, occurredAt: now, direction: 'user',
+      }, mentionedBot, quotedBot, audioSources, groupChannelMeta?.endpointId)
     this.reportOperation('summary', 'info', story, 'user-message', '收到群聊消息 群=%s 发送者=%s', groupId, senderId)
     return true
   }
@@ -1857,6 +1998,18 @@ export class InterludeService extends Service {
     this.signalIncomingInterruption(story, participant)
     const forward = await this.readForward(session)
     const userInput = this.describeUserEvent(story, session, forward)
+    // M1a 端点层（解析在故事队列外）：注册表命中才标注通道上下文/刷新端点状态，
+    // 未迁移或陌生账号不产生任何变化——单平台行为与现状一致。
+    const inboundSource = { platform: session.platform, selfId: String(session.selfId ?? story.selfId), userId: String(session.userId ?? participant.userId ?? '') }
+    const channelMeta = await this.channelMetadataFor(inboundSource, { userId: inboundSource.userId })
+    await this.touchEndpointStateInbound(inboundSource)
+    // M2 §1.3：来源必须在回合创建后写入。此前这里先 recordSource、后
+    // bufferUserNarrative，TurnEngine 找不到尚未创建的 turn，首条消息的
+    // source 会静默丢失，导致首轮通道标注和后续路由上下文为空。
+    const inboundResolution = await this.resolveInboundEndpointFor(inboundSource)
+    const inboundEndpointId = inboundResolution?.userEndpoint?.id ?? inboundResolution?.roleEndpoint?.id ?? 'unknown'
+    this.inboundSeq += 1
+    const inboundReceivedSeq = this.inboundSeq
     this.reportOperation('summary', 'info', story, 'user-message', '收到参与者私聊消息 参与者=%s', participant.id)
     if (this.config.logging?.logMessageContent) {
       this.reportOperation('diagnostic', 'info', story, 'user-message', '用户消息内容：%s', userInput.content.slice(0, this.config.logging.previewLength))
@@ -1878,6 +2031,7 @@ export class InterludeService extends Service {
         kind: 'user-message', actor: 'user', content: userInput.content,
         occurredAt: now.toISOString(), metadata: {
           platform: session.platform, messageId: session.messageId, personId: incomingParticipant.personId,
+          ...(channelMeta ? { channel: channelMeta } : {}),
           ...(userInput.sources.length ? { imageCount: userInput.sources.length } : {}),
           ...(userInput.audioSources.length ? { audioCount: userInput.audioSources.length } : {}),
           ...(userInput.quote ? { quote: userInput.quote } : {}),
@@ -1889,7 +2043,8 @@ export class InterludeService extends Service {
       return { story: current, participant: incomingParticipant, now, superseded }
     })
     if (!accepted) return false
-    this.bufferUserNarrative(accepted.story, accepted.participant, session, accepted.now, accepted.superseded, userInput.content, userInput.sources, userInput.audioSources, userInput.quote)
+    this.bufferUserNarrative(accepted.story, accepted.participant, session, accepted.now, accepted.superseded, userInput.content, userInput.sources, userInput.audioSources, userInput.quote, inboundEndpointId)
+    this.turnEngine.recordSource(accepted.participant.id, inboundEndpointId, inboundReceivedSeq)
     if (userInput.sources.length) {
       this.reportOperation('standard', 'info', accepted.story, 'user-message', '当前事件包含图片附件 数量=%d 原生识图=%s', userInput.sources.length, this.config.model.vision?.enabled ? '开启' : '关闭')
     }
@@ -1930,7 +2085,7 @@ export class InterludeService extends Service {
     }
   }
 
-  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean, audioSources: string[] = []) {
+  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean, audioSources: string[] = [], endpointId?: string) {
     const key = `${story.id}:${normalizeGroupId(rule.groupId)}`
     const existing = this.bufferedGroupTurns.get(key)
     const turn: BufferedGroupTurn = existing ?? {
@@ -1941,7 +2096,7 @@ export class InterludeService extends Service {
     turn.channelId = session.channelId
     turn.latestSession = session
     // Transport sources belong only to this fresh batch, never to durable history.
-    turn.messages.push({ ...message, ...(audioSources.length ? { audioSources, audioSession: session } : {}) })
+    turn.messages.push({ ...message, ...(audioSources.length ? { audioSources, audioSession: session } : {}), ...(endpointId ? { endpointId } : {}) })
     turn.mentionedBot ||= mentionedBot
     turn.quotedBot ||= quotedBot
     const revision = ++turn.revision
@@ -1975,6 +2130,9 @@ export class InterludeService extends Service {
     // request has started. New group messages form the next batch so a busy
     // conversation cannot permanently starve the protagonist of a reply.
     const batch = turn.messages.splice(0)
+    turn.activeBatchEndpointIds = [...new Set(batch
+      .map(message => message.endpointId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0))]
     const hasAudio = batch.some(message => message.audioSources?.length)
     const mentionedBot = turn.mentionedBot
     const quotedBot = turn.quotedBot
@@ -2036,10 +2194,25 @@ export class InterludeService extends Service {
         : undefined
       const stickerCatalog = await this.stickerCatalogForSession(session, turnQueryEmbedding)
       const audio: NarrativeAudio[] = []
+      const audioBatchMaxCount = Math.max(1, this.audioConfig.maxPerMessage * 4)
+      const audioBatchMaxBytes = Math.max(1, this.audioConfig.maxFileSizeMB * 1_000_000 * 4)
+      let audioBatchBytes = 0
       for (const message of batch) {
         if (!message.audioSources?.length) continue
-        const loaded = await this.loadNativeAudio(snapshot.story, message.audioSources, message.audioSession)
-        for (const item of loaded) audio.push({ ...item, id: `group-audio-${audio.length + 1} (${message.speaker})` })
+        const remaining = audioBatchMaxCount - audio.length
+        if (remaining <= 0 || audioBatchBytes >= audioBatchMaxBytes) {
+          this.reportOperation('diagnostic', 'warn', snapshot.story, 'user-message', '群音频批次达到资源上限，剩余音频延后处理 附件上限=%d 字节上限=%d', audioBatchMaxCount, audioBatchMaxBytes)
+          continue
+        }
+        const loaded = await this.loadNativeAudio(snapshot.story, message.audioSources, message.audioSession, remaining)
+        for (const item of loaded) {
+          if (audioBatchBytes + item.base64.length > audioBatchMaxBytes) {
+            this.reportOperation('diagnostic', 'warn', snapshot.story, 'user-message', '群音频批次达到字节上限，剩余音频跳过当前回合 字节上限=%d', audioBatchMaxBytes)
+            break
+          }
+          audio.push({ ...item, id: `group-audio-${audio.length + 1} (${message.speaker})` })
+          audioBatchBytes += item.base64.length
+        }
       }
       if (hasAudio) this.reportOperation('standard', audio.length ? 'info' : 'warn', story, 'user-message',
         '群音频直接触发主叙事（跳过意愿/冷却），已载入音频=%s；实际发言由剧本决定%s', audio.length,
@@ -2354,22 +2527,50 @@ export class InterludeService extends Service {
     }
   }
 
-  private async sendGroupMessage(story: InterludeStory, channelId: string, content: string, replyToMessageId?: string, session?: Session) {
-    // The live group session is authoritative: it already represents the bot
-    // account that received this exact group message. Shared stories may have
-    // been created under an old account or platform and must not override it.
-    const sessionBot = session?.bot && typeof (session.bot as any).sendMessage === 'function'
-      ? session.bot
-      : undefined
-    const bot = sessionBot ?? this.ctx.bots.find(item => String(item.selfId) === String(story.selfId)
-      && (item.platform === story.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(story.platform)))
+  private async sendGroupMessage(story: InterludeStory, channelId: string, content: string, replyToMessageId?: string, session?: Session, endpointId?: string) {
+    const targetGroupId = normalizeGroupId(channelId)
+    // Keep the adapter-facing channel spelling (for example `group:100`)
+    // while using the normalized id only for endpoint/config matching.
+    const transportGroupId = String(channelId ?? '')
     const segments = this.splitOutgoingMessage(content)
-    if (!bot) {
-      this.report('warn', story, 'user-message', '没有可用机器人账号投递群消息 群频道=%s 故事平台=%s 故事账号=%s', channelId, story.platform, story.selfId)
-      return {
-        deliveredSegments: [], complete: false,
-        segmentOutcomes: segments.map((segment, index) => ({ index, content: segment, status: 'failed' as const, reason: 'bot-not-found' })),
+    const failed = (reason: string) => ({
+      deliveredSegments: [], complete: false,
+      segmentOutcomes: segments.map((segment, index) => ({ index, content: segment, status: 'failed' as const, reason })),
+    })
+    const endpointRows: EndpointRow[] = Array.isArray(this.endpointRows) ? this.endpointRows : []
+    let fallbackAddress: { platform: string, selfId: string, endpointId?: string } | undefined
+    let bot: any
+    if (endpointId) {
+      // Explicit group routing may only select this story's role endpoint or
+      // the registered endpoint belonging to the requested group.
+      const endpoint = endpointRows.find(row => row.id === endpointId && row.enabled && (
+        row.ownerKind === 'story-role' && row.ownerId === story.id
+        || row.ownerKind === 'group' && normalizeGroupId(row.groupId ?? row.ownerId) === targetGroupId
+      ))
+      if (!endpoint) {
+        this.report('warn', story, 'user-message', '群消息指定端点无效或不属于目标群 端点=%s 群频道=%s', endpointId, targetGroupId)
+        return failed('endpoint-not-allowed')
       }
+      fallbackAddress = { platform: endpoint.platform, selfId: endpoint.selfId, endpointId: endpoint.id }
+      bot = this.ctx.bots.find(item => String(item.selfId) === String(endpoint.selfId)
+        && (item.platform === endpoint.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(endpoint.platform)))
+    } else {
+      // A private session that authored a cross-group action is not a valid
+      // group transport session. Use it only when its channel is this group.
+      const sessionGroupId = normalizeGroupId(String((session as any)?.guildId ?? session?.channelId ?? ''))
+      // Older adapters do not expose guildId/channelId on the synthetic
+      // session passed to this helper. Preserve their live-session routing;
+      // when a channel is known, only reuse it for the same target group.
+      const sessionBot = (!sessionGroupId || sessionGroupId === targetGroupId) && session?.bot && typeof (session.bot as any).sendMessage === 'function'
+        ? session.bot
+        : undefined
+      fallbackAddress = this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
+      bot = sessionBot ?? this.ctx.bots.find(item => String(item.selfId) === String(fallbackAddress!.selfId)
+        && (item.platform === fallbackAddress!.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(fallbackAddress!.platform)))
+    }
+    if (!bot) {
+      this.report('warn', story, 'user-message', '没有可用机器人账号投递群消息 群频道=%s 故事平台=%s 故事账号=%s', targetGroupId, story.platform, story.selfId)
+      return failed('bot-not-found')
     }
     let allDelivered = true
     const deliveredSegments: string[] = []
@@ -2379,15 +2580,19 @@ export class InterludeService extends Service {
         ? [h('quote', { id: replyToMessageId }), segment]
         : segment
       try {
-        const receipt = await bot.sendMessage(channelId, outgoing)
+        const receipt = await bot.sendMessage(transportGroupId, outgoing)
         if (Array.isArray(receipt) && !receipt.length) throw new Error('Group transport returned no message receipt.')
+        // P2-8：状态按实际投递的 bot 归因——实时群会话优先时归因到 session.bot，
+        // 否则归因到解析出的兜底账号（多角色下不再错刷 fallback）。
+        const actualBot = (bot as unknown as { platform?: string, selfId?: string })
+        this.noteEndpointOutbound({ kind: 'story-role', id: story.id }, true, 'group-delivered', { platform: String(actualBot?.platform ?? fallbackAddress!.platform), selfId: String(actualBot?.selfId ?? fallbackAddress!.selfId) })
         deliveredSegments.push(segment)
         segmentOutcomes.push({ index, content: segment, status: 'delivered' })
       }
       catch (error) {
         allDelivered = false
         segmentOutcomes.push({ index, content: segment, status: 'failed', reason: clip(String(error), 500) })
-        this.report('warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', channelId, error)
+        this.report('warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', targetGroupId, error)
       }
     }
     return { deliveredSegments, complete: allDelivered, segmentOutcomes }
@@ -2397,33 +2602,13 @@ export class InterludeService extends Service {
    * Persisted messages wait here briefly before they reach the narrator. This
    * makes “你好 / 在吗 / 我有件事想问” one event without risking message loss.
    */
-  private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[], content = String(session.content ?? ''), imageSources: string[] = [], audioSources: string[] = [], quote?: QuotedMessageContext) {
-    const key = participant.id
-    const existing = this.turnEngine.turns.get(key)
-    const turn: BufferedNarrativeTurn = existing ?? {
-      storyId: story.id, participantId: participant.id, messages: [], nextRevision: 0, obsoleteRequestIds: new Set(),
-    }
-    if (shouldSupersedeNarrativeRequest(turn.inFlightRequestId, turn.firstMessageCommittedRequestId, turn.obsoleteRequestIds)) {
-      turn.obsoleteRequestIds.add(turn.inFlightRequestId)
-      this.reportOperation('standard', 'info', story, 'user-message', '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
-    }
-    turn.messages.push({ content, occurredAt: now, supersededIntents, imageSources, audioSources, ...(quote ? { quote } : {}) })
-    turn.latestSession = session
-    if (turn.timer) turn.timer()
-    const revision = ++turn.nextRevision
-    const delay = Math.max(0, this.config.runtime.userMessageDebounceSeconds ?? 2) * Time.second
-    turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), delay)
-    this.turnEngine.turns.set(key, turn)
-    this.reportOperation('diagnostic', 'debug', story, 'user-message', '短时消息合并 参与者=%s 待处理=%d 等待=%dms', participant.id, turn.messages.length, delay)
+  private bufferUserNarrative(story: InterludeStory, participant: InterludeParticipant, session: Session, now: Date, supersededIntents: NarrativeIntent[], content = String(session.content ?? ''), imageSources: string[] = [], audioSources: string[] = [], quote?: QuotedMessageContext, endpointId?: string) {
+    this.turnEngine.bufferUserNarrative(story, participant, session, now, supersededIntents, content, imageSources, audioSources, quote, (key, revision) => void this.flushBufferedNarrative(key, revision), endpointId)
   }
 
   private signalIncomingInterruption(story: InterludeStory, participant: InterludeParticipant) {
     this.interruptedTypingParticipants.add(participant.id)
-    const turn = this.turnEngine.turns.get(participant.id)
-    if (!turn || !shouldSupersedeNarrativeRequest(turn.inFlightRequestId, turn.firstMessageCommittedRequestId, turn.obsoleteRequestIds)) return
-    turn.obsoleteRequestIds.add(turn.inFlightRequestId)
-    this.reportOperation('standard', 'info', story, 'user-message',
-      '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
+    this.turnEngine.signalIncomingInterruption(story, participant)
   }
 
   /** Experimental streaming path: only a complete, validated private reply
@@ -2870,11 +3055,11 @@ export class InterludeService extends Service {
    * which multimodal models cannot read, so SnowLuma's get_record action is
    * always asked to transcode server-side (out_format) and return base64.
    * Mirrors the native-image acquisition path; nothing is persisted. */
-  private async loadNativeAudio(story: InterludeStory, sources: string[], session?: Session): Promise<NarrativeAudio[]> {
+  private async loadNativeAudio(story: InterludeStory, sources: string[], session?: Session, maxCount = this.audioConfig.maxPerMessage): Promise<NarrativeAudio[]> {
     const config = this.audioConfig
     if (!config.enabled || !sources.length) return []
     const audio: NarrativeAudio[] = []
-    for (const [index, source] of sources.slice(0, config.maxPerMessage).entries()) {
+    for (const [index, source] of sources.slice(0, Math.min(config.maxPerMessage, Math.max(0, maxCount))).entries()) {
       try {
         const item = await this.fetchNativeAudio(source, session)
         if (item) audio.push({ id: `turn-audio-${index + 1}`, ...item })
@@ -3118,14 +3303,8 @@ export class InterludeService extends Service {
   /** Prevent timers or already-returning model calls from resurrecting data
    * after an administrator resets the story or clears HDSI tables. */
   private invalidateBufferedNarratives(storyId?: string) {
-    if (storyId) this.compactionBackoff.delete(storyId)
-    else this.compactionBackoff.clear()
-    for (const [key, turn] of this.turnEngine.turns) {
-      if (storyId && turn.storyId !== storyId) continue
-      if (turn.timer) turn.timer()
-      if (turn.inFlightRequestId) turn.obsoleteRequestIds.add(turn.inFlightRequestId)
-      this.turnEngine.turns.delete(key)
-    }
+    this.scheduler.clearBackoff(storyId)
+    this.turnEngine.invalidateNarratives(storyId)
     // Group turns have their own debounce timers. They must be cancelled by
     // the same reset/purge path, otherwise an old buffered group message can
     // write a fresh entry after the administrator has cleared the story.
@@ -3137,45 +3316,56 @@ export class InterludeService extends Service {
     for (const key of this.groupWillingness.keys()) {
       if (!storyId || key.startsWith(`${storyId}:`)) this.groupWillingness.delete(key)
     }
-    for (const [key, wake] of this.dueIntentWakeTimers) {
-      if (storyId && key !== storyId) continue
-      wake.cancel()
-      this.dueIntentWakeTimers.delete(key)
-    }
+    this.scheduler.cancelWakes(storyId)
+  }
+
+  private invalidateStoryTasks(storyId?: string) {
+    if (storyId) this.storyTaskGenerations.set(storyId, (this.storyTaskGenerations.get(storyId) ?? 0) + 1)
+    else this.runtimeGeneration += 1
+  }
+
+  private taskGeneration(storyId: string) {
+    return `${this.runtimeGeneration}:${this.storyTaskGenerations.get(storyId) ?? 0}`
+  }
+
+  private taskGenerationCurrent(storyId: string, generation: string) {
+    return this.taskGeneration(storyId) === generation
+      && !this.databaseResetting
+      && this.desktopRuntimePhase !== 'paused'
   }
 
   /** True while a live or debounced conversation should take priority over background work. */
   private hasPendingNarrative(storyId: string) {
-    if (this.turnEngine.narrating.has(storyId)) return true
-    for (const turn of this.turnEngine.turns.values()) {
-      if (turn.storyId === storyId && (turn.messages.length || turn.timer || turn.inFlightRequestId)) return true
-    }
-    for (const turn of this.bufferedGroupTurns.values()) {
-      if (turn.storyId === storyId && (turn.messages.length || turn.timer)) return true
-    }
-    return false
+    return this.turnEngine.hasPendingNarrative(storyId, target => {
+      for (const turn of this.bufferedGroupTurns.values()) {
+        if (turn.storyId === target && (turn.messages.length || turn.timer)) return true
+      }
+      return false
+    })
   }
 
   private async flushBufferedNarrative(key: string, revision: number) {
     if (this.databaseResetting || this.desktopRuntimePhase === 'paused') return
-    const turn = this.turnEngine.turns.get(key)
-    if (!turn || turn.nextRevision !== revision) return
     // One shared story has one narrator at a time. If another relationship is
     // currently waiting on the provider, keep this batch intact and retry
     // shortly instead of taking an inconsistent cursor snapshot.
-    if (this.turnEngine.narrating.has(turn.storyId)) {
-      turn.timer = this.ctx.setTimeout(() => void this.flushBufferedNarrative(key, revision), 250)
-      return
-    }
-    this.turnEngine.narrating.add(turn.storyId)
-    turn.timer = undefined
-    const batch = turn.messages.splice(0)
-    if (!batch.length) {
-      this.turnEngine.narrating.delete(turn.storyId)
-      return
-    }
+    const turn = this.turnEngine.beginFlush(key, revision, (retryKey, retryRevision) => void this.flushBufferedNarrative(retryKey, retryRevision))
+    if (!turn) return
     const requestId = revision
     turn.inFlightRequestId = requestId
+    const batch = turn.messages.splice(0)
+    // Keep the endpoint set for this exact debounce batch separate from the
+    // broader turn source snapshot.  M4's batch-multi-endpoint annotation
+    // must only fire when messages in this request came from multiple
+    // endpoints; a turn may otherwise accumulate historical sources.
+    turn.activeBatchEndpointIds = [...new Set(batch
+      .map(message => message.endpointId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0))]
+    turn.activeBatchMessageCount = batch.length
+    if (!batch.length) {
+      this.turnEngine.endFlush(key, requestId)
+      return
+    }
     try {
       // Snapshot only the lightweight decision inputs under the story lock.
       // The network request stays outside it, so a new user message can be
@@ -3262,7 +3452,10 @@ export class InterludeService extends Service {
           commit: undefined as ScriptCommitDraft | undefined, scriptEntry: undefined as ScriptEntry | undefined,
         }
         if (turn.obsoleteRequestIds.has(requestId)) return {
-          obsolete: true, requeue: true, messages: [] as OutgoingMessageDraft[],
+          // User interruptions keep the batch for the next combined turn;
+          // administrative invalidation marks the request as discarded so a
+          // purge/reset can never resurrect the old input after it completes.
+          obsolete: true, requeue: !turn.discardedRequestIds?.has(requestId), messages: [] as OutgoingMessageDraft[],
           commit: undefined as ScriptCommitDraft | undefined, scriptEntry: undefined as ScriptEntry | undefined,
         }
         const current = await this.getStory(turn.storyId)
@@ -3380,20 +3573,15 @@ export class InterludeService extends Service {
         await this.scheduleNarrativeRetry(turn.storyId, turn.participantId, new Date()).catch(() => undefined)
       }
     } finally {
-      if (turn.inFlightRequestId === requestId) {
-        turn.inFlightRequestId = undefined
-        turn.firstMessageCommittedRequestId = undefined
-        this.turnEngine.narrating.delete(turn.storyId)
-      }
-      turn.obsoleteRequestIds.delete(requestId)
-      if (!turn.messages.length && !turn.timer && !turn.inFlightRequestId) this.turnEngine.turns.delete(key)
+      this.turnEngine.endFlush(key, requestId)
     }
   }
 
   async advanceStory(story: InterludeStory, force = true) {
     if (this.desktopRuntimePhase === 'paused') return []
     if (!this.canHandleStory(story)) return []
-    const messages = await this.serial(story.id, async () => this.advanceUnlocked(await this.getStory(story.id), new Date(), force))
+    const generation = this.taskGeneration(story.id)
+    const messages = await this.serial(story.id, async () => this.advanceUnlocked(await this.getStory(story.id), new Date(), force, generation))
     if (force || messages.length) this.reportOperation('summary', 'info', story, 'advance', '剧本推进完成 可见消息=%d', messages.length)
     this.scheduleCompaction(story.id)
     return messages
@@ -3410,7 +3598,8 @@ export class InterludeService extends Service {
   async compactStory(story: InterludeStory, force = true) {
     if (this.desktopRuntimePhase === 'paused') return false
     if (!this.canHandleStory(story)) return false
-    return this.serial(story.id, async () => this.compactUnlocked(await this.getStory(story.id), new Date(), force))
+    const generation = this.taskGeneration(story.id)
+    return this.serial(story.id, async () => this.compactUnlocked(await this.getStory(story.id), new Date(), force, generation))
   }
 
   /** Merge and compress already-applied overlay patches without running the
@@ -3467,7 +3656,8 @@ export class InterludeService extends Service {
     }
   }
 
-  private async advanceUnlocked(story: InterludeStory, now: Date, force: boolean) {
+  private async advanceUnlocked(story: InterludeStory, now: Date, force: boolean, generation?: string) {
+    const taskCurrent = () => !generation || this.taskGenerationCurrent(story.id, generation)
     const urgeMode = this.urgeConfig.enabled ? JSON.stringify(this.urgeConfig) : 'off'
     const previousUrge = normalizeUrgeState(story.state.extensions?.urge, now.getTime())
     if (previousUrge.mode !== urgeMode && (this.urgeConfig.enabled || previousUrge.mode && previousUrge.mode !== 'off')) {
@@ -3551,6 +3741,13 @@ export class InterludeService extends Service {
     // in executeDeferredBrowserIntent(), so re-reading the whole pending list
     // here only adds a SQLite round trip to every background sweep.
     due = due.filter(intent => intent.type !== 'browser-research')
+    // QQ 空间动作同样是“到期即外部已发生/已失败”的一锤子执行：限流门挡下或
+    // 通道失败都直接完成（成败在审计表），绝不作为未来计划回流给叙事。
+    const qzoneIntent = due.filter(intent => intent.type === 'qzone-action').slice(0, 1)[0]
+    if (qzoneIntent) {
+      await this.executeQzoneIntent(story, qzoneIntent, now)
+      due = due.filter(intent => intent.id !== qzoneIntent.id)
+    }
     // Director retry gates only the optional director, never the life scheduler.
     // Its persisted cooldown survives cursor changes and is handled at call time.
     // Turning off automatic advancement must suppress *every* background
@@ -3595,8 +3792,10 @@ export class InterludeService extends Service {
         : 'advance'
       this.reportOperation('standard', 'info', story, phase,
         '即将执行自动写作 类型=%s 时间段=%s→%s', phaseLabel(phase), formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone))
-      const { decision, succeeded, timelinePlan } = await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
-      if (succeeded) {
+      const { decision, succeeded, timelinePlan } = taskCurrent()
+        ? await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
+        : { decision: {} as NarrativeDecision, succeeded: false, timelinePlan: undefined }
+      if (succeeded && taskCurrent()) {
         const permitMessages = phase === 'conversation-follow-up' || this.config.runtime.allowProactiveMessages
         const persisted = await this.persistDecision(story, followUpParticipant ?? null, decision, from, now, permitMessages, phase, [], false, timelinePlan)
         messages.push(...persisted.messages)
@@ -3629,18 +3828,20 @@ export class InterludeService extends Service {
         try {
           this.reportOperation('standard', 'info', current, 'intent-due',
             '即将处理到期计划 数量=%d 类型=%s 参与者=%s', dueBatch.length, Array.from(new Set(dueBatch.map(intent => intent.type))).join(','), dueParticipant?.id || '全局')
-          const { decision, succeeded, timelinePlan } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
+          const { decision, succeeded, timelinePlan } = taskCurrent()
+            ? await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
+            : { decision: {} as NarrativeDecision, succeeded: false, timelinePlan: undefined }
           const streamRecovery = dueBatch.every(intent => intent.type === 'narrative-retry' && intent.payload?.streamRecovery === true)
           const recovered = streamRecovery && succeeded
             ? await this.persistStreamScriptRecovery(current, dueParticipant ?? null, decision, now)
             : false
           const turnSucceeded = streamRecovery ? recovered : succeeded
-          if (!streamRecovery) {
+          if (!streamRecovery && taskCurrent()) {
             const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
             const persisted = await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', dueBatch, false, timelinePlan)
             messages.push(...persisted.messages)
           }
-          if (turnSucceeded) {
+          if (turnSucceeded && taskCurrent()) {
             await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
             const ordinaryDueIds = dueBatch.filter(intent => intent.type !== 'follow-up-commitment').map(intent => intent.id)
             if (ordinaryDueIds.length) await this.dbSet('interlude_intent', { id: { $in: ordinaryDueIds } }, { status: 'completed', updatedAt: now })
@@ -3799,6 +4000,12 @@ export class InterludeService extends Service {
     // conversation turns — advance phases stay untouched.
     const messageRepetition = (phase === 'user-message' || phase === 'conversation-follow-up') && !groupContext
       ? detectMessageRepetition(promptEntries) : undefined
+    const availableGroupTargets = this.sharedStoryConfig.allowCrossConversationMessages
+      && !groupContext && (phase === 'user-message' || phase === 'advance' && advanceCanContact && !this.agencyConfig.enabled)
+      ? (this.config.onebot?.groupChats ?? []).filter(group => group.enabled !== false && normalizeGroupId(group.groupId))
+        .map(group => ({ participantId: `group:${normalizeGroupId(group.groupId)}`, groupId: normalizeGroupId(group.groupId), label: group.label || '' }))
+      : []
+    const endpointSelection = this.narrativeEndpointSelection(story, allParticipants, availableGroupTargets)
     return reconcileTransportReferences(await this.narrator.decide({
       urgeEnabled: this.urgeConfig.enabled && !dueIntents.some(intent => intent.type === 'narrative-retry'),
       phase, refreshContinuity, outputRecovery, story, from, now, userMessage, userReportedTimes, images, audio, visualObservations, timelinePlan, developmentTendencies,
@@ -3814,16 +4021,108 @@ export class InterludeService extends Service {
       // participant summaries and may proactively contact one account only
       // when the owner explicitly enables proactive messages.
       participants: phase === 'advance' && !advanceCanContact ? [] : participants,
-      availableGroupTargets: this.sharedStoryConfig.allowCrossConversationMessages
-        && !groupContext && (phase === 'user-message' || phase === 'advance' && advanceCanContact && !this.agencyConfig.enabled)
-        ? (this.config.onebot?.groupChats ?? []).filter(group => group.enabled !== false && normalizeGroupId(group.groupId))
-          .map(group => ({ participantId: `group:${normalizeGroupId(group.groupId)}`, groupId: normalizeGroupId(group.groupId), label: group.label || '' }))
-        : [],
+      availableGroupTargets,
+      ...(endpointSelection.enabled ? {
+        availableOutgoingEndpoints: endpointSelection.options,
+        channelSelectionEnabled: true,
+      } : {}),
       dueIntents: visibleDueIntents, upcomingIntents: visibleUpcomingIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
       recentEntries: promptEntries, memories, sceneContext: { scene, arc, ...(previousScenes.length ? { previousScenes } : {}) }, facts, groupContext, chatCapabilities,
       contactThreads: memoryEnabled ? await this.contactThreads(story.id, facts, participant?.id) : [],
       sceneFrame, dialogueBurst,
+      // M4 §十：通道标注数据。只把宿主已确认的路由/来源事实交给作者；
+      // 当前入站条目本身不能再被当成“上一条”，否则私↔群和同人异端
+      // 规则永远比较不到真正的前一条历史记录。
+      channelData: await (async (): Promise<NarrativeChannelData | undefined> => {
+        const channelData: NarrativeChannelData = {}
+        const turn = this.turnEngine.getTurn(participant?.id ?? '')
+        const turnSources = turn?.activeSources ?? turn?.sources
+        if (turnSources?.length) {
+          channelData.turnSources = turnSources.map(source => ({
+            endpointId: source.endpointId,
+            receivedSeq: source.receivedSeq,
+            channelKind: this.endpointRows.find(row => row.id === source.endpointId)?.channelKind ?? 'qq',
+          }))
+          if ((turn?.activeBatchEndpointIds?.length ?? 0) > 1) channelData.batchMultiEndpoint = true
+          const lastSource = turnSources[turnSources.length - 1]
+          const row = this.endpointRows.find(item => item.id === lastSource.endpointId)
+          if (row) {
+            channelData.currentChannel = {
+              endpointId: row.id, channelKind: row.channelKind,
+              conversationKind: groupContext ? 'group' : 'private',
+            }
+          }
+          const route = participant
+            ? this.endpointAddressSync({ platform: participant.platform, selfId: participant.selfId }, { kind: 'participant-user', id: participant.id })
+            : this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
+          if (route.endpointId) {
+            const routeRow = this.endpointRows.find(item => item.id === route.endpointId)
+            channelData.replyEndpoint = {
+              endpointId: route.endpointId,
+              ...(routeRow ? { channelKind: routeRow.channelKind } : {}),
+            }
+          }
+        }
+
+        // A live user batch appends one or more new entries. Continuation and
+        // repair turns have no active batch, so their latest channel row is
+        // already the historical predecessor and must not be skipped. Keep
+        // this calculation outside the turnSources branch: automatic
+        // continuation has no TurnEngine owner but still needs the latest
+        // historical channel for the switch annotations.
+        const channelEntries = promptEntries.filter(entry => !!(entry.metadata as any)?.channel?.channelKind)
+        const hasCurrentInboundBatch = (turn?.activeBatchMessageCount ?? 0) > 0
+        const previousEntry = channelEntries.length > (hasCurrentInboundBatch ? 1 : 0)
+          ? channelEntries[channelEntries.length - (hasCurrentInboundBatch ? 2 : 1)]
+          : undefined
+        const previousChannel = (previousEntry?.metadata as any)?.channel
+        if (previousChannel) channelData.lastEntryChannel = previousChannel
+
+        if (groupContext && !channelData.currentChannel) {
+          // Group turns use the dedicated group debounce buffer rather than
+          // TurnEngine. Prefer the endpoint set captured for this exact batch;
+          // fall back to the registered story-role endpoint when the registry
+          // did not resolve the inbound source.
+          const groupTurn = this.bufferedGroupTurns.get(`${story.id}:${normalizeGroupId(groupContext.groupId)}`)
+          if ((groupTurn?.activeBatchEndpointIds?.length ?? 0) > 1) channelData.batchMultiEndpoint = true
+          const activeGroupEndpointId = groupTurn?.activeBatchEndpointIds?.at(-1)
+          const row = (activeGroupEndpointId
+            ? this.endpointRows.find(item => item.id === activeGroupEndpointId && item.enabled)
+            : undefined)
+            ?? this.endpointRows.find(item => item.ownerKind === 'story-role'
+            && item.ownerId === story.id && item.enabled
+            && (item.platform === story.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(story.platform)))
+            ?? this.endpointRows.find(item => item.ownerKind === 'story-role' && item.ownerId === story.id && item.enabled)
+          if (row) {
+            channelData.currentChannel = { endpointId: row.id, channelKind: row.channelKind, conversationKind: 'group' }
+            channelData.replyEndpoint = { endpointId: row.id, channelKind: row.channelKind }
+          }
+        }
+
+        // Automatic follow-up/intent turns have no inbound TurnEngine source.
+        // For a participant turn, the participant's registered endpoint is the
+        // current conversation channel and the reply route. This also gives
+        // continuation a meaningful comparison target without pretending a
+        // new inbound message arrived.
+        if (!channelData.currentChannel && participant) {
+          const route = this.endpointAddressSync({ platform: participant.platform, selfId: participant.selfId }, { kind: 'participant-user', id: participant.id })
+          const routeRow = route.endpointId ? this.endpointRows.find(item => item.id === route.endpointId) : undefined
+          if (route.endpointId) {
+            channelData.currentChannel = {
+              endpointId: route.endpointId,
+              ...(routeRow ? { channelKind: routeRow.channelKind } : {}),
+              conversationKind: 'private',
+            }
+            channelData.replyEndpoint = {
+              endpointId: route.endpointId,
+              ...(routeRow ? { channelKind: routeRow.channelKind } : {}),
+            }
+          }
+        }
+        return channelData.turnSources?.length || channelData.lastEntryChannel || channelData.currentChannel || channelData.replyEndpoint
+          ? channelData : undefined
+      })(),
       workingDetails: this.pruneWorkingDetails(decodedState.workingDetails, now),
       timelineCarry: decodedState.timelineCarry,
       recalledHistory: memoryEnabled && recallFocus(userMessage,
@@ -3853,6 +4152,7 @@ export class InterludeService extends Service {
       alterEnabled: this.alterSystemConfig.enabled,
       emotionalOffset: this.emotionalOffsetForPrompt(story),
       agencyEnabled,
+      proactiveContactMode: this.agencyConfig.contactMode,
       agencyWindow: agencyEnabled ? activeAgencyWindow(story.state.agencyWindow, now) ?? null : null,
       automaticDeliverySummaries: isAutomaticNarrativePhase(phase)
         ? decodedState.automaticDeliverySummaries
@@ -4345,19 +4645,36 @@ export class InterludeService extends Service {
         if (isAgencyCheck && agencyCandidate?.participantId !== participant?.id) agencyCandidate = undefined
         if (agencyCandidate && agencyWindow) {
           const target = allParticipants.find(item => item.id === agencyCandidate!.participantId)
+          // 联系温度：natural/balanced 只放宽意愿阈值与安全间隔；Urge 爆发间隔
+          // 仍优先；容量门（设备/隐私/负荷）三模式全保——想聊天也需要手机和隐私。
+          const modeRelaxed = this.agencyConfig.contactMode !== 'strict'
+          const urgeBurst = this.urgeConfig.enabled && urgeBurstActive(normalizeUrgeState(state.extensions?.urge, now.getTime()), now.getTime(), this.urgeConfig, agencyCandidate.participantId)
+          const capacityConfig = urgeBurst
+            ? { ...this.agencyConfig, minimumProactiveIntervalMinutes: this.urgeConfig.contactMin }
+            : modeRelaxed && this.agencyConfig.naturalMinimumIntervalMinutes! < this.agencyConfig.minimumProactiveIntervalMinutes
+              ? { ...this.agencyConfig, minimumProactiveIntervalMinutes: this.agencyConfig.naturalMinimumIntervalMinutes! }
+              : this.agencyConfig
           const capacity = evaluateAgencyCapacity(
             agencyWindow,
             agencyCandidate,
             now,
-            this.urgeConfig.enabled && urgeBurstActive(normalizeUrgeState(state.extensions?.urge, now.getTime()), now.getTime(), this.urgeConfig, agencyCandidate.participantId)
-              ? { ...this.agencyConfig, minimumProactiveIntervalMinutes: this.urgeConfig.contactMin }
-              : this.agencyConfig,
+            capacityConfig,
             target?.state.lastCharacterMessageAt,
           )
           const willingness = agencyCandidate.willingness ?? 0
-          const willingnessPasses = willingness >= (this.effectiveUrgeRuntime.proactiveWillingnessThreshold ?? 0.65)
-          agencyAllowsSend = agencyCandidate.outcome === 'send-now' && capacity.allowed && willingnessPasses
-          if (!agencyAllowsSend && agencyCandidate.outcome !== 'let-go' && willingnessPasses) {
+          const willingnessThreshold = modeRelaxed ? this.agencyConfig.naturalWillingnessThreshold! : (this.effectiveUrgeRuntime.proactiveWillingnessThreshold ?? 0.65)
+          const willingnessPasses = willingness >= willingnessThreshold
+          // 每日上限（全模式）：防自然模式下的高频打扰；触顶不排重查，交由下一次推进自然判断。
+          const dailyCap = Math.max(0, this.agencyConfig.proactiveDailyCap ?? 3)
+          const capPasses = dailyCap <= 0 || countProactiveContactsInWindow(state.proactiveContactLog, agencyCandidate.participantId, now) < dailyCap
+          agencyAllowsSend = agencyCandidate.outcome === 'send-now' && capacity.allowed && willingnessPasses && capPasses
+          if (agencyAllowsSend) {
+            // M3 §八：渠道选择审计——记录实际投递端点 + 通道级原因
+            const chosenEndpointId = (agencyCandidate as unknown as { endpointId?: string }).endpointId
+              ?? this.resolveMostActiveEndpointId(agencyCandidate.participantId)
+            nextState.proactiveContactLog = appendProactiveContact(state.proactiveContactLog, agencyCandidate.participantId, now, chosenEndpointId)
+          }
+          if (!agencyAllowsSend && agencyCandidate.outcome !== 'let-go' && willingnessPasses && capPasses) {
             agencyRecheck = {
               candidate: agencyCandidate,
               window: agencyWindow,
@@ -4366,11 +4683,13 @@ export class InterludeService extends Service {
             }
           }
           this.reportOperation('standard', 'info', story, phase,
-            'Agency 主动联系判断 参与者=%s 结果=%s 原因=%s 意愿=%s',
+            'Agency 主动联系判断 参与者=%s 结果=%s 原因=%s 意愿=%s 阈值=%s 模式=%s',
             agencyCandidate.participantId,
             agencyAllowsSend ? '立即联系' : agencyRecheck ? '稍后重查' : '自然放下',
             capacity.reason,
-            willingness.toFixed(2))
+            willingness.toFixed(2),
+            willingnessThreshold.toFixed(2),
+            this.agencyConfig.contactMode)
         }
         if (agencyWindow) {
           this.reportOperation('diagnostic', 'debug', story, phase,
@@ -4477,13 +4796,13 @@ export class InterludeService extends Service {
           // Use the shared delivery queue so background turns do not discard
           // group sends, and keep the originating event for receipt projection.
           messages.push(attachMessageEvent({
-            participantId: action.participantId, content: action.content, userInitiated: phase === 'user-message',
+            participantId: action.participantId, content: action.content, endpointId: action.endpointId, userInitiated: phase === 'user-message',
           }, commit ? findPrivateOutgoingMessageEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
           continue
         }
         // P2 Fix: 主动联系计数移到投递结果处——加入数组不等于发送成功。
         messages.push(attachMessageEvent({
-          participantId: action.participantId, content: action.content, automaticDelivery,
+          participantId: action.participantId, content: action.content, endpointId: action.endpointId, automaticDelivery,
           interaction: interaction ?? null, userInitiated: phase === 'user-message',
         }, commit ? findPrivateOutgoingMessageEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
         this.pendingProactiveCount++
@@ -4494,7 +4813,7 @@ export class InterludeService extends Service {
         await this.appendIntent(story.id, {
           type: 'cross-conversation-message', summary: 'The character planned a message to another relationship branch.',
           notBefore: sendAtValue, payload: {
-            content: action.content, userInitiated: false, crossConversation: true,
+            content: action.content, endpointId: action.endpointId, userInitiated: false, crossConversation: true,
             willingness: action.willingness, reason: action.reason,
             ...(commit
               ? scriptEventPayload(attachMessageEvent(
@@ -5128,39 +5447,23 @@ export class InterludeService extends Service {
   /** Wake the scheduler close to a short typing delay instead of waiting for
    * the normal background sweep. The due intent remains the source of truth. */
   private scheduleDueIntentWake(storyId: string, notBefore: Date) {
-    const delay = Math.max(0, notBefore.getTime() - Date.now())
-    const existing = this.dueIntentWakeTimers.get(storyId)
-    // Several <sep/> segments can be scheduled at once. Keep the earliest
-    // wake-up; the next due segment schedules the following wake as needed.
-    if (existing && existing.dueAt <= notBefore.getTime()) return
-    if (existing) existing.cancel()
-    const wake = () => {
-      this.dueIntentWakeTimers.delete(storyId)
-      // A long narrative request can overlap the simulated typing delay. Keep
-      // the intent pending and retry shortly after the scheduler is free,
-      // rather than waiting for the next normal sweep.
-      if (this.databaseResetting) return
-      void (async () => {
-        const due = await this.dueIntents(storyId, new Date())
-        // Split segments are already committed transport events. Deliver them
-        // through the story queue directly; do not make them wait for the
-        // five-minute sweep or start another narrator request.
-        if (due.some(intent => intent.type === 'split-message')) {
-          await this.deliverDueSplitSegments(storyId)
-          if (due.every(intent => intent.type === 'split-message')) return
-        }
-        if (this.sweepRunning || this.hasPendingNarrative(storyId)) {
-          const retryAt = Date.now() + Time.second
-          const retry = this.ctx.setTimeout(wake, Time.second)
-          this.dueIntentWakeTimers.set(storyId, { cancel: retry, dueAt: retryAt })
-          return
-        }
-        await this.sweep()
-      })().catch(error => this.reportStandaloneOperation('diagnostic', 'debug', '到期消息唤醒失败 错误=%s', error))
+    const delay = this.scheduler.scheduleWake(storyId, notBefore, () => this.wakeDueIntents(storyId))
+    if (delay !== undefined) this.reportStandaloneOperation('diagnostic', 'debug', '已设置到期计时器 故事=%s 触发时间=%s 等待=%dms', storyId, formatLogTime(notBefore, 'Asia/Shanghai'), delay)
+  }
+
+  /** 到期唤醒的执行体：分段消息直投；sweep 繁忙或前台回合未结束时返回 'busy'，由 scheduler 短候重排。 */
+  private async wakeDueIntents(storyId: string): Promise<'busy' | void> {
+    if (this.databaseResetting) return
+    const due = await this.dueIntents(storyId, new Date())
+    // Split segments are already committed transport events. Deliver them
+    // through the story queue directly; do not make them wait for the
+    // five-minute sweep or start another narrator request.
+    if (due.some(intent => intent.type === 'split-message')) {
+      await this.deliverDueSplitSegments(storyId)
+      if (due.every(intent => intent.type === 'split-message')) return
     }
-    const timer = this.ctx.setTimeout(wake, delay)
-    this.dueIntentWakeTimers.set(storyId, { cancel: timer, dueAt: notBefore.getTime() })
-    this.reportStandaloneOperation('diagnostic', 'debug', '已设置到期计时器 故事=%s 触发时间=%s 等待=%dms', storyId, formatLogTime(notBefore, 'Asia/Shanghai'), delay)
+    if (this.sweepRunning || this.hasPendingNarrative(storyId)) return 'busy'
+    await this.sweep()
   }
 
   private async scheduleNextSplitWake(storyId: string) {
@@ -5433,11 +5736,7 @@ export class InterludeService extends Service {
         const reference = restoreMessageEvent(intent.payload, content)
         if (reference) await this.updateScriptDeliveryOutcome(storyId, reference, 'cancelled', now, 'superseded-by-new-message')
       }
-      const wake = this.dueIntentWakeTimers.get(storyId)
-      if (wake) {
-        wake.cancel()
-        this.dueIntentWakeTimers.delete(storyId)
-      }
+      this.scheduler.cancelWake(storyId)
       await this.scheduleNextSplitWake(storyId)
       const interruptedDrafts = matching
         .filter(intent => intent.type === 'split-message')
@@ -5492,7 +5791,7 @@ export class InterludeService extends Service {
     const groupId = normalizeGroupId(message.participantId.slice('group:'.length))
     const allowed = this.config.onebot?.groupChats?.some(group => group.enabled !== false && normalizeGroupId(group.groupId) === groupId)
     const outcome: GroupDeliveryResult = allowed
-      ? await this.sendGroupMessage(story, groupId, message.content, undefined, session)
+      ? await this.sendGroupMessage(story, groupId, message.content, undefined, session, message.endpointId)
       : { deliveredSegments: [], complete: false, segmentOutcomes: this.splitOutgoingMessage(message.content).map((content, index) => ({ index, content, status: 'failed', reason: 'group-not-allowed' })) }
     const now = new Date()
     await this.serial(story.id, async () => {
@@ -5583,6 +5882,8 @@ export class InterludeService extends Service {
         if (session && current?.id === target.id) {
           const receipt = await session.send(outgoingContent)
           if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
+          // P2-5：即时会话投递成功同样刷新端点状态（与 bot/desktop 路径一致）。
+          this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'session-delivered', { platform: target.platform, selfId: target.selfId })
           delivered.push(message)
           continue
         }
@@ -5595,9 +5896,42 @@ export class InterludeService extends Service {
             channelId: target.channelId, kind: 'private', content: message.content,
             ...(message.quoteMessageId ? { quoteMessageId: message.quoteMessageId } : {}),
           })
-          if (outcome.ok) delivered.push(message)
+          if (outcome.ok) {
+            // P2-9：桌面宿主投递成功同样刷新端点 deliverable 状态。
+            this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'desktop-delivered', { platform: target.platform, selfId: target.selfId })
+            delivered.push(message)
+          }
           else throw new Error(outcome.error || 'typ-0 宿主投递失败。')
           continue
+        }
+        // M3 §八：显式端点优先——message.endpointId 指定时按该端点地址选 bot
+        if (message.endpointId) {
+          // A model-provided endpoint may only select one of this participant's
+          // registered user endpoints. Without the owner check, an arbitrary
+          // enabled story/group endpoint could be used to send to a private
+          // target under the wrong account.
+          const endpoint = this.endpointRows.find(row => row.id === message.endpointId
+            && row.enabled && row.ownerKind === 'participant-user' && row.ownerId === target.id)
+          if (endpoint) {
+            const exact = this.ctx.bots.find(item => String(item.selfId) === String(endpoint.selfId)
+              && (item.platform === endpoint.platform
+                || isOneBotPlatform(item.platform) && isOneBotPlatform(endpoint.platform)))
+            if (exact) {
+              try {
+                const receipt = await exact.sendMessage(target.channelId, outgoingContent)
+                if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
+                this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'endpoint-explicit', { platform: endpoint.platform, selfId: endpoint.selfId })
+                delivered.push(message)
+                continue
+              } catch (error) {
+                this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, false, String(error), { platform: endpoint.platform, selfId: endpoint.selfId })
+                this.report('warn', story, 'intent-due', '指定端点投递失败 参与者=%s 端点=%s 错误=%s', target.id, message.endpointId, error)
+                if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, `endpoint-error: ${String(error)}`)
+                continue
+              }
+            }
+          }
+          // 端点不存在或 bot 不在线——落入默认路径（不硬失败）
         }
         const bot = this.findBotForParticipant(target)
         if (!bot) {
@@ -5607,6 +5941,7 @@ export class InterludeService extends Service {
         }
         const receipt = await bot.sendMessage(target.channelId, outgoingContent)
         if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
+        this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'private-delivered', { platform: target.platform, selfId: target.selfId })
         delivered.push(message)
       } catch (error) {
         this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
@@ -5826,9 +6161,12 @@ export class InterludeService extends Service {
   }
 
   private findBotForParticipant(participant: InterludeParticipant) {
+    // M1a：出站地址经端点注册表解析（私聊全链唯一收口——即时/延迟/主动）；
+    // 注册表未命中回落旧字段，行为与现状一致。
+    const address = this.endpointAddressSync({ platform: participant.platform, selfId: participant.selfId }, { kind: 'participant-user', id: participant.id })
     return this.ctx.bots.find(bot =>
-      String(bot.selfId) === String(participant.selfId)
-      && (bot.platform === participant.platform || isOneBotPlatform(bot.platform) && isOneBotPlatform(participant.platform)))
+      String(bot.selfId) === String(address.selfId)
+      && (bot.platform === address.platform || isOneBotPlatform(bot.platform) && isOneBotPlatform(address.platform)))
   }
 
   private get autoAdvanceConfig(): AutoAdvanceConfig {
@@ -6173,6 +6511,8 @@ export class InterludeService extends Service {
       await this.dbSet(table, { storyId: story.id }, { participantId: participant.id } as any)
     }
     await this.dbSet('interlude_story', { id: legacy.id }, { status: 'archived', updatedAt: now })
+    // M1b：旧 ID 登记为别名——历史引用（外部记录/管理员操作）仍可循别名找回本故事。
+    await this.recordStoryAlias(legacy.id, story.id, 'legacy-story-migration').catch(() => undefined)
     await this.ensureContinuity(story, now)
     return story
   }
@@ -6320,17 +6660,12 @@ export class InterludeService extends Service {
   }
 
   private compactionIsBackedOff(storyId: string, fingerprint: string, now = Date.now()) {
-    const backoff = this.compactionBackoff.get(storyId)
-    if (!backoff || backoff.fingerprint !== fingerprint || now >= backoff.until) {
-      if (backoff && now >= backoff.until) this.compactionBackoff.delete(storyId)
-      return false
-    }
-    return true
+    return this.scheduler.isBackedOff(storyId, fingerprint, now)
   }
 
   private noteCompactionFailure(storyId: string, fingerprint: string, error: unknown) {
     const until = Date.now() + COMPACTION_RETRY_BACKOFF
-    this.compactionBackoff.set(storyId, { fingerprint, until })
+    this.scheduler.noteBackoff(storyId, fingerprint, until)
     this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理进入冷却 故事=%s 冷却至=%s 错误=%s', storyId, new Date(until).toISOString(), error)
   }
 
@@ -6346,28 +6681,18 @@ export class InterludeService extends Service {
   }
 
   private scheduleCompaction(storyId: string) {
-    if ((!this.memoryConfig.enabled && !this.schedulePreplanConfig.enabled) || this.scheduledCompactions.has(storyId)) return
-    this.scheduledCompactions.add(storyId)
-    this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理已排队 故事=%s', storyId)
-    const run = () => {
-      if (this.desktopRuntimePhase === 'paused' || this.databaseResetting) {
-        this.scheduledCompactions.delete(storyId)
-        return
-      }
-      // Let an active or debounced user turn go first. This keeps compaction
-      // fully off the latency-sensitive path even during a busy conversation.
-      if (this.hasPendingNarrative(storyId)) {
-        this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理等待前台回合结束 故事=%s', storyId)
-        this.ctx.setTimeout(run, 500)
-        return
-      }
-      void (async () => {
+    if (!this.memoryConfig.enabled && !this.schedulePreplanConfig.enabled) return
+    // P1: 去重门/让路等待/收尾释放由 scheduler 拥有；Phase 1-3 执行体在下方回调，
+    // 排队时捕获的 generation 穿透整个执行体（purge/pause 后任务作废）。
+    const generation = this.taskGeneration(storyId)
+    this.scheduler.scheduleExclusive(storyId, async () => {
         // Phase 1 (serial): cheap reads and due checks. The queue MUST be
         // released before the compactor call — a promise-chain serial cannot
         // be re-entered from inside one of its own running tasks (that
         // deadlocks the whole story queue), so the expensive model call runs
         // unqueued and only the cheap DB writes re-acquire it afterwards.
         const prepared = await this.serial(storyId, async () => {
+          if (!this.taskGenerationCurrent(storyId, generation)) return undefined
           if (this.hasPendingNarrative(storyId)) return undefined
           const story = await this.getStory(storyId)
           const review = await this.prepareSchedulePreplanReview(story, new Date())
@@ -6394,6 +6719,7 @@ export class InterludeService extends Service {
         let decision: CompactionDecision = {}
         let compactionError: unknown = undefined
         if (context) {
+          if (!this.taskGenerationCurrent(storyId, generation)) return
           try {
             decision = await this.compactor.compact(context.compactRequest)
           } catch (error) {
@@ -6405,7 +6731,7 @@ export class InterludeService extends Service {
         // Phase 3 (serial): cheap DB writes, re-queued after the model call.
         try {
           await this.serial(storyId, async () => {
-            if (this.databaseResetting) return
+            if (!this.taskGenerationCurrent(storyId, generation)) return
             if (prepared.review?.needsModel) {
               const persisted = await this.persistSchedulePreplanReview(prepared.story, prepared.review, scheduleProposal, new Date())
               if (persisted) this.schedulePreplanBackoff.delete(storyId)
@@ -6421,16 +6747,712 @@ export class InterludeService extends Service {
               }
             }
           })
-          if (context && !compactionError) this.compactionBackoff.delete(storyId)
+          if (context && !compactionError) this.scheduler.clearBackoff(storyId)
         } catch (error) {
           if (context && !compactionError) this.noteCompactionFailure(storyId, context.fingerprint, error)
           throw error
         }
-      })()
-        .catch(error => this.reportStandaloneOperation('diagnostic', 'debug', '记忆压缩跳过 错误=%s', error))
-        .finally(() => this.scheduledCompactions.delete(storyId))
+    }, {
+      halted: () => this.desktopRuntimePhase === 'paused' || this.databaseResetting,
+      // Let an active or debounced user turn go first. This keeps compaction
+      // fully off the latency-sensitive path even during a busy conversation.
+      defer: () => {
+        if (!this.hasPendingNarrative(storyId)) return false
+        this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理等待前台回合结束 故事=%s', storyId)
+        return true
+      },
+      onQueued: () => this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理已排队 故事=%s', storyId),
+    })
+  }
+
+  // ── QQ 空间（说说）通道：门控 → 审计 → 动作 → 回写 ─────────────────────
+  // 通道只负责安全执行；"何时发/发什么"的决策由叙事层（后续版本）与手动命令提供。
+
+  /** 从当前在线的 OneBot（SnowLuma/NapCat）连接取通用动作调用口。
+   * 指定 preferSelfId 时严格匹配该账号——空间动作落在别的 QQ 上比失败更糟。 */
+  private qzoneCaller(preferSelfId?: string): QzoneActionCaller | undefined {
+    const bot = preferSelfId
+      ? this.ctx.bots.find(item => isOneBotPlatform(item.platform) && String(item.selfId) === String(preferSelfId))
+      : this.ctx.bots.find(item => isOneBotPlatform(item.platform))
+    const internal = (bot as any)?.internal
+    if (!internal || typeof internal._request !== 'function') return undefined
+    return (action: string, params?: Record<string, unknown>) => internal._request(action, params)
+  }
+
+  /**
+   * 执行一条空间动作（发帖/评论/点赞）：限流门 → pending 审计行（在故事串行
+   * 队列内原子预留配额）→ SnowLuma 动作（网络调用留在队列外）→ 回写
+   * confirmed/failed/unknown。传输类异常与“成功帧但无 tid”都记 unknown——
+   * 结果不明按已发生保守计入配额，且绝不自动重试非幂等动作。
+   */
+  async qzoneExecute(story: InterludeStory, kind: QzoneActionKind, input: { content?: string, tid?: string, targetUin?: string, ugcRight?: number }, preferSelfId?: string): Promise<{ ok: boolean, tid?: string, error?: string }> {
+    if (!this.qzoneRuntime.enabled) return { ok: false, error: 'QQ 空间通道未启用（Console → 扩展 → QQ 空间）。' }
+    // M1a（路径 7）+ P1-4：qzone 账号选择——显式指定 preferSelfId 时按 accountKey
+    // 精确匹配本故事的角色端点，找不到直接失败（绝不自动切到其他端点）；
+    // 未指定时经 endpointAddressSync 解析（多端点按最近观测选取）。
+    // endpointId 随行落审计，限流门按端点分桶（历史无 id 行保守计入）。
+    let qzoneAddress: { platform: string, selfId: string, endpointId?: string }
+    if (preferSelfId) {
+      await this.ensureEndpointRegistry().catch(() => undefined)
+      const key = endpointAccountKey(story.platform, String(preferSelfId))
+      const exact = this.endpointRows.find(row => row.ownerKind === 'story-role' && row.ownerId === story.id && row.accountKey === key && row.enabled)
+      if (!exact) return { ok: false, error: `账号 ${preferSelfId} 未注册为本故事的角色端点（精确匹配失败，不自动切换账号）。` }
+      qzoneAddress = { platform: exact.platform, selfId: exact.selfId, endpointId: exact.id }
+    } else {
+      qzoneAddress = this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
     }
-    run()
+    const qzoneEndpointId = qzoneAddress.endpointId
+    const caller = this.qzoneCaller(qzoneAddress.selfId)
+    if (!caller) return { ok: false, error: `没有可用的 OneBot（SnowLuma）连接（账号 ${qzoneAddress.selfId} 不在线）；不会改用其他账号执行空间动作。` }
+    const now = new Date()
+    // 门控与 pending 预留在故事串行队列内完成：并发动作串行过门，杜绝双双
+    // 通过限流检查后各插一行而突破日上限/最小间隔（快照模式与 flush 相同）。
+    const pending = await this.serial(story.id, async () => {
+      const recent = (await this.dbGet('interlude_qzone_post', { createdAt: { $gte: new Date(now.getTime() - 48 * Time.hour) } })) as unknown as QzonePostRecord[]
+      const gate = evaluateQzoneGate(qzoneRecordsForEndpoint(recent, qzoneEndpointId), this.qzoneRuntime, { kind, now })
+      if (!gate.allowed) return { blocked: gate.reason as string, gate, row: undefined as undefined | { id: number } }
+      const row = await this.dbCreate('interlude_qzone_post', {
+        storyId: story.id, kind,
+        tid: input.tid ?? '', ...(input.targetUin ? { targetUin: input.targetUin } : {}),
+        ...(kind === 'post' && input.content ? { content: input.content.slice(0, 2_000), ...(input.ugcRight ? { ugcRight: input.ugcRight } : {}) } : {}),
+        ...(qzoneEndpointId ? { endpointId: qzoneEndpointId } : {}),
+        status: 'pending', createdAt: now,
+      })
+      return { blocked: undefined, gate, row: { id: row.id } }
+    })
+    if (pending.blocked || !pending.row) {
+      const gate = pending.gate
+      this.reportOperation('diagnostic', 'debug', story, 'user-message', 'QQ 空间动作被限流门拦下 类型=%s 原因=%s 今日=%d/%d', kind, pending.blocked, gate.usedToday, gate.cap)
+      return { ok: false, error: pending.blocked === 'daily-cap' ? `今日${kind === 'post' ? '发帖' : kind === 'comment' ? '评论' : '点赞'}已达上限（${gate.usedToday}/${gate.cap}）。` : `距离上一条空间动作不足最小间隔（${this.qzoneRuntime.minIntervalMinutes} 分钟）。` }
+    }
+    const pendingId = pending.row.id
+    try {
+      if (kind === 'post') {
+        const data = await callQzoneAction<{ tid?: string | number }>(caller, 'send_qzone_msg', { content: input.content ?? '', ugc_right: input.ugcRight ?? 4 })
+        const tid = String(data.tid ?? '')
+        if (!tid) {
+          // 成功帧却拿不到 tid：帖子可能已发出但无法追踪——记 unknown，不宣称已确认。
+          await this.dbSet('interlude_qzone_post', { id: pendingId }, { status: 'unknown', error: '服务端未返回 tid，结果未知。' }).catch(() => undefined)
+          this.reportStandalone('warn', 'QQ 空间说说发表结果未知（无 tid），已按保守计入配额且不自动重试')
+          return { ok: false, error: '发表结果未知：服务端未返回说说 tid，为避免重复发帖不会自动重试。' }
+        }
+        await this.dbSet('interlude_qzone_post', { id: pendingId }, { tid, status: 'confirmed', postedAt: new Date() })
+        // 已发布的事实进剧本：她自己会记得发过什么（[空间动态] 前缀走 SOCIAL SURFACE 规则）。
+        await this.appendEntry(story.id, {
+          kind: 'qzone-post', actor: 'character',
+          content: `[空间动态] 她发表了说说：${clip(input.content ?? '', 120)}（${qzoneVisibilityLabel(input.ugcRight ?? 4)}）`,
+          occurredAt: now.toISOString(), metadata: { qzoneKind: 'post', tid, ugcRight: input.ugcRight ?? 4 },
+        }, now)
+        this.reportOperation('standard', 'info', story, 'user-message', 'QQ 空间说说已发表 tid=%s 可见性=%s', tid, input.ugcRight ?? 4)
+        return { ok: true, tid }
+      }
+      if (kind === 'comment') {
+        await callQzoneAction(caller, 'comment_qzone', { tid: input.tid ?? '', content: input.content ?? '', ...(input.targetUin ? { target_uin: Number(input.targetUin) } : {}) })
+        await this.dbSet('interlude_qzone_post', { id: pendingId }, { status: 'confirmed', postedAt: new Date() })
+        await this.appendEntry(story.id, {
+          kind: 'qzone-post', actor: 'character',
+          content: `[空间动态] 她评论了${input.targetUin ? ` QQ ${input.targetUin}` : ''}的说说：${clip(input.content ?? '', 80)}`,
+          occurredAt: now.toISOString(), metadata: { qzoneKind: 'comment', tid: input.tid ?? '' },
+        }, now)
+        return { ok: true }
+      }
+      await callQzoneAction(caller, 'like_qzone', { tid: input.tid ?? '', ...(input.targetUin ? { target_uin: Number(input.targetUin) } : {}) })
+      await this.dbSet('interlude_qzone_post', { id: pendingId }, { status: 'confirmed', postedAt: new Date() })
+      return { ok: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // ambiguous=true 表示请求可能已到达服务端（超时/断连）：记 unknown 而非
+      // failed——unknown 保守计入配额（可能已发生），语义上禁止自动重试。
+      const ambiguous = error instanceof QzoneActionError && error.ambiguous
+      await this.dbSet('interlude_qzone_post', { id: pendingId }, { status: ambiguous ? 'unknown' : 'failed', error: message.slice(0, 500) }).catch(() => undefined)
+      this.reportStandalone('warn', 'QQ 空间动作%s 类型=%s 错误=%s', ambiguous ? '结果未知' : '失败', kind, message)
+      return { ok: false, error: ambiguous ? `${message}（结果未知：请求可能已生效，为避免重复不会自动重试。）` : message }
+    }
+  }
+
+  /** 通道能力探测（只读）：SnowLuma 的 qzone 扩展是否可用。 */
+  async qzoneAvailable(preferSelfId?: string): Promise<boolean> {
+    const caller = this.qzoneCaller(preferSelfId)
+    if (!caller) return false
+    try { return await probeQzoneAvailable(caller) } catch { return false }
+  }
+
+  /**
+   * 到期 qzone-action 意图的执行侧：payload 校验 → 限流门 → 动作 → 完成意图。
+   * 坏 payload / 限流 / 通道失败都直接完成意图（成败进审计表），不回流叙事。
+   */
+  private async executeQzoneIntent(story: InterludeStory, intent: NarrativeIntent, now: Date) {
+    const request = qzoneIntentFromPayload(intent.payload)
+    const finish = async (note: string) => {
+      await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now }).catch(() => undefined)
+      this.reportOperation('diagnostic', 'debug', story, 'intent-due', 'QQ 空间意图已处理 意图=%d 结果=%s', intent.id, note)
+    }
+    if (!request) return finish('payload-invalid')
+    if (request.action !== 'post') {
+      // 目标来源绑定：评论/点赞的 tid 必须来自本账号实际读到并入账的好友动态
+      // （feed-seen 行）或她自己已发表的说说（confirmed post 行）——模型编造
+      // 的 tid 一律拒绝，防止对任意帖子执行写操作。
+      const targets = (await this.dbGet('interlude_qzone_post', { tid: request.tid ?? '' })) as unknown as QzonePostRecord[]
+      const known = targets.some(row => row.status === 'confirmed' && (row.kind === 'feed-seen' || row.kind === 'post'))
+      if (!known) return finish('target-unknown')
+    }
+    const result = await this.qzoneExecute(story, request.action, {
+      content: request.content, tid: request.tid, targetUin: request.targetUin, ugcRight: request.ugcRight,
+    }, story.selfId)
+    // 点赞成功不单独进剧本（过细）；发帖/评论的条目由 qzoneExecute 写入。
+    return finish(result.ok ? 'ok' : `failed:${clip(result.error ?? '', 80)}`)
+  }
+
+  /** 好友动态轮询：感知零模型调用——新鲜说说写成 [好友动态] 条目，反应留给回合内决策。 */
+  private qzoneFeedSweepRunning = false
+
+  private async qzoneFeedSweep() {
+    if (this.desktopRuntimePhase === 'paused' || this.databaseResetting || !this.qzoneRuntime.enabled || this.qzoneFeedSweepRunning) return
+    this.qzoneFeedSweepRunning = true
+    try {
+      const story = await this.getCanonicalStory()
+      if (!story || !this.canHandleStory(story)) return
+      // P2-7：轮询账号经端点注册表解析（多角色端点下不再读故事旧 selfId），
+      // feed-seen 审计行随记 endpointId。
+      const sweepAddress = this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
+      const sweepEndpointId = (sweepAddress as { endpointId?: string }).endpointId
+      const caller = this.qzoneCaller(sweepAddress.selfId)
+      if (!caller) return
+      const now = new Date()
+      // feeds CGI 间歇失败（POC 实测）：失败静默跳过，下轮再试，不写任何条目。
+      let feeds: QzoneFeedEntry[] = []
+      try {
+        const raw = await callQzoneAction<{ feeds?: unknown[] }>(caller, 'get_qzone_feeds', { page_num: 1, count: 20 })
+        feeds = (Array.isArray(raw.feeds) ? raw.feeds : []).map(item => normalizeQzoneFeedEntry(item, now)).filter((item): item is QzoneFeedEntry => !!item)
+      } catch { return }
+      // 去重账本：feed-seen 行的 tid 即 feeds.key（7 天窗足够覆盖时间窗的双倍）。
+      const seenRows = (await this.dbGet('interlude_qzone_post', { kind: 'feed-seen', createdAt: { $gte: new Date(now.getTime() - 7 * 24 * Time.hour) } })) as unknown as QzonePostRecord[]
+      const seenKeys = new Set(seenRows.map(row => String(row.tid ?? '')).filter(Boolean))
+      for (const feed of qzoneFeedCandidates(feeds, seenKeys, this.qzoneRuntime, now)) {
+        let content = ''
+        try {
+          const listRaw = await callQzoneAction<{ msglist?: unknown[] }>(caller, 'get_qzone_msg_list', { target_uin: Number(feed.uin), num: 5 })
+          const entries = (Array.isArray(listRaw.msglist) ? listRaw.msglist : []).map(item => normalizeQzoneMsgEntry(item)).filter((item): item is NonNullable<typeof item> => !!item)
+          content = matchQzoneFeedContent(entries, feed)
+        } catch { /* 正文拉取失败按元数据处理 */ }
+        const owner = feed.nickname || `QQ ${feed.uin}`
+        await this.appendEntry(story.id, {
+          kind: 'friend-feed', actor: 'system',
+          content: `[好友动态] ${owner}发布了说说${content ? `：${clip(content, 80)}` : ''}`,
+          occurredAt: feed.time.toISOString(),
+          metadata: { qzoneFeedKey: feed.key, qzoneFeedUin: feed.uin, qzoneFeedNickname: feed.nickname },
+        }, now)
+        await this.dbCreate('interlude_qzone_post', { storyId: story.id, kind: 'feed-seen', tid: feed.key, targetUin: feed.uin, ...(sweepEndpointId ? { endpointId: sweepEndpointId } : {}), content: feed.nickname.slice(0, 100), status: 'confirmed', createdAt: now })
+        this.reportOperation('diagnostic', 'debug', story, 'advance', '好友动态已入账 归属=%s 正文=%s', owner, content ? '有' : '无')
+      }
+    } catch (error) {
+      this.reportStandalone('warn', 'QQ 空间动态轮询失败 错误=%s', error)
+    } finally {
+      this.qzoneFeedSweepRunning = false
+    }
+  }
+
+  // ── 端点注册表（M1a）：迁移/加载/解析/状态 ────────────────────────────────
+  // 规格见 docs/MULTI_CHANNEL_SINGLE_STORY_DESIGN.md v3 §二/§三/§四。
+  // 单平台零影响：注册表未命中时一律回落旧路径（undefined），绝不自动挂载。
+
+  /** 加载并补齐端点注册表（幂等）：active 故事/参与者/启用的群规则派生行。 */
+  /** 加载并补齐端点注册表（幂等 + 单飞：并发调用共享同一次 reconcile）。 */
+  private endpointRegistryInFlight: Promise<void> | undefined
+
+  /** 端点/别名运行期写队列（P1-2）：所有注册表变更串行执行，杜绝并发"查后写"重复。 */
+  private endpointWriteQueue: Promise<unknown> = Promise.resolve()
+
+  private enqueueEndpointWrite<T>(task: () => Promise<T>): Promise<T> {
+    const run = (this.endpointWriteQueue ?? Promise.resolve()).then(task, task)
+    this.endpointWriteQueue = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  private async ensureEndpointRegistry() {
+    if (this.endpointRegistryReady) return
+    if (this.endpointRegistryInFlight) return this.endpointRegistryInFlight
+    // P1-4：单飞锁——两个并发初始化不会各自"查不存在→插入"造成重复行。
+    this.endpointRegistryInFlight = this.reconcileEndpointRegistry().finally(() => { this.endpointRegistryInFlight = undefined })
+    return this.endpointRegistryInFlight
+  }
+
+  private async reconcileEndpointRegistry() {
+    const now = new Date()
+    const existing = (((await this.dbGet('interlude_endpoint', {})) as unknown[]) ?? [])
+      .map(row => normalizeEndpointRow(row)).filter((row): row is EndpointRow => !!row)
+    const byKey = new Map(existing.map(row => [endpointUniqueKey(row), row]))
+    const drafts: EndpointRow[] = []
+    const addDraft = (draft: EndpointRow) => {
+      const key = endpointUniqueKey(draft)
+      if (byKey.has(key)) return
+      byKey.set(key, draft)
+      drafts.push({ ...draft, id: randomUUID() })
+    }
+    // active+paused 都登记（P2-7）：暂停故事的账号/别名同样要能被 resume/status
+    // 与入站重定向找到；archived 由 migrateLegacyStory 迁移时单独登记。
+    const stories = (await this.dbGet('interlude_story', { status: { $in: ['active', 'paused'] } })) as any[]
+    for (const story of stories) {
+      if (story?.id && story.selfId) addDraft(deriveStoryRoleEndpoint({ id: String(story.id), platform: String(story.platform ?? 'onebot'), selfId: String(story.selfId) }, now))
+      for (const rule of this.config.onebot?.groupChats ?? []) {
+        if (rule.enabled !== false) addDraft(deriveGroupEndpoint({ id: String(story.id), platform: String(story.platform ?? 'onebot'), selfId: String(story.selfId) }, rule, now))
+      }
+    }
+    for (const participant of (await this.dbGet('interlude_participant', { status: 'active' })) as any[]) {
+      if (participant?.id && participant.selfId && participant.userId) addDraft(deriveParticipantUserEndpoint({ id: String(participant.id), platform: String(participant.platform ?? 'onebot'), selfId: String(participant.selfId), userId: String(participant.userId) }, now))
+    }
+    const persisted: EndpointRow[] = []
+    for (const draft of drafts) {
+      // P1-1：先落库、成功才进内存——失败行不产生幽灵端点（重启即消失的假行）。
+      try {
+        await this.dbCreate('interlude_endpoint', draft)
+        persisted.push(draft)
+      } catch (error) {
+        this.reportStandalone('warn', '端点行写入失败，已跳过（不进内存，下次 reconcile 重试）键=%s 错误=%s', endpointUniqueKey(draft), error)
+      }
+    }
+    if (persisted.length) this.reportStandaloneOperation('diagnostic', 'debug', '端点注册表迁移完成 新增=%d/%d 总数=%d', persisted.length, drafts.length, existing.length + persisted.length)
+    this.endpointRows = [...existing, ...persisted]
+    for (const row of this.endpointRows) {
+      if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+    }
+    // M1b：剧本别名迁移（与端点同一幂等通道）——为每个故事登记"按账号推导的
+    // ID → 既有剧本 ID"。故事主键保持不动（即冻结的稳定角色 ID），推导形态
+    // （legacy platform:selfId:userId / 未来的第二端点 character:...）一律经
+    // 别名重定向，不再创建平行故事。前后各记一条带行数快照的审计。
+    this.storyAliasRows = (((await this.dbGet('interlude_story_alias', {})) as unknown[]) ?? [])
+      .map(row => normalizeStoryAliasRow(row)).filter((row): row is StoryAliasRecord => !!row)
+    this.reportStandaloneOperation('diagnostic', 'debug', '剧本别名迁移开始 角色=%d 既有别名=%d', this.endpointRows.filter(row => row.ownerKind === 'story-role').length, this.storyAliasRows.length)
+    let aliasesAdded = 0
+    for (const story of stories) {
+      if (!story?.id || !story.selfId) continue
+      const derivedId = storyIdForCharacter(String(story.platform ?? 'onebot'), String(story.selfId))
+      if (derivedId === story.id) continue
+      const recorded = await this.recordStoryAlias(derivedId, String(story.id), 'M1b-stable-id', false)
+      if (recorded) aliasesAdded += 1
+    }
+    this.reportStandaloneOperation('diagnostic', 'debug', '剧本别名迁移完成 新增=%d 总数=%d', aliasesAdded, this.storyAliasRows.length)
+    // P2-10：回填 qzone 审计行的 endpointId（按 storyId → 角色端点归因）。
+    await this.backfillQzoneEndpointIds()
+    this.endpointRegistryReady = true
+  }
+
+  /** 运行期增量登记（P1-2）：故事/参与者创建时同步 upsert 端点行。
+   * P1-1/P1-2：经写队列串行执行；先落库成功才进内存；失败置脏（下次 reconcile
+   * 重试）——绝不留下"进程内有、重启即无"的幽灵端点，也不让登记失败被静默
+   * 吞掉后触发陌生账号拒绝（置脏保证 findStory 下次会重新 reconcile 补上）。 */
+  private async registerStoryRoleEndpointRow(story: { id: string, platform: string, selfId: string }) {
+    await this.enqueueEndpointWrite(async () => {
+      try {
+        await this.ensureEndpointRegistry()
+        const now = new Date()
+        const draft = deriveStoryRoleEndpoint(story, now)
+        if (this.endpointRows.some(row => endpointUniqueKey(row) === endpointUniqueKey(draft))) return
+        const row: EndpointRow = { ...draft, id: randomUUID() }
+        await this.dbCreate('interlude_endpoint', row)
+        this.endpointRows.push(row)
+        if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+        await this.recordStoryAlias(storyIdForCharacter(story.platform, story.selfId), story.id, 'story-created', false)
+      } catch (error) {
+        this.endpointRegistryReady = false
+        this.reportStandalone('warn', '故事端点登记失败，注册表已置脏待重试 故事=%s 错误=%s', story.id, error)
+      }
+    })
+  }
+
+  private async registerParticipantUserEndpointRow(participant: { id: string, platform: string, selfId: string, userId: string }) {
+    await this.enqueueEndpointWrite(async () => {
+      try {
+        await this.ensureEndpointRegistry()
+        const now = new Date()
+        const draft = deriveParticipantUserEndpoint(participant, now)
+        if (this.endpointRows.some(row => endpointUniqueKey(row) === endpointUniqueKey(draft))) return
+        const row: EndpointRow = { ...draft, id: randomUUID() }
+        await this.dbCreate('interlude_endpoint', row)
+        this.endpointRows.push(row)
+        if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+      } catch (error) {
+        this.endpointRegistryReady = false
+        this.reportStandalone('warn', '参与者端点登记失败，注册表已置脏待重试 参与者=%s 错误=%s', participant.id, error)
+      }
+    })
+  }
+
+  /** qzone 审计行 endpointId 回填：旧行按 storyId → 该故事角色端点归因。 */
+  private async backfillQzoneEndpointIds() {
+    const rows = (await this.dbGet('interlude_qzone_post', {})) as any[]
+    for (const row of rows) {
+      if (row?.endpointId) continue
+      const endpoint = this.endpointRows.find(item => item.ownerKind === 'story-role' && item.ownerId === String(row.storyId ?? ''))
+      if (!endpoint) continue
+      await this.dbSet('interlude_qzone_post', { id: row.id }, { endpointId: endpoint.id }).catch(() => undefined)
+    }
+  }
+
+  /**
+   * 登记剧本别名（幂等）：既有行指向相同 canonical → 无操作；指向不同
+   * canonical → 冲突告警一次且不覆盖（人工裁决）；成功则落行并更新缓存。
+   */
+  private async recordStoryAlias(aliasStoryId: string, canonicalStoryId: string, reason: string, announce = true): Promise<boolean> {
+    if (!aliasStoryId || !canonicalStoryId || aliasStoryId === canonicalStoryId) return false
+    const existing = this.storyAliasRows.find(row => row.aliasStoryId === aliasStoryId)
+    if (existing) {
+      if (existing.canonicalStoryId !== canonicalStoryId) {
+        const key = `conflict:${aliasStoryId}`
+        if (!this.storyAliasProblems.has(key)) {
+          this.storyAliasProblems.add(key)
+          this.reportStandalone('warn', '剧本别名冲突，保留既有指向（人工裁决）别名=%s 既有=%s 试图=%s', aliasStoryId, existing.canonicalStoryId, canonicalStoryId)
+        }
+      }
+      return false
+    }
+    const now = new Date()
+    const row: StoryAliasRecord = { aliasStoryId, canonicalStoryId, reason, createdAt: now }
+    // P1-1：先落库、成功才进内存——失败不产生幽灵别名。
+    try {
+      await this.dbCreate('interlude_story_alias', row)
+    } catch (error) {
+      this.reportStandalone('warn', '剧本别名写入失败，已放弃（无内存幻影）别名=%s 错误=%s', aliasStoryId, error)
+      return false
+    }
+    this.storyAliasRows.push(row)
+    if (announce) this.reportStandaloneOperation('diagnostic', 'debug', '剧本别名已登记 %s → %s 原因=%s', aliasStoryId, canonicalStoryId, reason)
+    return true
+  }
+
+  /** 别名解析：链式（双射失败）或悬空（canonical 无故事）→ undefined + 一次性告警。 */
+  private async resolveStoryIdAlias(aliasStoryId: string): Promise<string | undefined> {
+    if (!aliasStoryId) return undefined
+    const result = resolveStoryAlias(this.storyAliasRows, aliasStoryId)
+    if (result.problem === 'chain') {
+      const key = `chain:${aliasStoryId}`
+      if (!this.storyAliasProblems.has(key)) {
+        this.storyAliasProblems.add(key)
+        this.reportStandalone('warn', '剧本别名形成链式指向（双射失败，人工裁决）别名=%s', aliasStoryId)
+      }
+      return undefined
+    }
+    if (!result.canonicalStoryId) return undefined
+    const target = (await this.dbGet('interlude_story', { id: result.canonicalStoryId }))[0]
+    if (!target) {
+      const key = `dangling:${aliasStoryId}`
+      if (!this.storyAliasProblems.has(key)) {
+        this.storyAliasProblems.add(key)
+        this.reportStandalone('warn', '剧本别名指向不存在的剧本（悬空，忽略重定向）别名=%s 目标=%s', aliasStoryId, result.canonicalStoryId)
+      }
+      return undefined
+    }
+    return result.canonicalStoryId
+  }
+
+  /** M1b 回滚：删除一条别名重定向并留审计。行删除即回滚生效（双向可达由 canonicalStoryId 索引保证）。 */
+  async removeStoryAlias(aliasStoryId: string, reason = 'manual-rollback'): Promise<{ ok: boolean, error?: string }> {
+    const row = this.storyAliasRows.find(item => item.aliasStoryId === aliasStoryId)
+    if (!row) return { ok: false, error: `别名不存在：${aliasStoryId}` }
+    await this.dbRemove('interlude_story_alias', { aliasStoryId })
+    this.storyAliasRows = this.storyAliasRows.filter(item => item.aliasStoryId !== aliasStoryId)
+    await this.appendEntry(row.canonicalStoryId, {
+      kind: 'system', actor: 'system',
+      content: `[通道迁移] 已回滚剧本别名 ${row.aliasStoryId} → ${row.canonicalStoryId}（原因：${reason}）`,
+      occurredAt: new Date().toISOString(), metadata: { aliasRollback: true, aliasStoryId: row.aliasStoryId },
+    }, new Date()).catch(() => undefined)
+    this.reportStandaloneOperation('standard', 'warn', '剧本别名已回滚 别名=%s 原因=%s', aliasStoryId, reason)
+    return { ok: true }
+  }
+
+  /** M1b 只读视图：列出当前别名（管理命令用）。 */
+  listStoryAliases(): StoryAliasRecord[] {
+    return [...this.storyAliasRows]
+  }
+
+  // ── 角色端点管理（P1-1 的显式迁移路径）：账号变更只能经此，入站永不改绑 ──
+
+  /** 注册一个角色端点到既有故事（幂等；accountKey 被其他故事占用时拒绝）。
+   * P1-2：经写队列串行执行——并发 add 不会双双重叠冲突检查；P1-1：落库失败
+   * 不进内存且返回失败。 */
+  async addStoryEndpoint(story: InterludeStory, platform: string, selfId: string, channelKind: 'qq' | 'wechat' = 'qq'): Promise<{ ok: boolean, endpointId?: string, error?: string }> {
+    const account = String(selfId || '').trim()
+    if (!account) return { ok: false, error: '账号不能为空。' }
+    return this.enqueueEndpointWrite(async () => {
+      await this.ensureEndpointRegistry()
+      const now = new Date()
+      const accountKey = endpointAccountKey(platform, account)
+      const conflict = this.endpointRows.find(row => row.ownerKind === 'story-role' && row.accountKey === accountKey)
+      if (conflict) {
+        if (conflict.ownerId === story.id) return { ok: true, endpointId: conflict.id, error: '该账号已注册为本故事端点。' }
+        return { ok: false, error: `账号 ${account} 已被故事 ${conflict.ownerId} 注册（唯一键 role:${accountKey}）。` }
+      }
+      const row: EndpointRow = {
+        id: randomUUID(), ownerKind: 'story-role', ownerId: story.id,
+        channelKind, platform, accountKey, selfId: account,
+        enabled: true, createdAt: now, updatedAt: now,
+      }
+      try {
+        await this.dbCreate('interlude_endpoint', row)
+      } catch (error) {
+        this.reportStandalone('warn', '角色端点写入失败 故事=%s 账号=%s 错误=%s', story.id, account, error)
+        return { ok: false, error: `写入失败：${error instanceof Error ? error.message : String(error)}` }
+      }
+      this.endpointRows.push(row)
+      this.endpointStates.set(row.id, freshEndpointState(row.id))
+    // 第二端点的推导 ID 同步登记别名——其消息经 M1b 重定向直达本故事。
+    await this.recordStoryAlias(storyIdForCharacter(platform, account), story.id, 'endpoint-added', false)
+    await this.appendEntry(story.id, {
+      kind: 'system', actor: 'system',
+      content: `[通道迁移] 角色端点已注册：${platform} 账号 ${account}（${channelKind}）`,
+      occurredAt: now.toISOString(), metadata: { endpointAdded: true, endpointId: row.id },
+    }, now).catch(() => undefined)
+      this.reportStandaloneOperation('standard', 'warn', '角色端点已注册 故事=%s 平台=%s 账号=%s 端点=%s', story.id, platform, account, row.id)
+      return { ok: true, endpointId: row.id }
+    })
+  }
+
+  /** 停用一个角色端点（身份与历史保留；enabled=false 后其消息按陌生账号处理）。 */
+  async disableStoryEndpoint(endpointId: string): Promise<{ ok: boolean, error?: string }> {
+    await this.ensureEndpointRegistry()
+    const row = this.endpointRows.find(item => item.id === endpointId && item.ownerKind === 'story-role')
+    if (!row) return { ok: false, error: `端点不存在：${endpointId}` }
+    if (!row.enabled) return { ok: true, error: '该端点已处于停用状态。' }
+    const enabledRoleRows = this.endpointRows.filter(item => item.ownerKind === 'story-role' && item.ownerId === row.ownerId && item.enabled)
+    if (enabledRoleRows.length <= 1) return { ok: false, error: '不能停用故事的最后一个启用端点。' }
+    await this.dbSet('interlude_endpoint', { id: row.id }, { enabled: false, updatedAt: new Date() }).catch(() => undefined)
+    row.enabled = false
+    this.reportStandaloneOperation('standard', 'warn', '角色端点已停用 故事=%s 账号=%s 端点=%s', row.ownerId, row.selfId, row.id)
+    return { ok: true }
+  }
+
+  /** M3 §八：解析参与者最近活跃端点（EndpointState.connection.observedAt 最新；无则 undefined）。 */
+  private resolveMostActiveEndpointId(participantId: string): string | undefined {
+    const userEndpoints = this.endpointRows.filter(row => row.ownerKind === 'participant-user' && row.ownerId === participantId && row.enabled)
+    if (!userEndpoints.length) return undefined
+    let best: { id: string, observedAt: number } | undefined
+    for (const row of userEndpoints) {
+      const state = this.endpointStates.get(row.id)
+      if (!state?.connection.online) continue
+      if (!best || state.connection.observedAt > best.observedAt) best = { id: row.id, observedAt: state.connection.observedAt }
+    }
+    return best?.id ?? userEndpoints[0]?.id  // 无在线则取第一个启用端点（保守可尝试）
+  }
+
+  /**
+   * Decide whether the narrator needs the multi-platform transport contract.
+   * One platform, including several accounts on that platform, keeps the
+   * lightweight legacy prompt. Only enabled endpoints that are legal targets
+   * for this request are considered; the complete registry is never exposed.
+   */
+  private narrativeEndpointSelection(
+    story: InterludeStory,
+    participants: InterludeParticipant[],
+    groups: Array<{ participantId: string, groupId: string, label: string }>,
+  ): { enabled: boolean, options: NarrativeEndpointOption[] } {
+    const roleRows = this.endpointRows.filter(row => row.ownerKind === 'story-role' && row.ownerId === story.id && row.enabled)
+    const roleAccountKeys = new Set(roleRows.map(row => row.accountKey))
+    const participantIds = new Set(participants.map(item => item.id))
+    const options: NarrativeEndpointOption[] = []
+    const seen = new Set<string>()
+    const add = (row: EndpointRow, targetId: string, targetKind: 'participant' | 'group', conversationKind: 'private' | 'group') => {
+      if (!row.enabled || seen.has(`${row.id}:${targetId}`)) return
+      seen.add(`${row.id}:${targetId}`)
+      options.push({
+        endpointId: row.id, targetId, targetKind, conversationKind,
+        channelKind: row.channelKind,
+        online: this.endpointStates.get(row.id)?.connection.online === true,
+      })
+    }
+    for (const row of this.endpointRows) {
+      if (row.ownerKind === 'participant-user' && participantIds.has(row.ownerId)) {
+        add(row, row.ownerId, 'participant', 'private')
+      }
+    }
+    for (const group of groups) {
+      const groupId = normalizeGroupId(group.groupId)
+      for (const row of roleRows) add(row, group.participantId, 'group', 'group')
+      for (const row of this.endpointRows) {
+        if (row.ownerKind === 'group' && roleAccountKeys.has(row.accountKey)
+          && normalizeGroupId(row.groupId ?? row.ownerId) === groupId) {
+          add(row, group.participantId, 'group', 'group')
+        }
+      }
+    }
+    const channelKinds = new Set(options.map(option => option.channelKind))
+    if (channelKinds.size < 2) return { enabled: false, options: [] }
+    return { enabled: true, options }
+  }
+
+  // ── M2 §1.2：用户端点链接（同一个人的另一个号链入既有参与者）──────────────
+
+  /** 链接用户端点到既有参与者（幂等；accountKey+userId 已属其他参与者时拒绝）。 */
+  async linkParticipantEndpoint(participant: InterludeParticipant, platform: string, userId: string): Promise<{ ok: boolean, endpointId?: string, error?: string }> {
+    const account = String(userId || '').trim()
+    if (!account) return { ok: false, error: '用户 ID 不能为空。' }
+    await this.ensureEndpointRegistry()
+    // 角色端点的 accountKey 决定该用户走哪个通道——与参与者现有端点一致或显式指定。
+    const accountKey = endpointAccountKey(platform, this.resolveRoleAccountKey(participant.storyId, platform))
+    const existing = this.endpointRows.find(row => row.ownerKind === 'participant-user'
+      && row.accountKey === accountKey && String(row.userId ?? '') === account)
+    if (existing) {
+      if (existing.ownerId === participant.id) return { ok: true, endpointId: existing.id, error: '该用户端点已链接到此参与者。' }
+      return { ok: false, error: `用户 ${account} 已链接到参与者 ${existing.ownerId}——一个人格一处。` }
+    }
+    const row: EndpointRow = {
+      id: randomUUID(), ownerKind: 'participant-user', ownerId: participant.id,
+      channelKind: 'qq', platform, accountKey, selfId: accountKey.slice(accountKey.indexOf(':') + 1),
+      userId: account, conversationKind: 'private',
+      enabled: true, createdAt: new Date(), updatedAt: new Date(),
+    }
+    try {
+      await this.dbCreate('interlude_endpoint', row)
+    } catch (error) {
+      this.reportStandalone('warn', '用户端点写入失败 参与者=%s 用户=%s 错误=%s', participant.id, account, error)
+      return { ok: false, error: `写入失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+    this.endpointRows.push(row)
+    this.endpointStates.set(row.id, freshEndpointState(row.id))
+    await this.appendEntry(participant.storyId, {
+      kind: 'system', actor: 'system',
+      content: `[通道迁移] 用户端点已链接：${platform} ${account} → 参与者 ${participant.displayName || participant.id}`,
+      occurredAt: new Date().toISOString(), metadata: { endpointLinked: true, endpointId: row.id },
+    }, new Date()).catch(() => undefined)
+    this.reportStandaloneOperation('standard', 'warn', '用户端点已链接 参与者=%s 平台=%s 用户=%s 端点=%s', participant.id, platform, account, row.id)
+    return { ok: true, endpointId: row.id }
+  }
+
+  /** 解除链接（可撤销；身份与历史保留，enabled=false）。 */
+  async unlinkParticipantEndpoint(endpointId: string): Promise<{ ok: boolean, error?: string }> {
+    await this.ensureEndpointRegistry()
+    const row = this.endpointRows.find(item => item.id === endpointId && item.ownerKind === 'participant-user')
+    if (!row) return { ok: false, error: `用户端点不存在：${endpointId}` }
+    if (!row.enabled) return { ok: true, error: '该端点已处于解除状态。' }
+    await this.dbSet('interlude_endpoint', { id: row.id }, { enabled: false, updatedAt: new Date() }).catch(() => undefined)
+    row.enabled = false
+    await this.appendEntry(row.ownerId.split(':')[0] || '', {
+      kind: 'system', actor: 'system',
+      content: `[通道迁移] 用户端点已解除链接：${row.platform} ${row.userId ?? ''}（端点 ${row.id}）`,
+      occurredAt: new Date().toISOString(), metadata: { endpointUnlinked: true, endpointId: row.id },
+    }, new Date()).catch(() => undefined)
+    this.reportStandaloneOperation('standard', 'warn', '用户端点已解除 端点=%s 参与者=%s', row.id, row.ownerId)
+    return { ok: true }
+  }
+
+  /** 列出参与者名下全部用户端点（含启用状态）。 */
+  listParticipantEndpoints(participantId: string) {
+    return this.endpointRows
+      .filter(row => row.ownerKind === 'participant-user' && row.ownerId === participantId)
+      .map(row => ({ endpointId: row.id, platform: row.platform, userId: row.userId ?? '', enabled: row.enabled }))
+  }
+
+  /** 解析故事的任一角色端点的 accountKey（供用户端点确定通道归属）。 */
+  private resolveRoleAccountKey(storyId: string, platform: string): string {
+    const role = this.endpointRows.find(row => row.ownerKind === 'story-role' && row.ownerId === storyId && row.enabled)
+    if (role) return role.selfId
+    return platform  // 无角色端点时用 platform 兜底（onebot 家族折叠后等效）
+  }
+
+  /** 列出故事的全部角色端点（含在线状态）。 */
+  listStoryEndpoints(storyId: string) {
+    return this.endpointRows
+      .filter(row => row.ownerKind === 'story-role' && row.ownerId === storyId)
+      .map(row => ({
+        endpointId: row.id, platform: row.platform, selfId: row.selfId, channelKind: row.channelKind, enabled: row.enabled,
+        online: this.endpointStates.get(row.id)?.connection.online === true,
+        lastInboundAt: this.endpointStates.get(row.id)?.connection.observedAt,
+      }))
+  }
+
+  /** 入站反向解析（v3 §三）：accountKey → 端点行；未注册返回 undefined（回落旧路径）。 */
+  async resolveInboundEndpointFor(source: { platform: string, selfId: string, userId?: string, groupId?: string, channelId?: string }) {
+    await this.ensureEndpointRegistry()
+    return resolveInboundEndpoint(this.endpointRows, source)
+  }
+
+  /** 条目通道上下文（v3 §十）：注册表命中才返回；未迁移/陌生账号不标注（单平台零影响）。 */
+  private async channelMetadataFor(source: { platform: string, selfId: string, userId?: string, groupId?: string, channelId?: string }, extra: { userId?: string, groupId?: string, channelId?: string } = {}) {
+    const resolution = await this.resolveInboundEndpointFor(source)
+    if (!resolution) return undefined
+    const endpoint = resolution.groupEndpoint ?? resolution.userEndpoint ?? resolution.roleEndpoint
+    return channelContextMetadata(endpoint, extra)
+  }
+
+  /** 入站触达端点状态：连接在线 + 可投递 + 微信主动资格刷新（v3 §四）。 */
+  private async touchEndpointStateInbound(source: { platform: string, selfId: string, userId?: string, groupId?: string, channelId?: string }) {
+    const resolution = await this.resolveInboundEndpointFor(source)
+    if (!resolution) return
+    // P2-10：重复角色端点（脏数据）一次性告警——静默取首行会让地址选择与
+    // qzone 限流的歧义无法追踪。
+    if (resolution.duplicateRoleAccountKeys?.length) {
+      const key = `dup-role:${resolution.duplicateRoleAccountKeys.join(',')}`
+      if (!this.storyAliasProblems.has(key)) {
+        this.storyAliasProblems.add(key)
+        this.reportStandalone('warn', '检测到重复角色端点（脏数据，取首行生效，请人工核查 interlude_endpoint）账号键=%s', resolution.duplicateRoleAccountKeys.join(', '))
+      }
+    }
+    const now = Date.now()
+    for (const endpoint of [resolution.roleEndpoint, resolution.userEndpoint, resolution.groupEndpoint]) {
+      if (!endpoint) continue
+      const previous = this.endpointStates.get(endpoint.id) ?? freshEndpointState(endpoint.id, now)
+      this.endpointStates.set(endpoint.id, stateAfterInbound(previous, now))
+    }
+  }
+
+  /** 连接器在线状态回写（连接/断开事件；v3 §四 connection 维）。 */
+  noteEndpointConnection(accountKey: string, online: boolean) {
+    const now = Date.now()
+    for (const row of this.endpointRows) {
+      if (row.accountKey !== accountKey) continue
+      const previous = this.endpointStates.get(row.id) ?? freshEndpointState(row.id, now)
+      this.endpointStates.set(row.id, stateAfterConnection(previous, online, now))
+    }
+  }
+
+  private endpointDriftWarned = new Set<string>()
+
+  /**
+   * M1a 出站地址解析（v3 §五）：注册表命中且启用时以注册表为准，并核对旧字段
+   * （漂移只告警一次）；未命中/注册表未加载时回落旧字段——单平台零影响。
+   * P2-11：同一 owner 多行时不再"取第一行"——优先最近观测过连接的端点，
+   * 平手按 createdAt 稳定排序，并一次性告警（M2 起多端点归因的正确性基础）。
+   */
+  private endpointAddressSync(legacy: { platform: string, selfId: string }, owner?: { kind: 'story-role' | 'participant-user', id: string }): { platform: string, selfId: string, endpointId?: string } {
+    if (!owner || !this.endpointRegistryReady) return legacy
+    let rows = this.endpointRows.filter(item => item.ownerKind === owner.kind && item.ownerId === owner.id && item.enabled)
+    if (!rows.length) return legacy
+    if (rows.length > 1) {
+      rows = [...rows].sort((left, right) => {
+        const leftOnline = this.endpointStates.get(left.id)?.connection.online === true ? 1 : 0
+        const rightOnline = this.endpointStates.get(right.id)?.connection.online === true ? 1 : 0
+        if (leftOnline !== rightOnline) return rightOnline - leftOnline
+        const leftSeen = this.endpointStates.get(left.id)?.connection.observedAt ?? 0
+        const rightSeen = this.endpointStates.get(right.id)?.connection.observedAt ?? 0
+        if (leftSeen !== rightSeen) return rightSeen - leftSeen
+        return left.createdAt.getTime() - right.createdAt.getTime()
+      })
+      const warnKey = `ambiguous:${owner.kind}:${owner.id}`
+      if (!this.endpointDriftWarned.has(warnKey)) {
+        this.endpointDriftWarned.add(warnKey)
+        this.reportStandalone('warn', '同一归属存在多个启用端点，出站地址按最近连接观测选取 归属=%s:%s 选中=%s', owner.kind, owner.id, rows[0].id)
+      }
+    }
+    const row = rows[0]
+    if (String(row.selfId) !== String(legacy.selfId) || row.platform !== legacy.platform) {
+      const warnKey = `drift:${row.id}:${legacy.platform}:${legacy.selfId}`
+      if (!this.endpointDriftWarned.has(warnKey)) {
+        this.endpointDriftWarned.add(warnKey)
+        this.reportStandalone('warn', '出站地址以端点注册表为准（旧字段漂移）端点=%s 注册=%s/%s 旧=%s/%s', row.id, row.platform, row.selfId, legacy.platform, legacy.selfId)
+      }
+    }
+    return { platform: row.platform, selfId: row.selfId, endpointId: row.id }
+  }
+
+  /** 出站结果回写端点状态（v3 §四 deliverable 维；内存无副作用）。
+   * P2-11：提供 address 时只更新地址匹配的端点——多端点下不串刷兄弟端点。 */
+  private noteEndpointOutbound(owner: { kind: 'story-role' | 'participant-user' | 'group', id: string }, ok: boolean, note: string, address?: { platform: string, selfId: string }) {
+    const now = Date.now()
+    for (const row of this.endpointRows) {
+      if (row.ownerKind !== owner.kind || row.ownerId !== owner.id) continue
+      if (address && (row.platform !== address.platform || String(row.selfId) !== String(address.selfId))) continue
+      const previous = this.endpointStates.get(row.id) ?? freshEndpointState(row.id, now)
+      this.endpointStates.set(row.id, stateAfterOutbound(previous, ok, note, ok ? 0 : 5 * 60_000, now))
+    }
   }
 
   // ── 世界事件播种器：生成回路 + 到期排水 ─────────────────────────────────
@@ -6445,6 +7467,7 @@ export class InterludeService extends Service {
     try {
       const story = await this.getCanonicalStory()
       if (!story || !this.canHandleStory(story)) return
+      const generation = this.taskGeneration(story.id)
       // 抖动：随机跳过部分检查，避免固定节律感（多数运行仍应输出空）。
       if (Math.random() < 0.25) return
       const now = new Date()
@@ -6456,17 +7479,25 @@ export class InterludeService extends Service {
       ])
       const runtime = this.worldSeederRuntime
       if (scheduled.length >= runtime.maxPending || last24.length >= runtime.dailyCap) return
-      const payload = await this.buildWorldSeederPayload(story, now, recentInjected.map(row => String(row.summary)))
+      // 去重窗口必须包含排期中（scheduled）的事件：45 分钟的 sweep 节奏下，第一条
+      // 事件到点注入之前会连跑数轮，若窗口只看已注入（injected），模型每轮都拿到
+      // "近期无事件"的空清单，同一通知的换皮改写会连续排期（用户实测 4 连）。
+      const windowRows = [...scheduled, ...recentInjected]
+      const domain = seedDomainForRun(story.id, now, runtime.cadenceMinutes)
+      const payload = await this.buildWorldSeederPayload(story, now, windowRows.map(row => String(row.summary)), domain)
       const raw = await this.worldSeeder.generate(payload)
+      if (!this.taskGenerationCurrent(story.id, generation)) return
       const drafts = parseWorldSeedEvents(raw)
       if (!drafts.length) {
         this.reportOperation('diagnostic', 'debug', story, 'advance', '世界播种器本轮无事件')
         return
       }
+      // recentSummaries 可变：同批次内已被接受的草稿立即入列，防止一次输出里的互为换皮对。
+      const recentSummaries = windowRows.map(row => String(row.summary))
       const input: SeedValidationInput = {
         now, timezone: story.setting.timezone, maxHorizonHours: runtime.maxHorizonHours,
         blockedNames: await this.worldSeederBlockedNames(story.id),
-        recentSummaries: recentInjected.map(row => String(row.summary)),
+        recentSummaries,
       }
       let pendingCount = scheduled.length
       let dailyCount = last24.length
@@ -6499,7 +7530,7 @@ export class InterludeService extends Service {
 
   /** 上下文 payload：环境（时区/季节/世界设定）、历史剧本（压缩摘录）、
    * 关系网（拉黑名单）、主角所为（workingDetails + 场景/弧摘要）。 */
-  private async buildWorldSeederPayload(story: InterludeStory, now: Date, recentSummaries: string[]) {
+  private async buildWorldSeederPayload(story: InterludeStory, now: Date, recentSummaries: string[], domain?: WorldSeedDomain) {
     const [entries, scene, arc] = await Promise.all([
       this.recentEntriesForPrompt(story.id, now),
       this.activeScene(story.id),
@@ -6507,7 +7538,10 @@ export class InterludeService extends Service {
     ])
     const state = decodeStoryState(story.state)
     const blockedNames = await this.worldSeederBlockedNames(story.id)
-    const compact = compactPromptEntries(entries, 2_000)
+    // 反馈环切断：已注入的世界事件不再进入"近期生活"摘录——播种器的灵感来源
+    // 是她本人的生活，不是自己上一轮的产出（它已单独列在 recentlySeededEvents）。
+    // 否则首轮事件注入后成为下一轮的上下文锚点，同模态复读是必然收敛。
+    const compact = compactPromptEntries(entries.filter(entry => entry.kind !== 'world-event'), 2_000)
       .slice(-14)
       .map(entry => ({ kind: entry.kind, at: entry.occurredAt.toISOString(), text: entry.content.slice(0, 240) }))
     const month = Number(new Intl.DateTimeFormat('en-US', { month: 'numeric', timeZone: story.setting.timezone }).format(now))
@@ -6528,6 +7562,7 @@ export class InterludeService extends Service {
       recentEstablishedLife: compact,
       workingDetails: (state.workingDetails ?? []).map(detail => ({ label: detail.label, value: detail.value })).slice(-8),
       blockedNames,
+      thisRunSlice: domain ? { key: domain.key, label: domain.label, brief: domain.brief } : undefined,
       recentlySeededEvents: recentSummaries.slice(-10),
       constraints: {
         maxHorizonHours: this.worldSeederRuntime.maxHorizonHours,
@@ -6549,7 +7584,15 @@ export class InterludeService extends Service {
   private async drainDueSeededEvents(story: InterludeStory, now: Date, includeLow: boolean) {
     if (!this.worldSeederRuntime.enabled) return
     try {
-      const rows = await this.dbGet('interlude_seeded_event', { storyId: story.id, status: 'scheduled', occursAt: { $lte: now } })
+      const staleClaim = new Date(now.getTime() - 5 * Time.minute)
+      const rows = await this.dbGet('interlude_seeded_event', {
+        storyId: story.id,
+        occursAt: { $lte: now },
+        $or: [
+          { status: 'scheduled' },
+          { status: 'injecting', updatedAt: { $lte: staleClaim } },
+        ],
+      })
       const due = rows
         .map(row => normalizeDatabaseRow('interlude_seeded_event', row) as SeededWorldEvent)
         .sort((left, right) => left.occursAt.getTime() - right.occursAt.getTime())
@@ -6559,14 +7602,22 @@ export class InterludeService extends Service {
           continue
         }
         if (row.importance === 'low' && !includeLow) continue
-        await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'injected', updatedAt: now })
-        const entry = await this.appendEntry(story.id, {
-          kind: 'world-event', actor: 'system',
-          content: `[世界事件] ${row.summary}`,
-          occurredAt: row.occursAt.toISOString(),
-          metadata: { seededEventId: row.id, importance: row.importance },
-        }, now)
-        await this.dbSet('interlude_seeded_event', { id: row.id }, { injectedEntryId: entry.id, updatedAt: now })
+        // Claim before the append so two concurrent drains cannot create two
+        // script entries. Keep the row recoverable if the append fails.
+        await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'injecting', updatedAt: now })
+        let entry: ScriptEntry
+        try {
+          entry = await this.appendEntry(story.id, {
+            kind: 'world-event', actor: 'system',
+            content: `[世界事件] ${row.summary}`,
+            occurredAt: row.occursAt.toISOString(),
+            metadata: { seededEventId: row.id, importance: row.importance },
+          }, now)
+          await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'injected', injectedEntryId: entry.id, updatedAt: now })
+        } catch (error) {
+          await this.dbSet('interlude_seeded_event', { id: row.id }, { status: 'scheduled', updatedAt: now }).catch(() => undefined)
+          throw error
+        }
         this.reportOperation('standard', 'info', story, 'advance', '世界事件已注入 条目=%d 重要性=%s 摘要=%s', entry.id, row.importance, row.summary.slice(0, 60))
       }
     } catch (error) {
@@ -6768,11 +7819,14 @@ export class InterludeService extends Service {
     return true
   }
 
-  private async compactUnlocked(story: InterludeStory, now: Date, force: boolean) {
+  private async compactUnlocked(story: InterludeStory, now: Date, force: boolean, generation?: string) {
+    const taskCurrent = () => !generation || this.taskGenerationCurrent(story.id, generation)
+    if (!taskCurrent()) return false
     const review = await this.prepareSchedulePreplanReview(story, now)
     const context = await this.prepareCompaction(story, now, force)
     if (review?.needsModel && review.request) {
       const proposal = await this.requestSchedulePreplan(story, review.request)
+      if (!taskCurrent()) return false
       const persisted = await this.persistSchedulePreplanReview(story, review, proposal, new Date())
       if (persisted) this.schedulePreplanBackoff.delete(story.id)
       else this.schedulePreplanBackoff.set(story.id, Date.now() + SCHEDULE_PREPLAN_RETRY_BACKOFF)
@@ -6783,6 +7837,7 @@ export class InterludeService extends Service {
     let decision: CompactionDecision = {}
     try {
       decision = await this.compactor.compact(context.compactRequest)
+      if (!taskCurrent()) return false
     } catch (error) {
       this.noteCompactionFailure(story.id, context.fingerprint, error)
       this.report('warn', story, 'advance', '记忆压缩失败：%s', error)
@@ -6793,7 +7848,7 @@ export class InterludeService extends Service {
       if (!await this.compactionCheckpointAdvanced(context)) {
         throw new Error(`Compaction checkpoint did not advance (scene=${context.scene.id}, expected=${context.sceneEntries.at(-1)?.id ?? 0})`)
       }
-      this.compactionBackoff.delete(story.id)
+      this.scheduler.clearBackoff(story.id)
       return result
     } catch (error) {
       this.noteCompactionFailure(story.id, context.fingerprint, error)
@@ -7527,6 +8582,27 @@ export class InterludeService extends Service {
       && (bot.platform === story.platform || isOneBotPlatform(bot.platform) && isOneBotPlatform(story.platform)))
     if (hasLiveStoryBot || (story.platform === session.platform && String(story.selfId) === String(session.selfId))) return story
     const now = new Date()
+    // M1 审计修复 P1-5：多角色端点时先查数量——入站账号不改写任何端点地址，
+    // 仅刷新命中端点的在线状态；地址修复只属于单端点故事（旧世界漂移自愈）。
+    await this.ensureEndpointRegistry()
+    const roleRows = this.endpointRows.filter(row => row.ownerKind === 'story-role' && row.ownerId === story.id)
+    if (roleRows.length > 1) {
+      const newAccountKey = `onebot:${String(session.selfId).trim()}`
+      const hit = roleRows.find(row => row.accountKey === newAccountKey)
+      if (hit) {
+        const previous = this.endpointStates.get(hit.id) ?? freshEndpointState(hit.id)
+        this.endpointStates.set(hit.id, stateAfterConnection(previous, true))
+      }
+      this.reportStandalone('warn', '主剧本拥有多个角色端点，入站账号不改写任何地址 故事=%s 入站=%s 命中=%s', story.id, session.selfId, hit ? '是' : '否')
+      return story
+    }
+    const newAccountKey = `onebot:${String(session.selfId).trim()}`
+    for (const row of roleRows) {
+      if (row.accountKey !== newAccountKey || row.selfId !== String(session.selfId) || row.platform !== session.platform) {
+        await this.dbSet('interlude_endpoint', { id: row.id }, { accountKey: newAccountKey, selfId: String(session.selfId), platform: session.platform, updatedAt: now }).catch(() => undefined)
+        Object.assign(row, { accountKey: newAccountKey, selfId: String(session.selfId), platform: session.platform })
+      }
+    }
     await this.dbSet('interlude_story', { id: story.id }, { platform: session.platform, selfId: session.selfId, updatedAt: now })
     this.reportStandalone('warn', '主剧本投递账号已自愈 故事=%s 平台=%s 账号=%s', story.id, session.platform, session.selfId)
     return { ...story, platform: session.platform, selfId: session.selfId, updatedAt: now }
@@ -7645,12 +8721,30 @@ function participantIdForStory(storyId: string, platform: string, selfId: string
   return `${participantIdFor(platform, selfId, userId)}:${storyId}`.slice(0, 255)
 }
 
+/**
+ * M2 §1.2：端点集合匹配——参与者名下任一启用 user 端点行命中即该参与者；
+ * 注册表未命中时回落旧字段比对（单平台等价）。
+ */
 function sameParticipantEndpoint(participant: InterludeParticipant, session: Session) {
-  const onebotPair = isOneBotPlatform(participant.platform) && isOneBotPlatform(session.platform)
-  return (participant.platform === session.platform || onebotPair)
-    && normalizeAccountId(participant.selfId) === normalizeAccountId(session.selfId)
-    && normalizeAccountId(participant.userId) === normalizeAccountId(session.userId)
+  const legacy = () => {
+    const onebotPair = isOneBotPlatform(participant.platform) && isOneBotPlatform(session.platform)
+    return (participant.platform === session.platform || onebotPair)
+      && normalizeAccountId(participant.selfId) === normalizeAccountId(session.selfId)
+      && normalizeAccountId(participant.userId) === normalizeAccountId(session.userId)
+  }
+  const service = activeServiceForEndpoints as any
+  if (!service?.endpointRegistryReady) return legacy()
+  const rows = (service.endpointRows as EndpointRow[]).filter(row =>
+    row.ownerKind === 'participant-user' && row.ownerId === participant.id && row.enabled)
+  if (!rows.length) return legacy()
+  const sessionAccountKey = endpointAccountKey(session.platform, String(session.selfId ?? ''))
+  const sessionUserId = normalizeAccountId(session.userId)
+  return rows.some(row => row.accountKey === sessionAccountKey
+    && normalizeAccountId(row.userId ?? '') === sessionUserId)
 }
+
+/** sameParticipantEndpoint 需要读注册表——由构造器绑定当前 service 实例。 */
+let activeServiceForEndpoints: InterludeService | null = null
 
 function isOneBotPlatform(platform: string | undefined) {
   const value = String(platform ?? '').toLowerCase()
@@ -8620,7 +9714,9 @@ function webObservationEntryContent(observation: WebObservation) {
 }
 
 export function normalizeInteraction(value: unknown, now: Date, runtime: RuntimeConfig): NarrativeInteraction | undefined {
-  if (!isRecord(value) || typeof value.seen !== 'boolean' || !isRecord(value.reply)) return undefined
+  // DeepSeek V4.1 实测：偶发漏掉 seen 布尔——reply 本身有效时按已读处理，
+  // 不得因缺一个信息性字段丢弃整条已发送回复（丢弃会直接变成"回复模式 none"）。
+  if (!isRecord(value) || !isRecord(value.reply)) return undefined
   let mode: string | undefined = typeof value.reply.mode === 'string' ? value.reply.mode : undefined
   if (mode !== 'none' && mode !== 'immediate' && mode !== 'delayed') {
     // 弱模型常输出 mode:"text"/"send"/"reply" 或漏掉 mode——只要带了 content 就视为 immediate，
@@ -8642,7 +9738,7 @@ export function normalizeInteraction(value: unknown, now: Date, runtime: Runtime
   // seen 只描述是否读了新消息；reply 是独立的发送通道。跟进/到期回合协议
   // 规定 seen=false，若在此处因 seen 抹掉回复，“稍后读到再回”的自救路径
   // 会被无声斩断（模型写进了剧本的发送与投递现实分裂）。
-  const seen = value.seen === true
+  const seen = typeof value.seen === 'boolean' ? value.seen : true
   if (mode === 'none') return { seen, reply: { mode: 'none' } }
   if (!content) return { seen, reply: { mode: 'none' } }
   if (mode === 'immediate') return { seen, reply: { mode: 'immediate', content } }
@@ -8726,11 +9822,12 @@ function normalizeConversationAction(value: unknown, runtime: RuntimeConfig, per
     : undefined
   if (proactive && (willingness === undefined || willingness < (runtime.proactiveWillingnessThreshold ?? 0.65))) return undefined
   const reason = typeof value.reason === 'string' ? clip(value.reason, 300) : undefined
-  if (value.mode === 'immediate') return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
+  const endpointId = typeof value.endpointId === 'string' && value.endpointId.trim() ? value.endpointId.trim() : undefined
+  if (value.mode === 'immediate') return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, ...(endpointId ? { endpointId } : {}), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
   const sendAt = toDate(value.sendAt)
   const delay = sendAt?.getTime() - now.getTime()
   if (!sendAt || delay < runtime.minimumDelayedReplySeconds * 1_000 || delay > runtime.maximumDelayedReplyMinutes * Time.minute) return undefined
-  return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, sendAt: sendAt.toISOString(), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
+  return { participantId: groupTarget ? `group:${targetId}` : targetId, mode: value.mode, content, sendAt: sendAt.toISOString(), ...(endpointId ? { endpointId } : {}), ...(willingness === undefined ? {} : { willingness }), ...(reason ? { reason } : {}) }
 }
 
 function permittedOrGlobal(value: unknown, fallback: string, permittedParticipantIds: Set<string>) {

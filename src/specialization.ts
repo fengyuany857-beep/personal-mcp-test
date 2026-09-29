@@ -92,6 +92,8 @@ export interface FamilyOverride {
   extraAfterPhase?: string
 }
 
+const EXTRA_DEEPSEEK = 'TRANSPORT IS PER-TURN: the interaction object is required on every live turn, no matter how many turns came before. recentScript shows past replies as plain authored text without any transport object — that is history, not a template; never copy its shape or treat the field as optional because history omits it. Decide reply.mode only from the script you just wrote for this turn. interaction.seen is a required boolean — true when she reads the current message content, false otherwise; never omit it.'
+
 /** 家族覆盖表：仅在对应档位组装时应用；generic 与未列出的家族无偏移。 */
 export function familyOverrides(family: ModelFamily): FamilyOverride {
   switch (family) {
@@ -99,7 +101,7 @@ export function familyOverrides(family: ModelFamily): FamilyOverride {
     case 'claude': return { length: LENGTH_CLAUDE, extraAfterPhase: EXTRA_CLAUDE }
     case 'glm': return { extraAfterPhase: EXTRA_GLM }
     case 'kimi': return { typed: TYPED_MESSAGES_KIMI }
-    case 'deepseek': return { length: LENGTH_DEEPSEEK }
+    case 'deepseek': return { length: LENGTH_DEEPSEEK, extraAfterPhase: EXTRA_DEEPSEEK }
     case 'grok': return { length: LENGTH_GROK }
     case 'gpt': return { length: LENGTH_GPT }
     default: return {}
@@ -110,6 +112,7 @@ export function familyOverrides(family: ModelFamily): FamilyOverride {
 // lite 档组装复用同一常量，避免协议句多份手工同步）──
 
 export const CONTENT_ONLY_TRANSPORT = 'TRANSPORT: reply.content contains the message text. Use mode=immediate when she sends now, mode=none when silent. For several separate chat bubbles, place <sep/> between them inside content. Line breaks never separate bubbles; only <sep/> does.'
+
 
 // ── LITE 档专用块 ─────────────────────────────────────────────────────────
 

@@ -6,7 +6,7 @@
 
 HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
-当前版本：`1.0.1-rc24`（11 项缺陷修复：迁移/压缩缓存/命令识别/时间解析/协议救援/日程窗口/分页游标/失败重试等；见 [更新记录](docs/CHANGELOG.md)）。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
+当前版本：`1.0.1-rc28`（单剧本多通道 M2/M3/M4 全量：回合来源追踪/用户端点链接/显式端点投递/确定性通道标注/多平台端点选择；DeepSeek V4.1 回复模式修复；世界事件切面轮换架构修订；文档补全。前版：TurnEngine/Scheduler 模块化；九项能力修复与 invalidate 边界；见 [更新记录](docs/CHANGELOG.md)）。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
 
 ## 文档导航
 
@@ -292,19 +292,19 @@ npm install koishi-plugin-hds-interlude@beta
 使用本地预发布包时，可在 Koishi 实例目录执行：
 
 ```bash
-npm install /absolute/path/to/koishi-plugin-hds-interlude-1.0.1-rc24.tgz
+npm install /absolute/path/to/koishi-plugin-hds-interlude-1.0.1-rc28.tgz
 ```
 
 Windows 示例：
 
 ```powershell
-npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-1.0.1-rc24.tgz
+npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-1.0.1-rc28.tgz
 ```
 
 Koishi Desktop 的实例使用 Yarn 4。请在实例目录执行以下命令，并在完成后重载插件或重启 Desktop：
 
 ```powershell
-corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc24.tgz" --exact
+corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc28.tgz" --exact
 ```
 
 安装后重新加载 Koishi，再在 Console 启用插件。

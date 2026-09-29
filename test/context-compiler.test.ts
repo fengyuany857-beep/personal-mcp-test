@@ -33,3 +33,11 @@ test('scene evidence already visible in recentScript is not injected twice', () 
   assert.equal(compiled.currentSceneEvidence.sceneId, undefined)
   assert.equal(compiled.relevantEstablishedEpisodes.recentScript[0].content, '她仍在书桌前。')
 })
+
+test('availableOutgoingEndpoints rides ongoingThreads and is dropped when absent', () => {
+  const options = [{ endpointId: 'ep-1', targetId: 'p1', targetKind: 'participant', channelKind: 'wechat', conversationKind: 'private', online: true }]
+  const compiled = compileNarrativeContext({ availableOutgoingEndpoints: options }, undefined, undefined)
+  assert.strictEqual(compiled.ongoingThreads.availableOutgoingEndpoints, options)
+  const single = compileNarrativeContext({}, undefined, undefined)
+  assert.equal('availableOutgoingEndpoints' in single.ongoingThreads, false)
+})

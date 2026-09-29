@@ -10,6 +10,10 @@ export const DEFAULT_AGENCY_CONFIG: AgencyConfig = {
   maxWindowMinutes: 240,
   minimumProactiveIntervalMinutes: 60,
   maxCandidateHours: 24,
+  contactMode: 'strict',
+  naturalWillingnessThreshold: 0.25,
+  naturalMinimumIntervalMinutes: 30,
+  proactiveDailyCap: 3,
 }
 
 export interface AgencyCapacityResult {
@@ -19,7 +23,18 @@ export interface AgencyCapacityResult {
 }
 
 export function resolveAgencyConfig(value?: Partial<AgencyConfig>): AgencyConfig {
-  return { ...DEFAULT_AGENCY_CONFIG, ...value }
+  const merged = { ...DEFAULT_AGENCY_CONFIG, ...value } as AgencyConfig
+  const clampNumber = (candidate: unknown, min: number, max: number, fallback: number) => {
+    const parsed = Number(candidate)
+    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback
+  }
+  return {
+    ...merged,
+    contactMode: merged.contactMode === 'natural' || merged.contactMode === 'balanced' ? merged.contactMode : 'strict',
+    naturalWillingnessThreshold: clampNumber(merged.naturalWillingnessThreshold, 0, 1, 0.25),
+    naturalMinimumIntervalMinutes: Math.floor(clampNumber(merged.naturalMinimumIntervalMinutes, 0, 10_080, 30)),
+    proactiveDailyCap: Math.floor(clampNumber(merged.proactiveDailyCap, 0, 20, 3)),
+  }
 }
 
 export function normalizeAgencyWindowState(value: unknown): AgencyWindowState | undefined {

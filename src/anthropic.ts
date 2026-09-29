@@ -90,6 +90,11 @@ export async function requestAnthropicStreaming(endpoint: string, body: Record<s
   onText?: (text: string) => Promise<void>, collect?: (usage: unknown) => void) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeout)
+  // 首帧守卫：部分网关接受连接后长时间静默。总超时仍然兜底，但这里让
+  // "无任何响应"的失败在 timeout/3（至多 30s）内暴露，而不是耗满全程。
+  const firstFrameTimeout = Math.min(Math.floor(timeout / 3), 30_000)
+  let receivedAnyFrame = false
+  const firstFrameTimer = setTimeout(() => { if (!receivedAnyFrame) controller.abort() }, firstFrameTimeout)
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
   let usage: Record<string, unknown> = {}, hasUsage = false
   try {
@@ -129,6 +134,10 @@ export async function requestAnthropicStreaming(endpoint: string, body: Record<s
     }
     while (!stopped) {
       const chunk = await reader.read()
+      if (chunk.value?.length || chunk.done) {
+        receivedAnyFrame = true
+        clearTimeout(firstFrameTimer)
+      }
       pending += decoder.decode(chunk.value, { stream: !chunk.done })
       const frames = pending.split(/\r?\n\r?\n/)
       pending = frames.pop() || ''
@@ -140,10 +149,11 @@ export async function requestAnthropicStreaming(endpoint: string, body: Record<s
     if (!text) throw new Error('Anthropic stream ended without visible text.')
     return text
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(`Anthropic streaming request timed out after ${timeout}ms.`)
+    if (controller.signal.aborted) throw new Error(`Anthropic streaming request timed out after ${!receivedAnyFrame ? `first frame within ${firstFrameTimeout}ms` : `${timeout}ms`}.`)
     throw error
   } finally {
     clearTimeout(timer)
+    clearTimeout(firstFrameTimer)
     await reader?.cancel().catch(() => {})
     if (hasUsage) collect?.(anthropicUsage(usage))
   }

@@ -12,6 +12,8 @@ import type { InterludeStory, InterludeParticipant, NarrativeIntent, QuotedMessa
 export interface BufferedUserMessage {
   content: string
   occurredAt: Date
+  /** Registered inbound endpoint for deterministic batch attribution. */
+  endpointId?: string
   supersededIntents: NarrativeIntent[]
   imageSources: string[]
   audioSources: string[]
@@ -28,6 +30,17 @@ export interface BufferedNarrativeTurn {
   inFlightRequestId?: number
   firstMessageCommittedRequestId?: number
   obsoleteRequestIds: Set<number>
+  /** Requests invalidated by an administrative reset/purge must not be requeued. */
+  discardedRequestIds?: Set<number>
+  /** M2 §1.3：本回合涉及端点按接收序号有序；空 = 未解析（单端点等价）。 */
+  sources: Array<{ endpointId: string, receivedSeq: number }>
+  /** Snapshot used by the request currently being flushed. */
+  activeSources?: Array<{ endpointId: string, receivedSeq: number }>
+  /** Endpoint ids represented by the messages in the active debounce batch. */
+  activeBatchEndpointIds?: string[]
+  /** Number of messages represented by the active batch (including legacy
+   * messages whose endpoint could not be resolved). */
+  activeBatchMessageCount?: number
 }
 
 /** 最小依赖集——不含模型调用/投递/持久化（那些留在 service）。 */
@@ -56,7 +69,7 @@ export interface TurnEngine {
     story: InterludeStory, participant: InterludeParticipant, session: Session,
     now: Date, supersededIntents: NarrativeIntent[],
     content: string, imageSources: string[], audioSources: string[], quote: QuotedMessageContext | undefined,
-    flushTrigger: (key: string, revision: number) => void,
+    flushTrigger: (key: string, revision: number) => void, endpointId?: string,
   ): void
 
   signalIncomingInterruption(story: InterludeStory, participant: InterludeParticipant): void
@@ -75,6 +88,9 @@ export interface TurnEngine {
   /** 使全部（或指定故事的）回合失效。 */
   invalidateNarratives(storyId?: string, invalidateGroups?: (storyId?: string) => void): void
 
+  /** M2 §1.3：追加本回合来源端点（同回合第二端点追加而非新回合）。 */
+  recordSource(key: string, endpointId: string, receivedSeq: number): void
+
   /** 只读查询 */
   isNarrating(storyId: string): boolean
   getTurn(key: string): BufferedNarrativeTurn | undefined
@@ -89,18 +105,20 @@ export function createTurnEngine(deps: TurnEngineDeps): TurnEngine {
     story: InterludeStory, participant: InterludeParticipant, session: Session,
     now: Date, supersededIntents: NarrativeIntent[],
     content: string, imageSources: string[], audioSources: string[], quote: QuotedMessageContext | undefined,
-    flushTrigger: (key: string, revision: number) => void,
+    flushTrigger: (key: string, revision: number) => void, endpointId?: string,
   ) {
     const key = participant.id
     const existing = turns.get(key)
     const turn: BufferedNarrativeTurn = existing ?? {
-      storyId: story.id, participantId: participant.id, messages: [], nextRevision: 0, obsoleteRequestIds: new Set(),
+      storyId: story.id, participantId: participant.id, messages: [], nextRevision: 0,
+      obsoleteRequestIds: new Set(), discardedRequestIds: new Set(), sources: [],
     }
     if (shouldSupersedeRequest(turn.inFlightRequestId, turn.firstMessageCommittedRequestId, turn.obsoleteRequestIds)) {
       turn.obsoleteRequestIds.add(turn.inFlightRequestId!)
       deps.reportOperation('standard', 'info', story, 'user-message', '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
     }
-    turn.messages.push({ content, occurredAt: now, supersededIntents, imageSources, audioSources, ...(quote !== undefined && quote !== null ? { quote } : {}) })
+    turn.messages.push({ content, occurredAt: now, supersededIntents, imageSources, audioSources,
+      ...(endpointId ? { endpointId } : {}), ...(quote !== undefined && quote !== null ? { quote } : {}) })
     turn.latestSession = session
     if (turn.timer) turn.timer()
     const revision = ++turn.nextRevision
@@ -135,6 +153,8 @@ export function createTurnEngine(deps: TurnEngineDeps): TurnEngine {
     }
     narrating.add(turn.storyId)
     turn.timer = undefined
+    turn.activeSources = turn.sources
+    turn.sources = []
     return turn
   }
 
@@ -144,9 +164,16 @@ export function createTurnEngine(deps: TurnEngineDeps): TurnEngine {
     if (turn.inFlightRequestId === requestId) {
       turn.inFlightRequestId = undefined
       turn.firstMessageCommittedRequestId = undefined
+      // These fields describe only the request that just ended. Clear them
+      // before a pending replacement batch or an automatic continuation can
+      // reuse the same turn owner.
+      turn.activeSources = undefined
+      turn.activeBatchEndpointIds = undefined
+      turn.activeBatchMessageCount = undefined
       narrating.delete(turn.storyId)
     }
     turn.obsoleteRequestIds.delete(requestId)
+    turn.discardedRequestIds?.delete(requestId)
     if (!turn.messages.length && !turn.timer && !turn.inFlightRequestId) turns.delete(key)
   }
 
@@ -163,16 +190,35 @@ export function createTurnEngine(deps: TurnEngineDeps): TurnEngine {
     for (const [key, turn] of turns) {
       if (storyId && turn.storyId !== storyId) continue
       if (turn.timer) turn.timer()
-      if (turn.inFlightRequestId) turn.obsoleteRequestIds.add(turn.inFlightRequestId)
-      turns.delete(key)
+      if (turn.inFlightRequestId != null) {
+        // Keep an in-flight owner in the map until endFlush() runs. Deleting it
+        // here would strand narrating.has(storyId)=true forever because the
+        // completion callback would no longer have a turn through which to
+        // release the story claim. Clear only buffered work; a later message
+        // may reuse this owner while the obsolete request is winding down.
+        turn.obsoleteRequestIds.add(turn.inFlightRequestId)
+        ;(turn.discardedRequestIds ??= new Set()).add(turn.inFlightRequestId)
+        turn.messages.length = 0
+        turn.timer = undefined
+      } else {
+        turns.delete(key)
+      }
     }
     invalidateGroups?.(storyId)
+  }
+
+  function recordSource(key: string, endpointId: string, receivedSeq: number) {
+    const turn = turns.get(key)
+    if (!turn) return
+    if (turn.sources.some(source => source.endpointId === endpointId)) return
+    turn.sources.push({ endpointId, receivedSeq })
+    turn.sources.sort((left, right) => left.receivedSeq - right.receivedSeq)
   }
 
   return {
     turns, narrating,
     bufferUserNarrative, signalIncomingInterruption, hasPendingNarrative,
-    beginFlush, endFlush, rescheduleTimers, invalidateNarratives,
+    beginFlush, endFlush, rescheduleTimers, invalidateNarratives, recordSource,
     isNarrating: (storyId: string) => narrating.has(storyId),
     getTurn: (key: string) => turns.get(key),
     pendingTurnCount: () => turns.size,

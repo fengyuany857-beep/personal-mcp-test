@@ -1,6 +1,6 @@
 # HDS Interlude 管理与查看指令
 
-适用版本：`1.0.1-rc24`
+适用版本：`1.0.1-rc28`
 ## 使用前先看这里
 
 - 新手安装和首次测试：`BEGINNER_GUIDE.md`
@@ -50,6 +50,13 @@ sharedStory:
 | `interlude.init [旧名称]` | 管理员 | 兼容别名；名称参数已忽略，请改用 `interlude.story.start` |
 | `interlude.status` | 白名单用户 | 查看故事状态、运行游标、主动消息与 Agency Window |
 | `interlude.setup <JSON>` | 管理员 | 修改当前故事的基础设定（Canon） |
+| `interlude.qzone <内容>` | 管理员 | 经限流门以她本人身份发一条 QQ 空间说说（需 Console 启用【扩展 16】且 SnowLuma 在线；默认好友可见） |
+| `interlude.story.alias [remove <别名ID>]` | 管理员 | 查看/回滚剧本别名重定向（单剧本多通道 M1b；回滚写审计） |
+| `interlude.story.endpoint [add <平台> <账号> [qq\|wechat] \| disable <端点ID>]` | 管理员 | 管理剧本的角色端点（账号迁移唯一显式途径；多通道 M2：注册/停用/列出） |
+| `interlude.reset` | 管理员 | 询问 y/n 后完全重置——清空数据库并将故事设定重置为 Console 档案当前值 |
+| `interlude.participant.link <参与者ID> <用户ID>` | 管理员 | 把同一个人的另一个号链入既有参与者（第二端点消息进入同一关系分支；单剧本多通道 M2） |
+| `interlude.participant.unlink <端点ID>` | 管理员 | 解除一个用户端点链接（可撤销；身份与历史保留） |
+| `interlude.participant.endpoints <参与者ID>` | 管理员 | 列出参与者名下全部用户端点 |
 | `interlude.pause` | 管理员 | 暂停自动推进、延迟处理和主动处理 |
 | `interlude.resume` | 管理员 | 恢复自动处理 |
 | `interlude.advance` | 管理员 | 立即将剧本补写到当前真实时间 |
@@ -110,6 +117,14 @@ interlude.story.start
 - 剧本游标 `cursorAt`
 - 当前主模型连接
 - 是否允许主动可见消息
+
+### `interlude.story.endpoint [operation:text]`
+
+不带参数列出当前剧本的全部角色端点（ID/平台/账号/通道/状态）。`add <平台> <账号> [qq|wechat]` 注册新端点——平台填渠道侧标识（如 onebot），第三参显式指定通道类型（缺省按平台推断）；`disable <端点ID>` 停用端点（不删除，投递立即回退其余端点）。这是账号迁移的唯一显式途径：她的 QQ 换号、接入微信，都经此命令登记后自动进入端点注册表与通道标注。
+
+### `interlude.reset`
+
+危险操作：询问 y/n 后清空数据库并把故事设定重置为 Console 档案当前值（角色身份回到 storyDefaults 模板）。仅在愿意丢弃全部剧本、记忆与投递历史时使用；日常回退请用 `interlude.story.alias` / `interlude.timeline.rebase`。
 
 ### `interlude.setup <JSON>`
 

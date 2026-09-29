@@ -33,7 +33,22 @@ export declare const DEFAULT_WORLD_SEEDER_RUNTIME: WorldSeederRuntime;
 /** 提供商不再单独配置：模型中心的连接行勾选“用于世界播种”（useForWorldSeeding）
  * 即为选择；服务侧解析出该连接后传入。未勾选（provider 为空）即视为关闭。 */
 export declare function resolveWorldSeederRuntime(value: unknown, provider?: ProviderConfig): WorldSeederRuntime;
-export declare function worldSeederSystemPrompt(): string;
+/**
+ * 世界切面（domain rotation）：切面是任意居住世界都成立的通用方面（非现代地球专属题材），
+ * 具体面貌由各剧本自己的 worldSetting 决定。复读的架构根源不是缺闸门，而是"每轮提问完全相同
+ * + 生活摘录被自己上一轮的产出锚定"。切面让每轮 sweep 面向世界的一个不同局部
+ * 提问——生成侧的多样性来自提问本身，不来自下游过滤。切面按 (storyId, 时间槽)
+ * 确定性轮换，无新增持久状态。
+ */
+export interface WorldSeedDomain {
+    key: string;
+    label: string;
+    brief: string;
+}
+export declare const WORLD_SEED_DOMAINS: WorldSeedDomain[];
+/** 同一 (storyId, cadence 时间槽) 内切面稳定；跨槽前进一格——相邻两轮必然不同切面。 */
+export declare function seedDomainForRun(storyId: string, slotStart: Date, cadenceMinutes: number): WorldSeedDomain;
+export declare function worldSeederSystemPrompt(domain?: WorldSeedDomain): string;
 export interface SeedValidationInput {
     now: Date;
     timezone: string;

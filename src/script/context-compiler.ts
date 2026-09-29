@@ -48,6 +48,7 @@ export function compileNarrativeContext(
       currentParticipant: payload.currentParticipant,
       participants: payload.participants,
       availableGroupTargets: payload.availableGroupTargets,
+      availableOutgoingEndpoints: payload.availableOutgoingEndpoints,
       activeConsequences: payload.activeConsequences,
       followUpCommitments: payload.followUpCommitments,
       contactThreads: payload.contactThreads,
@@ -70,6 +71,8 @@ export function compileNarrativeContext(
       groupContext: payload.groupContext,
       chatCapabilities: payload.chatCapabilities,
       stickerCatalog: payload.stickerCatalog,
+      // M4 §十：确定性通道标注——命中五规则时注入 channelContext + 简短标记
+      channelContext: projectChannelContext(payload),
     }),
     authoringWindow: compactObject({
       phase: payload.phase,
@@ -125,4 +128,85 @@ function sourced(frame: SceneFrame, field: keyof SceneFrame['sources'], recentEn
 
 function compactObject(value: Record<string, unknown>) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined))
+}
+/**
+ * M4 §十：确定性通道标注五规则——命中即标，格式为结构化 channel 上下文 +
+ * 简短标记（[微信·私]）。投递不依赖标注，漏标后果限质感层面。
+ *
+ * 规则（V3 §十原文）：
+ * 1. 回合内端点切换（turn.sources.length > 1）
+ * 2. 同批消息多端点（currentEvent 含多端点来源）
+ * 3. 私聊↔群聊切换（上一条目与当前 different conversationKind）
+ * 4. 同一参与者不同端点连续出现
+ * 5. 回复目标 ≠ 来源端点（transport 目标端点不同于最后入站端点）
+ */
+export interface ChannelAnnotation {
+  /** 简短标记：[QQ·私] / [微信·私] / [QQ·群] 等 */
+  tag: string
+  /** 触发的规则列表（供诊断/测试） */
+  rules: string[]
+  /** 当前回合涉及的端点（来自 turn.sources） */
+  sources: Array<{ endpointId: string, channelKind: string, receivedSeq: number }>
+}
+
+export function projectChannelContext(payload: Record<string, any>): ChannelAnnotation | undefined {
+  const rules: string[] = []
+  const sources: ChannelAnnotation['sources'] = []
+
+  // 从 payload 中提取通道信息（service 侧在构建 NarrativeRequest 时注入）
+  const turnSources = payload._channelTurnSources
+  const lastEntryChannel = payload._channelLastEntryChannel
+  const currentChannel = payload._channelCurrentChannel
+  const replyEndpoint = payload._channelReplyEndpoint
+  const participant = payload.currentParticipant
+
+  // 来源端点集是标注的证据，即使只命中规则 3/4/5 也应保留。
+  // 过滤无效值并按接收序号稳定排序，避免模型看到 NaN/空端点。
+  if (Array.isArray(turnSources)) {
+    const seen = new Set<string>()
+    for (const source of turnSources) {
+      const endpointId = String(source?.endpointId ?? '').trim()
+      if (!endpointId || seen.has(endpointId)) continue
+      const receivedSeq = Number(source?.receivedSeq)
+      sources.push({
+        endpointId,
+        channelKind: source?.channelKind === 'wechat' ? 'wechat' : 'qq',
+        receivedSeq: Number.isSafeInteger(receivedSeq) && receivedSeq >= 0 ? receivedSeq : 0,
+      })
+      seen.add(endpointId)
+    }
+    sources.sort((left, right) => left.receivedSeq - right.receivedSeq || left.endpointId.localeCompare(right.endpointId))
+    if (sources.length > 1) rules.push('multi-endpoint-turn')
+  }
+
+  // 规则 2：同批消息多端点（currentEvent 含 multiEndpoint 标记）
+  if (payload.currentEvent?.multiEndpoint === true || payload._channelBatchMultiEndpoint === true) rules.push('batch-multi-endpoint')
+
+  // 规则 3：私聊↔群聊切换
+  if (lastEntryChannel?.conversationKind && currentChannel?.conversationKind
+    && lastEntryChannel.conversationKind !== currentChannel.conversationKind) {
+    rules.push('conversation-kind-switch')
+  }
+
+  // 规则 4：同一参与者不同端点连续出现
+  if (lastEntryChannel?.endpointId && currentChannel?.endpointId
+    && lastEntryChannel.endpointId !== currentChannel.endpointId
+    && participant?.id) {
+    rules.push('participant-endpoint-switch')
+  }
+
+  // 规则 5：回复目标 ≠ 来源端点
+  if (replyEndpoint?.endpointId && currentChannel?.endpointId
+    && replyEndpoint.endpointId !== currentChannel.endpointId) {
+    rules.push('reply-target-differs')
+  }
+
+  if (!rules.length) return undefined
+
+  // 构建简短标记
+  const kind = currentChannel?.channelKind === 'wechat' ? '微信' : 'QQ'
+  const conv = currentChannel?.conversationKind === 'group' ? '群' : '私'
+  const tag = `[${kind}·${conv}]`
+
+  return { tag, rules, sources }
 }

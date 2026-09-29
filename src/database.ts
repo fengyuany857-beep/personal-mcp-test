@@ -3,6 +3,9 @@ import {
   InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent,
   NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, SeededWorldEvent, StatePatchProposal, StickerAsset, WebObservation,
 } from './types'
+import type { QzonePostRecord } from './qzone'
+import type { EndpointRow, StoryAliasRecord } from './endpoints'
+import type { WorkRow } from './works'
 
 declare module 'koishi' {
   interface Tables {
@@ -20,6 +23,10 @@ declare module 'koishi' {
     interlude_web_observation: WebObservation
     interlude_schedule_preplan: SchedulePreplanRecord
     interlude_seeded_event: SeededWorldEvent
+    interlude_qzone_post: QzonePostRecord
+    interlude_endpoint: EndpointRow
+    interlude_story_alias: StoryAliasRecord
+    interlude_work: WorkRow
   }
 }
 
@@ -36,11 +43,18 @@ export function registerTables(ctx: Context) {
     if (existingTables.interlude_fact && !existingTables.interlude_fact.fields?.knowledge) {
       ctx.model.extend('interlude_fact', { knowledge: 'json' })
     }
+    if (existingTables.interlude_qzone_post && !existingTables.interlude_qzone_post.fields?.endpointId) {
+      ctx.model.extend('interlude_qzone_post', { endpointId: 'string(63)' })
+    }
     if (!existingTables.interlude_web_observation) registerWebObservationTable(ctx)
     if (!existingTables.interlude_overlay_snapshot) registerOverlaySnapshotTable(ctx)
     if (!existingTables.interlude_sticker) registerStickerTable(ctx)
     if (!existingTables.interlude_schedule_preplan) registerSchedulePreplanTable(ctx)
     if (!existingTables.interlude_seeded_event) registerSeededEventTable(ctx)
+    if (!existingTables.interlude_qzone_post) registerQzonePostTable(ctx)
+    if (!existingTables.interlude_endpoint) registerEndpointTable(ctx)
+    if (!existingTables.interlude_story_alias) registerStoryAliasTable(ctx)
+    if (!existingTables.interlude_work) registerWorkTable(ctx)
     return
   }
 
@@ -112,6 +126,10 @@ export function registerTables(ctx: Context) {
   registerStickerTable(ctx)
   registerSchedulePreplanTable(ctx)
   registerSeededEventTable(ctx)
+  registerQzonePostTable(ctx)
+  registerEndpointTable(ctx)
+  registerStoryAliasTable(ctx)
+  registerWorkTable(ctx)
 }
 
 function registerScriptEntryEmbedding(ctx: Context, tables = (ctx.model as any).tables ?? {}) {
@@ -161,6 +179,37 @@ function registerSeededEventTable(ctx: Context) {
   }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'occursAt'] })
 }
 
+function registerQzonePostTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_qzone_post) return
+  // 空间动作审计行：限流门（当日计数/最小间隔）与投递结果追溯共用。
+  ctx.model.extend('interlude_qzone_post', {
+    id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
+    targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+    status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
+  }, { primary: 'id', autoInc: true, indexes: ['storyId', 'kind', 'status', 'createdAt'] })
+}
+
+/** M1b 剧本别名：推导 ID → 稳定剧本 ID 的重定向；回滚 = 删行，行自带审计（reason/时间）。 */
+function registerStoryAliasTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_story_alias) return
+  ctx.model.extend('interlude_story_alias', {
+    aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
+  }, { primary: 'aliasStoryId', indexes: ['canonicalStoryId'] })
+}
+
+function registerEndpointTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_endpoint) return
+  // 端点注册表（M1a）：身份与地址分离——主键为持久随机 ID，accountKey 等地址字段
+  // 可变；唯一性靠唯一键约束在应用层校验（endpointUniqueKey）。
+  ctx.model.extend('interlude_endpoint', {
+    id: 'string(63)', ownerKind: 'string(24)', ownerId: 'string(255)',
+    channelKind: 'string(8)', platform: 'string(63)', accountKey: 'string(127)', selfId: 'string(63)',
+    userId: 'string(127)', channelId: 'string(127)', groupId: 'string(127)',
+    conversationKind: 'string(16)', enabled: 'boolean',
+    createdAt: 'timestamp', updatedAt: 'timestamp',
+  }, { primary: 'id', indexes: ['accountKey', 'ownerKind', 'ownerId'] })
+}
+
 function registerSchedulePreplanTable(ctx: Context) {
   if ((ctx.model as any).tables?.interlude_schedule_preplan) return
   ctx.model.extend('interlude_schedule_preplan', {
@@ -169,4 +218,11 @@ function registerSchedulePreplanTable(ctx: Context) {
     lastEvidenceEntryId: 'unsigned', reviewReason: 'text', regimes: 'json', exceptions: 'json', materializedDays: 'json',
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, { primary: 'storyId', indexes: ['validThrough', 'lastReviewedLocalDate'] })
+}
+
+function registerWorkTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_work) return
+  ctx.model.extend('interlude_work', {
+    id: 'string(64)', storyId: 'string(255)', participantId: 'string(255)', generation: 'unsigned', state: 'json',
+  }, { primary: 'id' })
 }

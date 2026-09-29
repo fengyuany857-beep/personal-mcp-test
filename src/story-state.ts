@@ -16,7 +16,7 @@ const KNOWN_STORY_STATE_KEYS = new Set([
   'continuitySnapshot', 'narrativeUpdateCount', 'lastContinuityUpdateAt',
   'continuityDirty', 'automation', 'alterSystem', 'agencyWindow', 'scenePresence',
   'automaticDeliverySummaries', 'workingDetails', 'timelineCarry', 'chatRhythm',
-  'sceneFrame', 'dialogueBurst', 'workingDetailResolutions', 'lifeStatus',
+  'sceneFrame', 'dialogueBurst', 'workingDetailResolutions', 'lifeStatus', 'proactiveContactLog',
 ])
 
 export interface StoryStateMigrationInspection {
@@ -87,6 +87,7 @@ export function upgradeStoryState(value: unknown): StoryState {
       .slice(-32).map(([label, id]) => [label, Number(id)])),
     timelineCarry: normalizeTimelineCarry(record.timelineCarry),
     lifeStatus: normalizeLifeStatus(record.lifeStatus),
+    proactiveContactLog: normalizeProactiveContactLog(record.proactiveContactLog),
     automaticDeliverySummaries: normalizeAutomaticDeliverySummaries(record.automaticDeliverySummaries),
     // beta10 declared this field but its old decoder forgot to return it.
     chatRhythm: isRecord(record.chatRhythm) ? record.chatRhythm as unknown as StoryState['chatRhythm'] : undefined,
@@ -224,6 +225,38 @@ export function normalizeWorkingDetails(value: unknown): WorkingDetail[] {
     })
   }
   return [...latest.values()].slice(-10)
+}
+
+/** 主动联系审计窗：每参与者每日上限的计数来源（最近 20 条；不进模型上下文）。 */
+export function normalizeProactiveContactLog(value: unknown): NonNullable<StoryState['proactiveContactLog']> {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is { participantId: string, at: string } => !!item && typeof item === 'object' && !Array.isArray(item)
+      && typeof (item as Record<string, unknown>).participantId === 'string' && !!(item as Record<string, unknown>).participantId
+      && typeof (item as Record<string, unknown>).at === 'string' && !Number.isNaN(Date.parse((item as Record<string, unknown>).at as string)))
+    .map(item => ({ participantId: item.participantId, at: item.at,
+      ...((item as Record<string, unknown>).endpointId ? { endpointId: String((item as Record<string, unknown>).endpointId) } : {}),
+      ...((item as Record<string, unknown>).channelReason ? { channelReason: String((item as Record<string, unknown>).channelReason).slice(0, 100) } : {}) }))
+    .slice(-20)
+}
+
+export function countProactiveContactsInWindow(
+  log: StoryState['proactiveContactLog'] | undefined,
+  participantId: string,
+  now: Date,
+  windowMs = 86_400_000,
+): number {
+  return (log ?? []).filter(entry => entry.participantId === participantId
+    && now.getTime() - Date.parse(entry.at) < windowMs).length
+}
+
+export function appendProactiveContact(
+  log: StoryState['proactiveContactLog'] | undefined,
+  participantId: string,
+  at: Date,
+  endpointId?: string,
+): NonNullable<StoryState['proactiveContactLog']> {
+  return [...(log ?? []), { participantId, at: at.toISOString(), ...(endpointId ? { endpointId } : {}) }].slice(-20)
 }
 
 export function normalizeLifeStatus(value: unknown): StoryState['lifeStatus'] {

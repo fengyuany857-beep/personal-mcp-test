@@ -66,9 +66,9 @@ export function updateScriptDeliveryActions(
     let actionChanged = false
     const segments = raw.segments.map(segment => {
       if (segment.index !== reference.segmentIndex) return segment
-      // A platform-accepted segment is terminal. A later bookkeeping failure
-      // must never turn delivered speech back into an unsent action.
-      if (segment.status === 'delivered') return segment
+      // 终态不可逆：平台已接受的发言（delivered）与已明确撤销的行动
+      // （cancelled）不会被后续记账失败或迟到回执改写。failed 允许重试。
+      if (segment.status === 'delivered' || segment.status === 'cancelled') return segment
       if (segment.status === status && segment.reason === reason) return segment
       changed = true
       actionChanged = true
@@ -78,6 +78,8 @@ export function updateScriptDeliveryActions(
         attemptedAt: segment.attemptedAt ?? timestamp,
         ...(status === 'pending' ? {} : { completedAt: timestamp }),
       }
+      // 回到 pending 意味着重试：上一轮的完成时间不再是事实，随理由一起清除。
+      if (status === 'pending') delete next.completedAt
       if (reason) next.reason = reason
       else delete next.reason
       return next

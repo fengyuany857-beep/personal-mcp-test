@@ -63,7 +63,33 @@ export function resolveWorldSeederRuntime(value: unknown, provider?: ProviderCon
 
 // ── 提示词 ──────────────────────────────────────────────────────────────────
 
-export function worldSeederSystemPrompt() {
+/**
+ * 世界切面（domain rotation）：切面是任意居住世界都成立的通用方面（非现代地球专属题材），
+ * 具体面貌由各剧本自己的 worldSetting 决定。复读的架构根源不是缺闸门，而是"每轮提问完全相同
+ * + 生活摘录被自己上一轮的产出锚定"。切面让每轮 sweep 面向世界的一个不同局部
+ * 提问——生成侧的多样性来自提问本身，不来自下游过滤。切面按 (storyId, 时间槽)
+ * 确定性轮换，无新增持久状态。
+ */
+export interface WorldSeedDomain { key: string; label: string; brief: string }
+
+export const WORLD_SEED_DOMAINS: WorldSeedDomain[] = [
+  { key: 'nature', label: '天象与环境', brief: '这个世界自己的自然节律：季节、天气、光照、声音与气味、环境的变化' },
+  { key: 'dwelling', label: '居所与近邻', brief: '她居住的地方与身边的空间：住处内外、近邻的动静、共用场所的状态变化' },
+  { key: 'livelihood', label: '生计与日常事务', brief: '她谋生、求学或营生方式带来的外部事务：安排与期限、场所状态、来自机构或雇主的告示' },
+  { key: 'close-people', label: '亲近之人', brief: '线下世界里与她有来往的人：家人、长辈、师长、旧识的近况或线下来讯' },
+  { key: 'paths', label: '途中与陌生人', brief: '她在外会遇到的：路人与人流、道路或交通、公共场合里偶发的善意或摩擦' },
+  { key: 'chance', label: '小意外与际遇', brief: '丢失与拾得、临时的小机会、小麻烦、身体的小状况' },
+]
+
+/** 同一 (storyId, cadence 时间槽) 内切面稳定；跨槽前进一格——相邻两轮必然不同切面。 */
+export function seedDomainForRun(storyId: string, slotStart: Date, cadenceMinutes: number): WorldSeedDomain {
+  const hash = [...storyId].reduce((acc, ch) => (Math.imul(acc, 31) + ch.charCodeAt(0)) >>> 0, 7)
+  const slot = Math.floor(slotStart.getTime() / (Math.max(5, cadenceMinutes) * 60_000))
+  return WORLD_SEED_DOMAINS[(hash + slot) % WORLD_SEED_DOMAINS.length]
+}
+
+
+export function worldSeederSystemPrompt(domain?: WorldSeedDomain) {
   return [
     'You are the world seeder for HDS Interlude. Your only job is to occasionally originate small external events in the protagonist’s world.',
     'You will receive: current local time and season, the story’s world setting, current scene and arc summaries, a bounded excerpt of her recent established life, her in-flight working details, her relationship network listed as BLOCKED NAMES, and recently seeded events to avoid repeating.',
@@ -73,9 +99,10 @@ export function worldSeederSystemPrompt() {
     '- NEVER generate events about BLOCKED NAMES or the user. Family, classmates, shopkeepers and strangers who exist only in her offline life are fine.',
     '- Fit the environment: season, weather, the canon setting’s texture (city or village, era, neighborhood), and her daily circumstances.',
     '- Fit her established life: events must be plausible next to the recent script, her working details and the current arc; never contradict what has already happened.',
+    ...(domain ? [`- THIS RUN'S SLICE OF THE WORLD: ${domain.label} — ${domain.brief}. A slice is an aspect of the world, not a genre: render it through this world's own places, people and vocabulary — the supplied worldSetting is authoritative, and you must never import real-world institutions into a world that does not have them. Originate this run's event from this slice only; other slices belong to other runs. If nothing genuine fits the slice right now, return an empty array.`] : []),
     '- Place events at concrete future times within the allowed horizon, expressed in the story timezone. Ordinary gaps in her day are the best slots.',
     '- Importance: low = texture she may barely notice; medium = a small practical change; high = relationship-relevant or disruptive. Low must be most of your output; high is rare.',
-    'Real life is mostly uneventful. MOST RUNS MUST RETURN an empty events array. Output at most 2 events.',
+    'Real life is mostly uneventful. MOST RUNS MUST RETURN an empty events array. Output at most 1 event.',
     'Output one JSON object only: {"events":[{"summary":"one concrete Chinese sentence stating what happened","importance":"low|medium|high","occursAt":"ISO-8601 with offset","expiresAt":"optional ISO-8601","subjects":["names of offline people involved, empty when none"],"rationale":"short reason this fits now"}]}',
   ].join('\n')
 }

@@ -127,6 +127,8 @@ test('group delivery uses the bot from the live session before stale story trans
   const service = {
     ctx: { bots: [{ selfId: 'old-bot', platform: 'onebot', sendMessage: async (...args: unknown[]) => sentByStaleBot.push(args) }] },
     splitOutgoingMessage: () => ['你好'],
+    endpointAddressSync: (legacy: unknown) => legacy,
+    noteEndpointOutbound: () => {},
     report: () => undefined,
   }
   const liveSession = { bot: { sendMessage: async (...args: unknown[]) => sentBySession.push(args) } }
@@ -147,6 +149,9 @@ test('stale OneBot transport repairs only when its configured account is no long
   const repair = (InterludeService.prototype as any).repairCanonicalOneBotStoryTransport
   const offlineService = {
     ctx: { bots: [] },
+    endpointRegistryReady: true,
+    endpointRows: [],
+    ensureEndpointRegistry: async () => {},
     dbSet: async (...args: unknown[]) => { updates.push(args) },
     reportStandalone: (...args: unknown[]) => { warnings.push(args) },
   }
@@ -170,6 +175,8 @@ test('a failed segment makes group delivery incomplete, even when an earlier seg
   const service = {
     ctx: { bots: [] },
     splitOutgoingMessage: () => ['第一段', '第二段'],
+    endpointAddressSync: (legacy: unknown) => legacy,
+    noteEndpointOutbound: () => {},
     report: () => undefined,
   }
   const liveSession = { bot: { sendMessage: async (_channelId: string, content: string) => {
@@ -201,6 +208,8 @@ test('private visible messages are confirmed only after transport, while failed 
     typingDelayMilliseconds: () => 100,
     appendIntent: async () => undefined,
     scheduleDueIntentWake: () => undefined,
+    endpointAddressSync: (legacy: unknown) => legacy,
+    noteEndpointOutbound: () => {},
     config: { runtime: { maxMessageCharacters: 1_000 } },
   }
   const confirm = (InterludeService.prototype as any).confirmOutgoingDeliveries

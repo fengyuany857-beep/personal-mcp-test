@@ -9,6 +9,7 @@ import { reconcileTransportReferences } from '../src/script/authored-actions'
 import { liveNarrativeIntents } from '../src/script/intent-lifecycle'
 import { materializeSchedulePreplan, resolveSchedulePreplanConfig, schedulePreplanWindow, type SchedulePreplanRecord } from '../src/schedule-preplan'
 import { storyLocalTimeContext } from '../src/time'
+import { createTurnEngine } from '../src/turn-engine'
 
 const now = new Date('2026-09-20T12:00:00+08:00')
 
@@ -156,6 +157,14 @@ test('fix#9 timeline cursor parses dual-key and legacy formats', () => {
 })
 
 // ── Fix#10: 持久化抛错排 narrative-retry ───────────────────────────────────
+// P0 切分后 flushBufferedNarrative 经 turnEngine.beginFlush/endFlush 取状态，
+// mock 改用真引擎实例（断言保持不变）。
+function seedTurnEngine(turn: unknown) {
+  const engine = createTurnEngine({ setTimeout: () => () => {}, userMessageDebounceSeconds: 2, reportOperation: () => {} })
+  engine.turns.set('p1', turn as never)
+  return engine
+}
+
 test('fix#10 flush failure schedules a narrative retry when nothing committed', async () => {
   const retries: Array<[string, string]> = []
   const turn = {
@@ -165,8 +174,7 @@ test('fix#10 flush failure schedules a narrative retry when nothing committed', 
   }
   const svc = {
     databaseResetting: false, desktopRuntimePhase: 'running',
-    turnEngine: { turns: new Map([['p1', turn]]), narrating: new Set<string>() },
-    ctx: { setTimeout: () => 0 },
+    turnEngine: seedTurnEngine(turn),
     serial: async () => { throw new Error('persist boom') },
     scheduleNarrativeRetry: async (storyId: string, participantId: string) => { retries.push([storyId, participantId]); return true },
     reportStandalone: () => {},
@@ -177,7 +185,7 @@ test('fix#10 flush failure schedules a narrative retry when nothing committed', 
   const turn2 = { ...turn, messages: [{ content: '在吗' }], firstMessageCommittedRequestId: undefined }
   const retries2: Array<[string, string]> = []
   const svc2 = {
-    ...svc, turnEngine: { turns: new Map([['p1', turn2]]), narrating: new Set<string>() },
+    ...svc, turnEngine: seedTurnEngine(turn2),
     scheduleNarrativeRetry: async (a: string, b: string) => { retries2.push([a, b]); return true },
   } as unknown as InterludeService
   ;(svc2 as any).serial = async () => { throw new Error('boom') }

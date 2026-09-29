@@ -31,6 +31,23 @@ test('existing installations extend raw script entries with persistent embedding
       subjects: 'json', sourcePayload: 'json', injectedEntryId: 'unsigned',
       createdAt: 'timestamp', updatedAt: 'timestamp',
     } },
+    { name: 'interlude_qzone_post', fields: {
+      id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
+      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+      status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
+    } },
+    { name: 'interlude_endpoint', fields: {
+      id: 'string(63)', ownerKind: 'string(24)', ownerId: 'string(255)',
+      channelKind: 'string(8)', platform: 'string(63)', accountKey: 'string(127)', selfId: 'string(63)',
+      userId: 'string(127)', channelId: 'string(127)', groupId: 'string(127)',
+      conversationKind: 'string(16)', enabled: 'boolean', createdAt: 'timestamp', updatedAt: 'timestamp',
+    } },
+    { name: 'interlude_story_alias', fields: {
+      aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
+    } },
+    { name: 'interlude_work', fields: {
+      id: 'string(64)', storyId: 'string(255)', participantId: 'string(255)', generation: 'unsigned', state: 'json',
+    } },
   ])
 })
 
@@ -53,6 +70,23 @@ test('knowledge evidence is an additive nullable field and reload does not rebui
       occursAt: 'timestamp', expiresAt: 'timestamp', status: 'string(16)',
       subjects: 'json', sourcePayload: 'json', injectedEntryId: 'unsigned',
       createdAt: 'timestamp', updatedAt: 'timestamp',
+    } },
+    { name: 'interlude_qzone_post', fields: {
+      id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
+      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+      status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
+    } },
+    { name: 'interlude_endpoint', fields: {
+      id: 'string(63)', ownerKind: 'string(24)', ownerId: 'string(255)',
+      channelKind: 'string(8)', platform: 'string(63)', accountKey: 'string(127)', selfId: 'string(63)',
+      userId: 'string(127)', channelId: 'string(127)', groupId: 'string(127)',
+      conversationKind: 'string(16)', enabled: 'boolean', createdAt: 'timestamp', updatedAt: 'timestamp',
+    } },
+    { name: 'interlude_story_alias', fields: {
+      aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
+    } },
+    { name: 'interlude_work', fields: {
+      id: 'string(64)', storyId: 'string(255)', participantId: 'string(255)', generation: 'unsigned', state: 'json',
     } },
   ])
 })

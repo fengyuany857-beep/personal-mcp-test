@@ -53,6 +53,7 @@ test('group failure is isolated from a subsequent private reply', async () => {
   const delivered = await methods.sendOutgoingMessages.call({
     sendCrossGroupMessage: async () => { throw new Error('group receipt failure') },
     canHandleParticipant: () => true, resolveLiteralQuoteMessageId: async () => undefined,
+    noteEndpointOutbound: () => {},
     config: { logging: {} }, report: () => {}, reportOperation: () => {},
   }, { id: 's' }, [{ participantId: 'group:12345', content: 'group' }, { participantId: 'p', content: 'private' }], privateTarget, { send: async () => { sends++; return ['id'] } })
   assert.equal(sends, 1); assert.equal(delivered.length, 1); assert.equal(delivered[0].content, 'private')
@@ -60,9 +61,34 @@ test('group failure is isolated from a subsequent private reply', async () => {
 
 test('empty group transport receipt is not recorded as delivery', async () => {
   const outcome = await methods.sendGroupMessage.call({
-    ctx: { bots: [] }, splitOutgoingMessage: () => ['text'], report: () => {},
+    ctx: { bots: [] }, splitOutgoingMessage: () => ['text'], endpointAddressSync: (legacy: unknown) => legacy, noteEndpointOutbound: () => {}, report: () => {},
   }, { id: 's' }, '12345', 'text', undefined, { bot: { sendMessage: async () => [] } })
   assert.equal(outcome.complete, false); assert.deepEqual(outcome.deliveredSegments, [])
+})
+
+test('cross-group delivery consumes an explicitly selected story endpoint', async () => {
+  const sent: string[] = []
+  const botA = { platform: 'onebot', selfId: '10001', sendMessage: async () => { sent.push('a'); return ['a1'] } }
+  const botB = { platform: 'onebot', selfId: '10002', sendMessage: async () => { sent.push('b'); return ['b1'] } }
+  const outcome = await methods.sendGroupMessage.call({
+    ctx: { bots: [botA, botB] }, splitOutgoingMessage: () => ['text'],
+    endpointRows: [{ id: 'ep-b', ownerKind: 'story-role', ownerId: 's', enabled: true, platform: 'onebot', selfId: '10002' }],
+    noteEndpointOutbound: () => {}, report: () => {},
+  }, { id: 's' }, '12345', 'text', undefined, { bot: botA }, 'ep-b')
+  assert.equal(outcome.complete, true)
+  assert.deepEqual(sent, ['b'])
+})
+
+test('cross-group delivery rejects an endpoint from another story', async () => {
+  let sends = 0
+  const outcome = await methods.sendGroupMessage.call({
+    ctx: { bots: [{ platform: 'onebot', selfId: '10002', sendMessage: async () => { sends++; return ['x'] } }] },
+    splitOutgoingMessage: () => ['text'], endpointRows: [{ id: 'ep-other', ownerKind: 'story-role', ownerId: 'other-story', enabled: true, platform: 'onebot', selfId: '10002' }],
+    noteEndpointOutbound: () => {}, report: () => {},
+  }, { id: 's' }, '12345', 'text', undefined, undefined, 'ep-other')
+  assert.equal(outcome.complete, false)
+  assert.equal(outcome.segmentOutcomes[0].reason, 'endpoint-not-allowed')
+  assert.equal(sends, 0)
 })
 
 test('history commands render stored segments as literal text', () => {

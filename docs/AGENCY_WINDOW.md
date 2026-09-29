@@ -1,6 +1,6 @@
 # Agency Window
 
-适用版本：`1.0.1-rc24`
+适用版本：`1.0.1-rc28`
 
 ## 定位
 
@@ -78,3 +78,14 @@ Agency Window 只负责外部联系行动的现实容量：日程负荷、隐私
 0.1.2 虽然可以开启主动消息，但后台 participant payload 实际只包含 opaque ID、未读数和时间戳；名称、资料和关系没有进入请求。advance 同时移除了原始私聊，又要求具体理由和较高 willingness，因此模型几乎没有足够信息生成合法 crossConversationAction。
 
 0.1.3-beta1 修正了参与者摘要，并使用 Agency Window 提供完整的产生、延后和重新裁决路径。
+
+## 联系温度（contactMode，随 rc24 后版本加入）
+
+`agency.contactMode` 三档，默认 `strict`（与既有行为完全一致）：
+
+- **strict**：现状——沉默本身不是理由，动机须落在她的生活事实上。
+- **natural**：提示词追加教义——想念、好奇近况、想分享此刻也是合法动机（须剧本显示她真的想到对方；`participants[].lastUserMessageAt` 的沉默时长作为事实已在载荷中）；意愿阈值降为 `naturalWillingnessThreshold`（默认 0.25），安全间隔取 `naturalMinimumIntervalMinutes`（默认 30，仅当小于严格间隔时生效）。
+- **balanced**：教义同 natural，但要求节制使用情感动机，多数联系仍跟随具体生活理由。
+
+三模式共有的保护：容量硬门（设备/隐私/负荷）不放宽——想聊天也需要手机和隐私；Urge 爆发间隔优先于模式放宽；**每参与者每 24 小时主动联系上限 `proactiveDailyCap`（默认 3，0=不限）全模式生效**，计数来自 `story.state.proactiveContactLog`（最近 20 条审计窗，不进模型上下文）。触顶时不排重查，交由下一次推进自然判断。
+

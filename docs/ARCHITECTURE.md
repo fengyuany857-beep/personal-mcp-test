@@ -1,6 +1,6 @@
 # 当前架构
 
-适用版本：`1.0.1-rc24`
+适用版本：`1.0.1-rc28`
 
 当前增量：事实/工作细节使用 knowledge 保存认知主体、证据角色与条件来源；contactThreads 给主叙事和时间导演提供同事项原始联系链。派生记录、主角相信的事与实际沟通结果分开解释，原文不裁写为第二份剧本。发送端将同一动作的完整分隔块映射至原有逐段回执链。详见 [实现报告](development/BETA6_EVIDENCE_DELIVERY_REPAIR.md)。
 
@@ -15,7 +15,11 @@ HDS Interlude 1.0 以持续剧本为唯一叙事主链：原始剧本保存生�
 | 文件 | 当前职责 |
 | --- | --- |
 | `src/index.ts` | Koishi 插件入口、Console Schema、失明模式命令屏蔽、命令和消息中间件 |
-| `src/service.ts` | 故事与参与者、串行队列、持久化、调度、记忆、浏览器、Alter 和消息投递 |
+| `src/service.ts` | 故事与参与者、串行队列、持久化、记忆、浏览器、Alter 和消息投递的编排层；回合/调度的状态机已拆出（见下两行），本文件只保留执行体与回调 |
+| `src/turn-engine.ts` | 私聊回合状态机：缓冲回合容器、narrating 互斥、请求取代（obsolete/discarded）与失效保留（在途回合由 endFlush 正常释放） |
+| `src/scheduler.ts` | 调度状态机：每故事最早到期唤醒（keep-earliest + busy 重排）、独占任务去重门（halt/defer）与指纹冷却表 |
+| `src/endpoints.ts` | 端点注册表（M1）：UUID 身份与地址分离、平台隔离 accountKey、入站反向解析、三维端点状态时效与剧本别名——单剧本多通道的身份层 |
+| `src/qzone.ts` | QQ 空间通道（M1 增量）：限流门（按端点分桶）、动作封装（ambiguous 语义）、动态轮询过滤与 qzone-action 意图校验 |
 | `src/alter.ts` | Alter 状态规范化、纯状态转移、动态阈值、权重和提示词投影 |
 | `src/agency.ts` | 主体行动窗口、联系候选验证、容量矩阵、去重和重查时间 |
 | `src/logging.ts` | 彩色分层日志、明暗主题、动作识别和字段布局 |

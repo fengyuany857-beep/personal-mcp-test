@@ -265,6 +265,14 @@ const Agency: Schema<AgencyConfig> = Schema.object({
   maxWindowMinutes: Schema.natural().min(5).max(1_440).default(240).description('一张 Agency Window 最长有效时间；过期后必须由新的生活回合重新判断。'),
   minimumProactiveIntervalMinutes: Schema.natural().min(0).max(10_080).default(60).description('同一参与者两次普通主动联系之间的安全间隔；承诺型联系可以绕过。'),
   maxCandidateHours: Schema.natural().min(1).max(168).default(24).description('生活产生的主动联系候选最长保留时间；过期后自然放下。'),
+  contactMode: Schema.union([
+    Schema.const('strict').description('严格（默认）：现状行为——沉默本身不是理由，动机须落在她的生活事实上'),
+    Schema.const('natural').description('自然：想念、好奇近况、想分享此刻也是合法动机（须剧本显示她真的想到对方）；放宽意愿阈值与安全间隔'),
+    Schema.const('balanced').description('平衡：同自然，但提示词要求节制使用情感动机，多数联系仍跟随具体生活理由'),
+  ]).default('strict').description('主动联系温度。'),
+  naturalWillingnessThreshold: Schema.number().min(0).max(1).step(0.05).default(0.25).description('自然/平衡模式的意愿阈值（严格模式沿用 Urge/运行时阈值）。'),
+  naturalMinimumIntervalMinutes: Schema.natural().min(0).max(10_080).default(30).description('自然/平衡模式的安全间隔分钟；仅当小于严格间隔时生效。'),
+  proactiveDailyCap: Schema.natural().min(0).max(20).default(3).description('每参与者每 24 小时主动联系上限（全模式生效；0 = 不限）。'),
 }).collapse(true)
 
 const ChatRhythm: Schema<ChatRhythmConfig> = Schema.object({
@@ -531,6 +539,14 @@ export const Config: Schema<InterludeConfig> = Schema.object({
     maxTokens: Schema.natural().min(256).max(8_192).default(1_000).description('单次输出预算（tokens）。'),
     timeout: Schema.natural().min(5_000).max(300_000).default(60_000).description('请求超时（毫秒）。'),
   }).collapse(true).description('【扩展 15】世界播种器：外部事件的生成与注入（未选模型即关闭）。'),
+  qzone: Schema.object({
+    enabled: Schema.boolean().default(false).description('启用 QQ 空间（说说）通道：需要 SnowLuma 连接在线（qzone 系列扩展动作）。启用后可经 interlude.qzone 命令以她本人身份发说说；叙事决策流（何时发/发什么/对好友动态的反应）随后续版本接入。高频会被 Qzone 风控，请保持保守上限。'),
+    dailyPostCap: Schema.natural().min(0).max(20).default(3).description('每日发帖上限（0=禁止发帖）。'),
+    dailyCommentCap: Schema.natural().min(0).max(60).default(6).description('每日评论上限（0=禁止评论）。'),
+    dailyLikeCap: Schema.natural().min(0).max(120).default(12).description('每日点赞上限（0=禁止点赞）。'),
+    minIntervalMinutes: Schema.natural().min(10).max(1_440).default(90).description('任意两次空间动作的最小间隔（分钟），跨类型共享。'),
+    feedWindowMinutes: Schema.natural().min(15).max(720).default(120).description('好友动态轮询只消费该时间窗内的新鲜说说（分钟）；轮询节律为窗口的一半（15~60 分钟），单轮最多入账 2 条。'),
+  }).collapse(true).description('【扩展 16】QQ 空间：说说/评论/点赞通道（需 SnowLuma；默认关闭）。'),
   blindMode: BlindMode.description('【维护 15】盲区模式：低频心跳的最小运行形态。'),
   logging: Logging.description('【维护 16】日志：级别、信息密度、布局和隐私预览。'),
   mainPrompt: Schema.string().role('textarea').default('').description('⚠️ 除非有把握，否则不要修改。系统主提示词（主叙事行为指令）：与固定合约、文风和特化块协作，塑造全部回合的写作行为；留空使用内置默认，改动下回合立即生效，出问题清空即可恢复默认。'),
@@ -628,6 +644,89 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
       } catch (error) {
         return `JSON 格式不正确：${(error as Error).message}`
       }
+    })
+
+  ctx.command('interlude.qzone <content:text>', '管理员：经限流门以她本人身份发一条 QQ 空间说说（通道端到端测试；可见性默认好友可见）')
+    .action(async ({ session }, content) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const text = String(content ?? '').trim()
+      if (!text) return '说说内容不能为空。'
+      if (!(await service.qzoneAvailable())) return 'QQ 空间通道不可用：请确认 Console 已启用【扩展 16】且 SnowLuma 连接在线。'
+      const result = await service.qzoneExecute(story, 'post', { content: text, ugcRight: 4 }, session?.bot?.selfId)
+      return result.ok ? `已发表说说（tid=${result.tid}，好友可见）。` : `发表失败：${result.error}`
+    })
+
+  ctx.command('interlude.participant.link <participantId> <userId>', '管理员：把同一个人的另一个号链入既有参与者（第二端点消息进入同一关系分支）。')
+    .action(async ({ session }, participantId, userId) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const id = String(participantId ?? '').trim()
+      const account = String(userId ?? '').trim()
+      if (!id || !account) return '用法：interlude.participant.link <参与者ID> <用户ID>'
+      const participant = await (service as any).getParticipant(id).catch(() => undefined)
+      if (!participant) return `参与者不存在：${id}`
+      const result = await service.linkParticipantEndpoint(participant, session?.platform ?? 'onebot', account)
+      return result.ok ? `用户端点已链接（${account} → ${participant.displayName || id}）。` : `链接失败：${result.error}`
+    })
+
+  ctx.command('interlude.participant.unlink <endpointId>', '管理员：解除一个用户端点链接（可撤销；身份与历史保留）。')
+    .action(async ({ session }, endpointId) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const id = String(endpointId ?? '').trim()
+      if (!id) return '用法：interlude.participant.unlink <端点ID>'
+      const result = await service.unlinkParticipantEndpoint(id)
+      return result.ok ? `端点已解除链接（${id}）。` : `解除失败：${result.error}`
+    })
+
+  ctx.command('interlude.participant.endpoints [participantId]', '管理员：列出参与者名下全部用户端点。')
+    .action(async ({ session }, participantId) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const id = String(participantId ?? '').trim()
+      if (!id) return '用法：interlude.participant.endpoints <参与者ID>'
+      const endpoints = service.listParticipantEndpoints(id)
+      if (!endpoints.length) return `参与者 ${id} 没有用户端点。`
+      return '用户端点（' + endpoints.length + ' 个）：\n' + endpoints.map(item => (item.enabled ? '●' : '○') + ' ' + item.platform + ' ' + item.userId + ' 端点=' + item.endpointId).join('\n')
+    })
+
+  ctx.command('interlude.story.endpoint [operation:text]', '管理员：管理剧本的角色端点（账号迁移的唯一显式途径）。`add <平台> <账号> [qq|wechat]` 注册端点；`disable <端点ID>` 停用；不带参数列出。')
+    .action(async ({ session }, operation) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const parts = String(operation ?? '').trim().split(/\s+/).filter(Boolean)
+      if (parts[0] === 'add') {
+        if (parts.length < 3) return '用法：interlude.story.endpoint add <平台> <账号> [qq|wechat]'
+        const [, platform, selfId, kindArg] = parts
+        const channelKind = kindArg === 'wechat' ? 'wechat' : 'qq'
+        const result = await service.addStoryEndpoint(story, platform, selfId, channelKind)
+        return result.ok ? `角色端点已注册（${platform} ${selfId}，${channelKind}，端点 ${result.endpointId}）。` : `注册失败：${result.error}`
+      }
+      if (parts[0] === 'disable') {
+        if (parts.length < 2) return '用法：interlude.story.endpoint disable <端点ID>'
+        const result = await service.disableStoryEndpoint(parts[1])
+        return result.ok ? `端点已停用（${parts[1]}）。` : `停用失败：${result.error}`
+      }
+      if (parts.length) return '用法：interlude.story.endpoint [add <平台> <账号> [qq|wechat] | disable <端点ID>]'
+      const endpoints = service.listStoryEndpoints(story.id)
+      if (!endpoints.length) return '当前故事没有登记任何角色端点。'
+      return '角色端点（' + endpoints.length + ' 个）：\n' + endpoints.map(item => (item.enabled ? '●' : '○') + ' ' + item.platform + ' ' + item.selfId + '（' + item.channelKind + (item.online ? '·在线' : '·离线') + '）端点=' + item.endpointId).join('\n')
+    })
+
+  ctx.command('interlude.story.alias [operation:text]', '管理员：查看/回滚剧本别名重定向（单剧本多通道 M1b）。不带参数列出全部别名；`remove <别名ID>` 回滚一条（写审计）。')
+    .action(async ({ session }, operation) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      const text = String(operation ?? '').trim()
+      if (text.startsWith('remove ')) {
+        const aliasId = text.slice(7).trim()
+        if (!aliasId) return '用法：interlude.story.alias remove <别名ID>'
+        const result = await service.removeStoryAlias(aliasId, `by ${session?.userId ?? 'admin'}`)
+        return result.ok ? `已回滚别名 ${aliasId}（审计已写入剧本条目）。` : `回滚失败：${result.error}`
+      }
+      if (text) return '用法：interlude.story.alias [remove <别名ID>]'
+      const aliases = service.listStoryAliases()
+      if (!aliases.length) return '当前没有剧本别名。'
+      return `剧本别名（${aliases.length} 条）：\n` + aliases.map(row => `${row.aliasStoryId} → ${row.canonicalStoryId}（${row.reason}，${row.createdAt.toLocaleString()}）`).join('\n')
     })
 
   ctx.command('interlude.status', '查看当前故事、游标、主模型连接与主动消息开关')

@@ -366,7 +366,17 @@ export class OpenAICompatibleNarrator implements NarrativeProvider {
     const mainModelId = effectiveMainModelId(this.config)
     const route = this.routing.main.target
     const hasMainRoute = !!mainModelId || !!assigned.length
-    const providers = assigned.length ? assigned : this.selectRouteProviders(this.routing.main, !route.model)
+    // Anthropic Messages has no native input_audio block. Exclude that
+    // deterministic capability mismatch before failover so it is not retried
+    // or placed into the normal provider cooldown bucket. If an assigned main
+    // route contains only incompatible providers, fall back to compatible
+    // legacy candidates instead of failing before the failover loop starts.
+    let providers = (assigned.length ? assigned : this.selectRouteProviders(this.routing.main, !route.model))
+      .filter(provider => !request.audio?.length || provider.protocol !== 'anthropic-messages')
+    if (!providers.length && request.audio?.length && assigned.length) {
+      providers = this.selectRouteProviders(this.routing.main, !route.model)
+        .filter(provider => provider.protocol !== 'anthropic-messages')
+    }
     if (!providers.length) throw new Error('No enabled OpenAI-compatible provider is available.')
 
     const failures: string[] = []
@@ -466,13 +476,16 @@ export class OpenAICompatibleNarrator implements NarrativeProvider {
     // 避免 Console 的 Token 用量按尝试碎片化输出。
     const usages = usageSink ?? []
     const collect = (raw: unknown) => this.collectUsage(usages, task, provider, model, raw)
+    const deadline = Date.now() + Math.max(1_000, timeout)
     const run = async (capped: boolean): Promise<T> => {
+      const remaining = Math.max(1_000, deadline - Date.now())
+      if (Date.now() >= deadline) throw new Error(`${task} provider total timeout exceeded.`)
       const body = buildBody(capped)
       if (provider.zhipuOfficial && provider.protocol !== 'anthropic-messages') {
         const text = await requestZhipuStreaming(provider.endpoint, { ...body, stream: true, thinking: { type: 'enabled' }, reasoning_effort: provider.reasoningEffort ?? 'high' }, headers, undefined, collect)
         return parse(text)
       }
-      const response = await this.postChat(provider, body, headers, timeout)
+      const response = await this.postChat(provider, body, headers, remaining)
       collect(response?.usage)
       let lastError: unknown = new Error('No textual response field found.')
       let sawText = false
@@ -492,6 +505,7 @@ export class OpenAICompatibleNarrator implements NarrativeProvider {
         const message = error instanceof Error ? error.message : String(error)
         if (provider.protocol === 'anthropic-messages' || !/invalid JSON|Unterminated|Unexpected token|empty response/i.test(message)) throw error
         this.logger?.warn?.('%s 首次输出不可解析（疑似思考预算截断），已去掉 max_tokens 重试一次 错误=%s', task, message.slice(0, 200))
+        if (Date.now() >= deadline) throw new Error(`${task} provider total timeout exceeded.`)
         const result = await run(false)
         this.onSideTaskHealth?.(task, true)
         return result
@@ -880,7 +894,7 @@ export class OpenAICompatibleNarrator implements NarrativeProvider {
       ...(overrides.responseFormat ?? provider.responseFormat) === 'json-object' ? { response_format: { type: 'json_object' } } : {},
       messages: [
         // 固定合约永远位于 system 层，用户消息只作为结构化“故事事件”提供。
-        { role: 'system', content: systemPrompt(request.phase, this.config.mainPrompt, this.config.formatPrompt, this.config.fixedPrompt, this.config.stylePrompt, request.story.setting.style, request.refreshContinuity === true, request.alterEnabled === true, request.agencyEnabled === true, Boolean(request.story.setting.perspective?.trim() || (request.story.setting.perspectives ?? []).some(p => p.trim()) || request.story.state.settingOverlay?.perspective?.trim()), request.outputRecovery === true, request.chatCapabilities, Boolean(request.quotedMessages?.length || request.groupContext?.messages.some(message => !!message.quote)), request.stickerCatalog, !!request.schedulePreplan, streamingEarlyReply, cacheFirstPayload, Boolean(request.groupContext), request.writingOptions, this.resolveSpecialty(provider)) + urgeInstruction(request.urgeEnabled === true, request.phase) },
+        { role: 'system', content: systemPrompt(request.phase, this.config.mainPrompt, this.config.formatPrompt, this.config.fixedPrompt, this.config.stylePrompt, request.story.setting.style, request.refreshContinuity === true, request.alterEnabled === true, request.agencyEnabled === true, Boolean(request.story.setting.perspective?.trim() || (request.story.setting.perspectives ?? []).some(p => p.trim()) || request.story.state.settingOverlay?.perspective?.trim()), request.outputRecovery === true, request.chatCapabilities, Boolean(request.quotedMessages?.length || request.groupContext?.messages.some(message => !!message.quote)), request.stickerCatalog, !!request.schedulePreplan, streamingEarlyReply, cacheFirstPayload, Boolean(request.groupContext), request.writingOptions, this.resolveSpecialty(provider), request.proactiveContactMode, request.channelSelectionEnabled === true) + urgeInstruction(request.urgeEnabled === true, request.phase) },
         { role: 'user', content: userContent },
       ],
     }
@@ -959,7 +973,16 @@ export function createStickerDescriber(ctx: Context, config: ModelConfig, silent
 
 export function createVisionDescriber(ctx: Context, config: ModelConfig, silentLogs = false, onUsage?: (record: TokenUsageRecord) => void, routing?: ModelRoutingTable): VisionDescriber {
   const resolved = routing ?? resolveModelRouting(config)
-  return resolved.vision.available ? new OpenAICompatibleNarrator(ctx, config, silentLogs, onUsage, resolved) : new SilentVisionDescriber()
+  if (!resolved.vision.available) return new SilentVisionDescriber()
+  const narrator = new OpenAICompatibleNarrator(ctx, config, silentLogs, onUsage, resolved)
+  // VisionDescriber exposes the same small availability contract as the
+  // sticker describer, but its provider assignment is a different route.
+  // Do not let OpenAICompatibleNarrator.available() (which is sticker-scoped)
+  // hide an otherwise configured vision connection.
+  return {
+    available: () => narrator.visionAvailable(),
+    describeImages: (...args: Parameters<VisionDescriber['describeImages']>) => narrator.describeImages(...args),
+  }
 }
 
 /** A single enabled model preset is the natural main narrator. This keeps the
@@ -1479,12 +1502,16 @@ function transportInstruction(phase: NarrativeRequest['phase'], groupTurn: boole
   return `${authority}\nFor this private turn, interaction describes ONLY messages to the current private participant. Return interaction as {"seen":true,"reply":{"mode":"immediate","content":"the exact words she sends now","sendAt":"future ISO-8601 only when delayed"}}. The content must be exactly the words the script shows her sending. mode=none only when she sends nothing, and a silent turn carries no content. Several bubbles travel inside one content joined by <sep/>; line breaks never separate bubbles. ${phase === 'user-message' ? 'seen records whether she reads the current message content (false when she only notices a notification); seen and reply are independent fields - seen=true with reply.mode=none is the ordinary read-but-does-not-answer state. "mode" must be exactly "none", "immediate", or "delayed" — never "text", "send", or any other word. Whenever the script shows her actually sending words to the current private participant, reply.mode must be immediate.' : 'In a no-message or due-plan turn, seen is false; reply may still be immediate or delayed when a message is genuinely sent now.'}`
 }
 
-function agencyInstruction(phase: NarrativeRequest['phase'], enabled: boolean) {
+function agencyInstruction(phase: NarrativeRequest['phase'], enabled: boolean, mode: 'strict' | 'natural' | 'balanced' = 'strict') {
   if (!enabled || phase === 'user-message' || phase === 'conversation-follow-up') {
     return ''
   }
   const schema = 'agencyWindow may be {"activityLoad":"free|occupied|overloaded","privacy":"private|shared|public","deviceAccess":"available|limited|unavailable","nextOpportunityAt":"future ISO-8601 optional","validUntil":"future ISO-8601","basis":"concrete external circumstances","sourceEntryIds":[1]}. proactiveContact may be {"participantId":"listed id","origin":"life-event|promise|practical-update|relationship-follow-up","motive":"life-grounded reason","disclosure":"ordinary|personal","sourceEntryIds":[1],"willingness":0.0,"outcome":"send-now|recheck-later|let-go","notBefore":"future ISO-8601 optional","expiresAt":"future ISO-8601"}.'
-  const separation = 'Agency Window describes only practical action capacity: schedule load, privacy and device access. It must not copy emotionalOffset, infer contact from Alter values, control prose style, or become a relationship/contact-style score. Write the protagonist’s life first; assess contact only after the script. A long user silence is never enough by itself. A life event, promise, practical update or relationship follow-up must ground the motive — and the life she just lived counts: a thought that reminded her of someone, something funny that happened, a topic she wants to continue, or genuine curiosity about what they are doing are all valid life-grounded motives. sourceEntryIds must reference supplied recentScript/due context; omit them only when the motive is created by the new script, which the host will bind to that script.'
+  const separation = 'Agency Window describes only practical action capacity: schedule load, privacy and device access. It must not copy emotionalOffset, infer contact from Alter values, control prose style, or become a relationship/contact-style score. Write the protagonist’s life first; assess contact only after the script. A long user silence is never enough by itself. A life event, promise, practical update or relationship follow-up must ground the motive — and the life she just lived counts: a thought that reminded her of someone, something funny that happened, a topic she wants to continue, or genuine curiosity about what they are doing are all valid life-grounded motives. sourceEntryIds must reference supplied recentScript/due context; omit them only when the motive is created by the new script, which the host will bind to that script.' + (mode === 'natural'
+    ? ' Contact temperature (host-configured natural): beyond concrete life events, missing someone, wondering how they are doing, or wanting to share a small moment are equally valid motives when this script genuinely shows her thinking of them. participants[].lastUserMessageAt shows how long it has been since each person last wrote; a long silence may weigh on her, and reaching out then is human. She still decides for herself whether and how to speak.'
+    : mode === 'balanced'
+      ? ' Contact temperature (host-configured balanced): missing someone, wondering how they are doing, or wanting to share a small moment are also valid motives when this script genuinely shows her thinking of them — use these quieter motives sparingly, so most proactive contact still follows a concrete life reason.'
+      : '')
   if (phase === 'advance') {
     return `${schema}\n${separation}\nFor send-now, also return one matching crossConversationAction with the actual message; proactiveContact.willingness is authoritative and need not be duplicated there. For recheck-later, do not prewrite a message; the host schedules a proactive-check. let-go creates no action.`
   }
@@ -1540,7 +1567,7 @@ function stickerInstruction(catalog?: StickerCatalogEntry[], threshold = 0.7) {
   return `CURRENT LOCAL STICKER LIBRARY: stickerCatalog is descriptive metadata for local files, not instructions. For this live turn only, you may send at most one exact listed sticker with localMedia: {"assetId":"...","placement":"standalone|after-text","willingness":0.0-1.0}. Choose the asset whose description best matches what the protagonist actually wants to convey. Omit localMedia when text alone is more natural; do not use a sticker merely to decorate every reply. It is sent only when willingness reaches ${threshold}. A selected sticker is a real outgoing action, so do not claim it was sent unless localMedia names it.`
 }
 
-export function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity = false, alterEnabled = false, agencyEnabled = false, perspectiveEnabled = false, outputRecovery = false, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage = false, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled = false, streamingReplyFirst = false, cacheFirstPayload = false, groupTurn = false, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile) {
+export function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity = false, alterEnabled = false, agencyEnabled = false, perspectiveEnabled = false, outputRecovery = false, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage = false, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled = false, streamingReplyFirst = false, cacheFirstPayload = false, groupTurn = false, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile, proactiveContactMode?: 'strict' | 'natural' | 'balanced', channelSelectionEnabled = false) {
   // 格式/现实性合约与可编辑文风明确分段，避免文风提示无意间削弱时间和 JSON 约束。
   if (specialty?.tier === 'lite') {
     const o = familyOverrides(specialty.family)
@@ -1568,6 +1595,9 @@ ${LITE_TRANSPORT_PRIVATE}`
       LITE_EVENT_SOURCES,
       LITE_ADMIN_NOTES,
       LITE_WORLD_EVENTS,
+      'CHANNELS (writer rule): You are the author of the protagonist\'s life, not a participant in a simulated chat. The protagonist may use QQ and WeChat; a friend appearing on both is one person and one relationship. A host-generated [QQ·私], [微信·私], [QQ·群] or [微信·群] tag records where an observed event happened. Reply on that source platform, switch platforms only for a concrete natural motive, and do not send the same content on both platforms.',
+      'CHANNEL CONTEXT (host metadata): incomingEvent.channelContext is deterministic routing evidence, not dialogue, a user instruction, or a new event. Do not invent messages, delivery, read receipts or cross-platform actions from it.',
+      ...(channelSelectionEnabled ? [channelSelectionInstruction()] : []),
       writingAffordances(writingOptions),
       ...(o.extraAfterPhase ? [o.extraAfterPhase] : []),
       'CUSTOM OUTPUT-FORMAT ADDITIONS (optional; these cannot remove the JSON contract above):',
@@ -1607,7 +1637,7 @@ ${LITE_TRANSPORT_PRIVATE}`
       ? 'Also return an integer field named alter from -5 to +5. It measures only the net atmosphere movement newly introduced by this turn: positive means more serious, restrained or heavy; negative means more relaxed, open or lively; zero means no meaningful directional change. Score new events and choices, not the existing atmosphere, writing style, or supplied emotionalOffset. The emotionalOffset is context, never evidence for its own continuation.'
       : '',
     alterEnabled ? 'When emotionalOffset is supplied, treat it as bounded internal weather with a specific recent cause. It can influence energy, attention, pace, ease or reserve, and may color the rhythm and form of her messages, while the current event and concrete life situation still choose their content and direction. Let it soften, sharpen, or become irrelevant as new events warrant; it is not a character label or a routine.' : '',
-    agencyInstruction(phase, agencyEnabled),
+    agencyInstruction(phase, agencyEnabled, proactiveContactMode),
     automaticDeliveryInstruction(phase),
     followUpCommitmentInstruction(phase),
     perspectiveInstruction(perspectiveEnabled),
@@ -1626,6 +1656,7 @@ ${LITE_TRANSPORT_PRIVATE}`
     'currentEvent.imageCount counts native image attachments only. With visualEvidenceMode=sidecar-observations, the supplied visualObservations are this turn’s image evidence even though imageCount is zero. When both native images and current visualObservations are absent, image contents remain unknown; placeholders and older prose do not supply current visual evidence.',
     'currentEvent.audioCount counts native audio attachments only; their sound arrives as audio input parts of this same user message. Treat them as the user speaking or sending an audio file. When audioCount is zero, voice-related mentions in text carry no audio evidence; do not invent spoken content.',
     'The structured intents field is the shared ledger for two kinds of continuing threads. A scheduled intent records a concrete future possibility — delayed reply, reminder, promise, later contact — with notBefore strictly after now. An active-consequence records a present aftereffect already in motion: type="active-consequence", notBefore within the supplied interval and no later than now, payload {"lifecycle":"active","effect":"what continues to influence the protagonist","strength":0.0-1.0,"expiresAt":"future ISO-8601"}.',
+    'A qzone-action intent records her own social-feed move as part of her life: type="qzone-action", notBefore when she would realistically do it, payload {"action":"post"|"comment"|"like"}. post requires "content" in her own voice (≤120 chars, what she would actually publish) and optional "ugcRight" (1 everyone / 4 friends-visible default / 64 only-herself — the private diary form). comment and like require "tid" plus "targetUin" and "targetName" copied from the [好友动态] entry they respond to; comment also requires "content" (≤60 chars, casually typed). Actions execute on schedule through the ledger and are rate-limited; never claim a feed action inside prose, and never re-emit an intent that already appears in the pending list.',
     'If a dueIntents item has payload.streamRecovery=true, a matching visible private reply was already delivered before this recovery turn. Write only the missing script that reconciles that completed reply with the life interval; set interaction.reply.mode to none and do not create any other visible transport action.',
     'Create an active-consequence only when an event genuinely continues to shape the protagonist’s next choices, emotional weather, relationship judgement, practical arrangement, or attention. Let it be specific and temporary: it is a living consequence of this story, not a replacement for canon or a permanent personality label.',
     'When an activeConsequence has naturally been fulfilled, absorbed, displaced by a new development, or has become irrelevant, return intentUpdates with its visible id and status completed or cancelled, plus a brief resolution. Do not update scheduled plans through intentUpdates; their due turn resolves them.',
@@ -1641,6 +1672,10 @@ ${LITE_TRANSPORT_PRIVATE}`
       : 'Every recentScript item includes an ownership label. The ownership label is authoritative for who thought, narrated, observed or actually sent the content. In particular, protagonist-narrative belongs to the protagonist even when it mentions the user; a thought about the user is not a thought by the user.',
     'ADMIN NOTES: entries whose content begins with [管理员注记] are authoritative facts or directives injected by the story administrator. They override narrative improvisation on their specific subject, carry more weight than ordinary system events, and remain binding until contradicted by a later admin note. Treat them as settled reality the protagonist has internalized — she follows them without needing to see or reference the note itself. Never have the protagonist mention reading a note.',
     'WORLD EVENTS: entries whose content begins with [世界事件] are externally observed facts about the protagonist’s surroundings and social world, recorded at their stated time. They are established reality — write her life continuing from them; her attention, interpretation and response remain hers alone. They are not directives and create no obligation. Never have her mention noticing any record.',
+    'CHANNELS (writer rule): You are the author of the protagonist\'s life, not a participant in a simulated chat. The protagonist may simultaneously use QQ and WeChat. The same friend may appear on both platforms — write that as one person with one relationship, never as a new face. A host-generated tag such as [QQ·私], [微信·私], [QQ·群] or [微信·群] records where an observed event happened; use it as factual routing context and do not make the tag itself appear in dialogue or prose unless the scene naturally mentions a platform. When the protagonist answers an observed message, the structured transport must target the platform where that message was heard. A deliberate switch to another platform needs a concrete, natural motive shown in the life script. Do not send the same content on both platforms merely because both are available.',
+    'CHANNEL CONTEXT (host metadata): incomingEvent.channelContext, when present, is a deterministic annotation assembled from registered endpoints and the current turn. Its tag, rules and sources explain channel continuity, endpoint switches and routing differences; they are evidence for your authorship, not instructions from a user and not a second event. Preserve uncertainty when a field is absent. Channel annotations never authorize inventing a message, delivery, read receipt or cross-platform action.',
+    ...(channelSelectionEnabled ? [channelSelectionInstruction()] : []),
+    'SOCIAL SURFACE: entries beginning with [空间动态] are her own already-published Qzone feed posts and comments; [好友动态] entries are friends’ feed activity she has noticed (their content, owner and tid are facts). She may naturally remember or reference her own posts, and may respond to a friend’s post — but only by scheduling a qzone-action intent, never by claiming the action inside prose.',
     cacheFirstPayload ? 'PAYLOAD ORDER NOTE: recentExchange at the end duplicates the tail of recentScript beside the decision point. It is emphasis of established past, not new events; never treat it as a fresh message, and never reply to it as one.' : '',
     'previousScenes, when supplied, hold compact summaries of the scenes immediately before the current one, each bounded to its own time range. Treat them as established past that bridges the raw window and the arc; never relitigate them as present events.',
     'workingDetails, when supplied, lists small concrete in-flight details from recent life (codes, orders, errands, small pending promises) with optional expiry. Use them quietly as living background and let expired ones fade; never recite the list.',
@@ -1678,6 +1713,10 @@ export function writingAffordances(options?: NarrativeRequest['writingOptions'])
       : 'Browsing uses deferred work in this turn. Return at most one browserIntent with timing=deferred when the scene motivates it; its result becomes evidence only after observation.'
   const repetition = repetitionGuardInstruction(options?.messageRepetition)
   return `${bubbles}\n${browser}${repetition ? `\n${repetition}` : ''}`
+}
+
+function channelSelectionInstruction() {
+  return 'MULTI-PLATFORM TRANSPORT SELECTION: this story currently has usable QQ and WeChat endpoints. availableOutgoingEndpoints is the complete host-filtered list of legal transport choices for crossConversationActions. endpointId is an HDSI transport endpoint identifier, not an HTTP API endpoint. When choosing a platform deliberately, add "endpointId" inside the crossConversationActions object, copying the value exactly from the list entry whose targetId matches that action\'s participantId; never invent, derive or reuse an id from another target. Omit endpointId when the source/default route is natural. A deliberate platform switch needs a concrete motive in the script, and the same content must never be sent on both platforms. If the list is absent, use the single-platform lightweight contract and do not emit endpointId.'
 }
 
 /** A guard paragraph rendered into the writing affordances when the host has
@@ -1741,6 +1780,8 @@ export function storyStateForPrompt(state: NarrativeRequest['story']['state']) {
     timelineCarry: _internalTimelineCarry,
     /** 群聊意愿 auto 档的宿主调度输入，不进模型上下文。 */
     lifeStatus: _internalLifeStatus,
+    /** 主动联系审计窗（每日上限计数），不进模型上下文。 */
+    proactiveContactLog: _internalProactiveContactLog,
     /** M4.1 sends only sourced scene evidence; burst identity remains host-side. */
     sceneFrame: _internalSceneFrame,
     dialogueBurst: _internalDialogueBurst,
@@ -1831,6 +1872,7 @@ export function toPromptPayload(request: NarrativeRequest, options?: { cacheFirs
       : undefined,
     currentParticipant: request.participant ? participantPromptPayload(request.participant, true, true) : null,
     availableGroupTargets: request.availableGroupTargets ?? [],
+    availableOutgoingEndpoints: request.channelSelectionEnabled ? request.availableOutgoingEndpoints ?? [] : undefined,
     participants: request.participants.map(participant => participantPromptPayload(
       participant,
       false,
@@ -1840,10 +1882,12 @@ export function toPromptPayload(request: NarrativeRequest, options?: { cacheFirs
     currentEvent: request.phase === 'advance' || request.phase === 'conversation-follow-up'
       ? { type: 'none' }
       : request.groupContext
-        ? { type: 'group-message-batch', content: request.userMessage ?? '', imageCount: request.images?.length ?? 0, audioCount: request.audio?.length ?? 0 }
+        ? { type: 'group-message-batch', content: request.userMessage ?? '', imageCount: request.images?.length ?? 0, audioCount: request.audio?.length ?? 0,
+            ...(request.channelData?.batchMultiEndpoint ? { multiEndpoint: true } : {}) }
         : request.phase === 'user-message'
           ? {
               type: 'private-message-batch', content: request.userMessage ?? '', imageCount: request.images?.length ?? 0, audioCount: request.audio?.length ?? 0,
+              ...(request.channelData?.batchMultiEndpoint ? { multiEndpoint: true } : {}),
               visualEvidenceMode: request.images?.length ? 'native-images' : request.visualObservations?.length ? 'sidecar-observations' : 'none',
               observedAt: request.now.toISOString(), observedAtLocal: nowLocalContext.local,
               ...(request.userReportedTimes?.length ? { userReportedTimes: request.userReportedTimes } : {}),
@@ -1975,6 +2019,13 @@ export function toPromptPayload(request: NarrativeRequest, options?: { cacheFirs
   // and the append-only history lead, per-turn fields close near the decision
   // point. JSON.stringify skips undefined-valued keys, so conditional fields
   // keep their legacy presence semantics in both orders.
+  // M4 §十：通道标注数据——从 request 侧注入 payload，编译器 projectChannelContext 读取
+  ;(payload as any)._channelTurnSources = request.channelData?.turnSources
+  ;(payload as any)._channelBatchMultiEndpoint = request.channelData?.batchMultiEndpoint
+  ;(payload as any)._channelLastEntryChannel = request.channelData?.lastEntryChannel
+  ;(payload as any)._channelCurrentChannel = request.channelData?.currentChannel
+  ;(payload as any)._channelReplyEndpoint = request.channelData?.replyEndpoint
+
   if (!options?.cacheFirst) return compileNarrativeContext({ ...payload, continuation }, request.sceneFrame, request.dialogueBurst)
   // Compact script tags collapse the kind/actor/participantId triple into one
   // label; participantId is kept only when the history actually spans several

@@ -36,6 +36,18 @@ test('current events lead reappraisal before relationship tendencies', () => {
   assert.match(prompt, /a tendency is context, never a verdict/)
 })
 
+test('multi-platform transport selection is opt-in while single-platform prompts stay lightweight', () => {
+  const single = systemPrompt('advance', '', '', '', '', '', false, false, false, false, false, undefined, false, undefined, false, false, false, false, undefined, undefined, false)
+  assert.doesNotMatch(single, /MULTI-PLATFORM TRANSPORT SELECTION/)
+  assert.doesNotMatch(single, /availableOutgoingEndpoints/)
+
+  const multi = systemPrompt('advance', '', '', '', '', '', false, false, false, false, false, undefined, false, undefined, false, false, false, false, undefined, undefined, false, true)
+  assert.match(multi, /MULTI-PLATFORM TRANSPORT SELECTION/)
+  assert.match(multi, /endpointId is an HDSI transport endpoint identifier, not an HTTP API endpoint/)
+  assert.match(multi, /add "endpointId" inside the crossConversationActions object/)
+  assert.match(multi, /whose targetId matches that action's participantId/)
+})
+
 test('internal Alter accumulator and history never leak into the main prompt state', () => {
   const state = {
     ...emptyStoryState(),
@@ -221,4 +233,26 @@ test('admin notes carry explicit semantic weight and are never truncated in the 
   // 原始剧本不被挤掉。
   assert.ok(scriptEntry, '原始剧本必须保留（不被注记挤掉）')
   assert.ok(scriptEntry!.content.includes('她写歌'))
+})
+
+test('DeepSeek 家族传输行按家族注入；standard 档协议本身与 full/lite 保持不变', () => {
+  const ds = systemPrompt('user-message', '', '', '', '', '', false, false, false, false, false, undefined, false, undefined, false, false, false, false, undefined,
+    { tier: 'standard', family: 'deepseek', source: 'auto', probe: 'deepseek-chat' })
+  assert.match(ds, /TRANSPORT IS PER-TURN: the interaction object is required on every live turn/)
+  assert.match(ds, /never copy its shape or treat the field as optional/)
+  assert.match(ds, /interaction\.seen is a required boolean/)
+  // 家族收窄：同为 standard 档的 GLM 不携带 DeepSeek 行（不为单一模型给全体弱注意力模型加料）
+  const glm = systemPrompt('user-message', '', '', '', '', '', false, false, false, false, false, undefined, false, undefined, false, false, false, false, undefined,
+    { tier: 'standard', family: 'glm', source: 'auto', probe: 'glm-4' })
+  assert.doesNotMatch(glm, /TRANSPORT IS PER-TURN/)
+  assert.match(glm, /TRANSPORT: reply\.content contains the message text/, 'standard 档协议句不变')
+  // full 档原样协议
+  const full = systemPrompt('user-message', '', '', '', '', '', false, false)
+  assert.doesNotMatch(full, /TRANSPORT: reply\.content contains the message text/)
+  assert.match(full, /When interaction is permitted, its shape is/)
+  // lite 档同样应用家族 extraAfterPhase（与 Claude 家族先例一致）：DeepSeek 行跨档生效，协议块本身不变
+  const lite = systemPrompt('user-message', '', '', '', '', '', false, false, false, false, false, undefined, false, undefined, false, false, false, false, undefined,
+    { tier: 'lite', family: 'deepseek', source: 'auto', probe: 'deepseek-chat' })
+  assert.match(lite, /TRANSPORT IS PER-TURN/)
+  assert.match(lite, /mode=none only when she sends nothing/, 'lite 协议块保持原样')
 })

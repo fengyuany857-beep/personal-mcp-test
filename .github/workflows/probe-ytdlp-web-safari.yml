@@ -1,0 +1,35 @@
+name: Probe yt-dlp Web Safari
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - YTDLP_SAFARI_PROBE_TRIGGER
+      - .github/workflows/probe-ytdlp-web-safari.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install yt-dlp
+        run: python -m pip install --disable-pip-version-check "yt-dlp>=2026.8.19"
+      - name: Probe target video formats
+        run: |
+          set -euo pipefail
+          yt-dlp -v --no-warnings --extractor-args "youtube:player_client=web_safari" -F "https://www.youtube.com/watch?v=teKcE8YhLhA"
+      - name: Download bounded test media
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ytdlp-probe
+          yt-dlp --no-warnings --extractor-args "youtube:player_client=web_safari"             -f "best[protocol^=m3u8]/best"             --max-filesize 32M             -o "/tmp/ytdlp-probe/input.%(ext)s"             "https://www.youtube.com/watch?v=teKcE8YhLhA"
+          ls -lh /tmp/ytdlp-probe

@@ -545,15 +545,7 @@ jobs:
             status="$(curl -sS --max-time 70 -o /tmp/browser-probe.json -w '%{http_code}' "$url" || true)"
             echo "BROWSER_PROBE_HTTP attempt=$attempt status=$status"
             if [ "$status" = "200" ]; then
-              if python - <<'PY'
-import json
-try:
-    data=json.load(open("/tmp/browser-probe.json"))
-    raise SystemExit(0 if data.get("ok") and not data.get("botBlocked") else 1)
-except Exception:
-    raise SystemExit(1)
-PY
-              then
+              if python -c 'import json,sys; d=json.load(open("/tmp/browser-probe.json")); sys.exit(0 if d.get("ok") and not d.get("botBlocked") else 1)'; then
                 accepted="true"
                 break
               fi

@@ -123,6 +123,81 @@ jobs:
                   };
                 });
 
+                let uiTranscriptProbe = null;
+                try {
+                  const expand = await page.$("#description-inline-expander #expand");
+                  if (expand) {
+                    await expand.click();
+                    await new Promise((resolve) => setTimeout(resolve, 800));
+                  }
+
+                  const clickResult = await page.evaluate(() => {
+                    const candidates = Array.from(
+                      document.querySelectorAll(
+                        'button, tp-yt-paper-button, yt-button-shape button, ytd-button-renderer button'
+                      )
+                    );
+                    const target = candidates.find((el) => {
+                      const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+                      const aria = el.getAttribute?.("aria-label") ?? "";
+                      return /show transcript/i.test(text) || /show transcript/i.test(aria);
+                    });
+                    if (!target) return { clicked: false, candidateTexts: candidates.map((el) => (el.textContent ?? "").trim()).filter(Boolean).filter((t) => /transcript/i.test(t)).slice(0, 20) };
+                    target.click();
+                    return { clicked: true, text: (target.textContent ?? "").trim(), aria: target.getAttribute?.("aria-label") ?? null };
+                  });
+
+                  await new Promise((resolve) => setTimeout(resolve, 2200));
+
+                  const transcriptDom = await page.evaluate(() => {
+                    const rows = Array.from(
+                      document.querySelectorAll(
+                        "ytd-transcript-segment-renderer, ytd-transcript-segment-list-renderer [role=listitem]"
+                      )
+                    );
+                    const segments = rows.map((row) => {
+                      const time =
+                        row.querySelector(".segment-timestamp")?.textContent?.trim() ??
+                        row.querySelector("[class*=timestamp]")?.textContent?.trim() ??
+                        "";
+                      const text =
+                        row.querySelector(".segment-text")?.textContent?.trim() ??
+                        row.querySelector("yt-formatted-string")?.textContent?.trim() ??
+                        row.textContent?.replace(/\s+/g, " ").trim() ??
+                        "";
+                      return { time, text };
+                    }).filter((item) => item.text);
+
+                    const transcriptNodes = Array.from(document.querySelectorAll("*"))
+                      .filter((node) => /transcript/i.test(node.tagName ?? ""))
+                      .slice(0, 40)
+                      .map((node) => ({
+                        tag: node.tagName,
+                        text: (node.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 500),
+                      }));
+
+                    return {
+                      segments,
+                      transcriptNodes,
+                      bodyHasTranscript: /transcript/i.test(document.body?.innerText ?? ""),
+                    };
+                  });
+
+                  uiTranscriptProbe = {
+                    clickResult,
+                    segmentCount: transcriptDom.segments.length,
+                    segments: transcriptDom.segments.slice(0, 3000),
+                    transcriptNodes: transcriptDom.transcriptNodes.slice(0, 20),
+                    bodyHasTranscript: transcriptDom.bodyHasTranscript,
+                  };
+                } catch (error) {
+                  uiTranscriptProbe = {
+                    error: String(error).slice(0, 500),
+                    segmentCount: 0,
+                    segments: [],
+                  };
+                }
+
                 let captionProbe = null;
                 const firstCaption = pageState.captionTracks.find((track) => track.baseUrl)?.baseUrl;
                 if (firstCaption) {
@@ -241,6 +316,7 @@ jobs:
                     })),
                     streamingFormats: pageState.streamingFormats,
                   },
+                  uiTranscriptProbe,
                   captionProbe,
                   mediaCount: media.length,
                   media: mediaSummary,
@@ -294,6 +370,11 @@ jobs:
               "ok": data.get("ok"),
               "botBlocked": data.get("botBlocked"),
               "page": data.get("page"),
+              "uiTranscriptProbe": {
+                  "segmentCount": (data.get("uiTranscriptProbe") or {}).get("segmentCount"),
+                  "clickResult": (data.get("uiTranscriptProbe") or {}).get("clickResult"),
+                  "sample": ((data.get("uiTranscriptProbe") or {}).get("segments") or [])[:8],
+              },
               "captionProbe": data.get("captionProbe"),
               "mediaCount": data.get("mediaCount"),
               "browserMediaProbe": data.get("browserMediaProbe"),
@@ -303,8 +384,9 @@ jobs:
               raise SystemExit("BROWSER_PROBE=FAIL worker error")
           if data.get("botBlocked"):
               raise SystemExit("BROWSER_PROBE=FAIL YouTube bot wall")
+          ui_segments=(data.get("uiTranscriptProbe") or {}).get("segments") or []
           variants=(data.get("captionProbe") or {}).get("variants") or []
-          caption_ok=any(v.get("ok") and v.get("length",0) > 100 for v in variants)
+          caption_ok=len(ui_segments) >= 3 or any(v.get("ok") and v.get("length",0) > 100 for v in variants)
           if not caption_ok and not (
               (data.get("browserMediaProbe") or {}).get("bytes",0) > 4096
               or (data.get("workerMediaProbe") or {}).get("bytes",0) > 4096

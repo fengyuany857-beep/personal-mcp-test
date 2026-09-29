@@ -258,7 +258,18 @@ jobs:
         run: |
           set -euo pipefail
           url="https://lattice-video-browser-probe.3254849126a.workers.dev"
-          curl -fsS --max-time 70 "$url" | tee /tmp/browser-probe.json
+          rm -f /tmp/browser-probe.json
+          status=""
+          for attempt in 1 2 3 4 5 6 7 8; do
+            status="$(curl -sS --max-time 70 -o /tmp/browser-probe.json -w '%{http_code}' "$url" || true)"
+            echo "BROWSER_PROBE_HTTP attempt=$attempt status=$status"
+            if [ "$status" = "200" ]; then
+              break
+            fi
+            sleep 3
+          done
+          test "$status" = "200"
+          cat /tmp/browser-probe.json
           python - <<'PY'
           import json
           data=json.load(open("/tmp/browser-probe.json"))

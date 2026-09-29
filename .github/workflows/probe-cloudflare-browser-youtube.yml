@@ -85,6 +85,34 @@ jobs:
                 browser = await puppeteer.launch(env.BROWSER);
                 const page = await browser.newPage();
                 const transcriptNetwork = [];
+                let transcriptRequest = null;
+                page.on("request", (req) => {
+                  const url = req.url();
+                  if (!/youtubei\/v1\/get_transcript/i.test(url)) return;
+                  const postData = req.postData() ?? "";
+                  let parsedSummary = null;
+                  try {
+                    const parsed = JSON.parse(postData);
+                    parsedSummary = {
+                      topLevelKeys: Object.keys(parsed),
+                      paramsLength: typeof parsed.params === "string" ? parsed.params.length : null,
+                      contextKeys: parsed.context && typeof parsed.context === "object"
+                        ? Object.keys(parsed.context)
+                        : null,
+                      clientKeys: parsed.context?.client && typeof parsed.context.client === "object"
+                        ? Object.keys(parsed.context.client)
+                        : null,
+                    };
+                  } catch {}
+                  transcriptRequest = {
+                    url,
+                    method: req.method(),
+                    headers: req.headers(),
+                    postData,
+                    postDataLength: postData.length,
+                    parsedSummary,
+                  };
+                });
                 page.on("response", async (res) => {
                   const url = res.url();
                   if (!/youtubei\/v1\/get_transcript/i.test(url)) return;
@@ -209,20 +237,68 @@ jobs:
                     };
                   });
 
+                  let workerTranscriptReplay = null;
+                  if (transcriptRequest?.postData) {
+                    try {
+                      const h = transcriptRequest.headers ?? {};
+                      const replayHeaders = {
+                        "content-type": h["content-type"] ?? "application/json",
+                        "x-youtube-client-name": h["x-youtube-client-name"] ?? "",
+                        "x-youtube-client-version": h["x-youtube-client-version"] ?? "",
+                        "origin": "https://www.youtube.com",
+                        "referer": WATCH_URL,
+                        "user-agent":
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36",
+                      };
+                      const replay = await fetch(transcriptRequest.url, {
+                        method: "POST",
+                        headers: replayHeaders,
+                        body: transcriptRequest.postData,
+                      });
+                      const replayText = await replay.text();
+                      workerTranscriptReplay = {
+                        ok: replay.ok,
+                        status: replay.status,
+                        contentType: replay.headers.get("content-type"),
+                        length: replayText.length,
+                        sample: replayText.slice(0, 10000),
+                      };
+                    } catch (error) {
+                      workerTranscriptReplay = {
+                        ok: false,
+                        status: 0,
+                        length: 0,
+                        error: String(error).slice(0, 500),
+                      };
+                    }
+                  }
+
                   uiTranscriptProbe = {
                     clickResult,
                     segmentCount: transcriptDom.segments.length,
                     segments: transcriptDom.segments.slice(0, 3000),
                     transcriptNodes: transcriptDom.transcriptNodes.slice(0, 20),
                     bodyHasTranscript: transcriptDom.bodyHasTranscript,
+                    requestSummary: transcriptRequest ? {
+                      method: transcriptRequest.method,
+                      postDataLength: transcriptRequest.postDataLength,
+                      parsedSummary: transcriptRequest.parsedSummary,
+                    } : null,
                     networkResponses: transcriptNetwork,
+                    workerTranscriptReplay,
                   };
                 } catch (error) {
                   uiTranscriptProbe = {
                     error: String(error).slice(0, 500),
                     segmentCount: 0,
                     segments: [],
+                    requestSummary: transcriptRequest ? {
+                      method: transcriptRequest.method,
+                      postDataLength: transcriptRequest.postDataLength,
+                      parsedSummary: transcriptRequest.parsedSummary,
+                    } : null,
                     networkResponses: transcriptNetwork,
+                    workerTranscriptReplay: null,
                   };
                 }
 
@@ -402,7 +478,9 @@ jobs:
                   "segmentCount": (data.get("uiTranscriptProbe") or {}).get("segmentCount"),
                   "clickResult": (data.get("uiTranscriptProbe") or {}).get("clickResult"),
                   "sample": ((data.get("uiTranscriptProbe") or {}).get("segments") or [])[:8],
+                  "requestSummary": (data.get("uiTranscriptProbe") or {}).get("requestSummary"),
                   "networkResponses": (data.get("uiTranscriptProbe") or {}).get("networkResponses"),
+                  "workerTranscriptReplay": (data.get("uiTranscriptProbe") or {}).get("workerTranscriptReplay"),
               },
               "captionProbe": data.get("captionProbe"),
               "mediaCount": data.get("mediaCount"),
@@ -416,8 +494,10 @@ jobs:
           ui_segments=(data.get("uiTranscriptProbe") or {}).get("segments") or []
           variants=(data.get("captionProbe") or {}).get("variants") or []
           network=(data.get("uiTranscriptProbe") or {}).get("networkResponses") or []
+          replay=(data.get("uiTranscriptProbe") or {}).get("workerTranscriptReplay") or {}
           caption_ok=(
               len(ui_segments) >= 3
+              or (replay.get("status")==200 and replay.get("length",0) > 200)
               or any(r.get("status")==200 and r.get("length",0) > 200 for r in network)
               or any(v.get("ok") and v.get("length",0) > 100 for v in variants)
           )

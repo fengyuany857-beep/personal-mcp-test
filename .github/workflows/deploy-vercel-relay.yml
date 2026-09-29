@@ -1,0 +1,72 @@
+name: Deploy Vercel Relay
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/deploy-vercel-relay.yml
+      - VERCEL_RELAY_DEPLOY_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: team_VKQCPwtBTZViPSpnQhSSf48d
+      VERCEL_PROJECT_ID: prj_bOdNw2LmN9l7Basw0fiW4SN2lGdi
+      HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Check deployment credentials
+        run: |
+          set -euo pipefail
+          test -n "$VERCEL_TOKEN"
+          test -n "$HUB_RELAY_TOKEN"
+
+      - name: Install relay dependencies
+        working-directory: relay/vercel
+        run: npm install --no-audit --no-fund
+
+      - name: Pull Vercel project configuration
+        working-directory: relay/vercel
+        run: npx vercel@59.19.1 pull --yes --environment=production --token="$VERCEL_TOKEN" --scope=yyyyyy1
+
+      - name: Build production relay
+        working-directory: relay/vercel
+        run: npx vercel@59.19.1 build --prod --token="$VERCEL_TOKEN" --scope=yyyyyy1
+
+      - name: Deploy production relay
+        id: deploy
+        working-directory: relay/vercel
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=$(npx vercel@59.19.1 deploy --prebuilt --prod --token="$VERCEL_TOKEN" --scope=yyyyyy1)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "VERCEL_PRODUCTION_URL=$URL"
+
+      - name: Verify YouTube audio route
+        env:
+          RELAY_URL: https://personal-mcp-hub-relay.vercel.app/api/youtube-audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --max-time 55             -D /tmp/headers.txt             -o /tmp/audio.bin             -H "content-type: application/json"             -H "x-hub-relay-token: $HUB_RELAY_TOKEN"             --data '{"videoId":"teKcE8YhLhA"}'             "$RELAY_URL"
+          BYTES=$(wc -c < /tmp/audio.bin)
+          TYPE=$(awk 'BEGIN{IGNORECASE=1} /^content-type:/ {print $2}' /tmp/headers.txt | tr -d '\r' | tail -1)
+          echo "YOUTUBE_AUDIO_BYTES=$BYTES"
+          echo "YOUTUBE_AUDIO_CONTENT_TYPE=$TYPE"
+          sed -n '1,30p' /tmp/headers.txt
+          test "$BYTES" -gt 100000
+          case "$TYPE" in audio/*) ;; *) cat /tmp/audio.bin; exit 1;; esac

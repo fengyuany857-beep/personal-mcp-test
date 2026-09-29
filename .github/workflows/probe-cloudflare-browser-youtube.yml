@@ -540,15 +540,28 @@ jobs:
           url="https://lattice-video-browser-probe.3254849126a.workers.dev"
           rm -f /tmp/browser-probe.json
           status=""
-          for attempt in 1 2 3 4 5 6 7 8; do
+          accepted="false"
+          for attempt in 1 2 3 4 5 6; do
             status="$(curl -sS --max-time 70 -o /tmp/browser-probe.json -w '%{http_code}' "$url" || true)"
             echo "BROWSER_PROBE_HTTP attempt=$attempt status=$status"
             if [ "$status" = "200" ]; then
-              break
+              if python - <<'PY'
+import json
+try:
+    data=json.load(open("/tmp/browser-probe.json"))
+    raise SystemExit(0 if data.get("ok") and not data.get("botBlocked") else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+              then
+                accepted="true"
+                break
+              fi
+              echo "BROWSER_PROBE_RETRY bot wall or invalid response"
             fi
-            sleep 3
+            sleep 2
           done
-          test "$status" = "200"
+          test "$accepted" = "true"
           cat /tmp/browser-probe.json
           python - <<'PY'
           import json

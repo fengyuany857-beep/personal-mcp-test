@@ -126,19 +126,36 @@ jobs:
                 let captionProbe = null;
                 const firstCaption = pageState.captionTracks.find((track) => track.baseUrl)?.baseUrl;
                 if (firstCaption) {
-                  captionProbe = await page.evaluate(async (url) => {
-                    try {
-                      const res = await fetch(url);
-                      const text = await res.text();
-                      return {
-                        ok: res.ok,
-                        status: res.status,
-                        contentType: res.headers.get("content-type"),
-                        sample: text.slice(0, 1200),
-                      };
-                    } catch (error) {
-                      return { ok: false, status: 0, error: String(error).slice(0, 300) };
+                  captionProbe = await page.evaluate(async (baseUrl) => {
+                    const variants = [];
+                    for (const fmt of ["json3", "vtt", "srv3", "ttml"]) {
+                      try {
+                        const url = new URL(baseUrl);
+                        url.searchParams.set("fmt", fmt);
+                        const res = await fetch(url.toString(), {
+                          credentials: "include",
+                          headers: { Accept: "*/*" },
+                        });
+                        const text = await res.text();
+                        variants.push({
+                          fmt,
+                          ok: res.ok,
+                          status: res.status,
+                          contentType: res.headers.get("content-type"),
+                          length: text.length,
+                          sample: text.slice(0, 1600),
+                        });
+                      } catch (error) {
+                        variants.push({
+                          fmt,
+                          ok: false,
+                          status: 0,
+                          length: 0,
+                          error: String(error).slice(0, 300),
+                        });
+                      }
                     }
+                    return { variants };
                   }, firstCaption);
                 }
 
@@ -286,7 +303,9 @@ jobs:
               raise SystemExit("BROWSER_PROBE=FAIL worker error")
           if data.get("botBlocked"):
               raise SystemExit("BROWSER_PROBE=FAIL YouTube bot wall")
-          if not data.get("captionProbe") and not (
+          variants=(data.get("captionProbe") or {}).get("variants") or []
+          caption_ok=any(v.get("ok") and v.get("length",0) > 100 for v in variants)
+          if not caption_ok and not (
               (data.get("browserMediaProbe") or {}).get("bytes",0) > 4096
               or (data.get("workerMediaProbe") or {}).get("bytes",0) > 4096
           ):

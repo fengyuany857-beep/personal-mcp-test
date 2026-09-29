@@ -241,8 +241,42 @@ jobs:
                   if (transcriptRequest?.postData) {
                     try {
                       const h = transcriptRequest.headers ?? {};
+                      const binary = Uint8Array.from(
+                        Array.from(transcriptRequest.postData, (ch) => ch.charCodeAt(0) & 0xff)
+                      );
+                      const isGzip =
+                        String(h["content-encoding"] ?? "").toLowerCase().includes("gzip") ||
+                        (binary.length >= 2 && binary[0] === 0x1f && binary[1] === 0x8b);
+
+                      let replayBody = transcriptRequest.postData;
+                      let decodedLength = null;
+                      let decodedJson = null;
+                      if (isGzip) {
+                        const ds = new DecompressionStream("gzip");
+                        const decompressed = await new Response(
+                          new Blob([binary]).stream().pipeThrough(ds)
+                        ).arrayBuffer();
+                        replayBody = new TextDecoder().decode(decompressed);
+                        decodedLength = replayBody.length;
+                        try {
+                          const parsed = JSON.parse(replayBody);
+                          decodedJson = {
+                            topLevelKeys: Object.keys(parsed),
+                            paramsLength: typeof parsed.params === "string" ? parsed.params.length : null,
+                            contextKeys:
+                              parsed.context && typeof parsed.context === "object"
+                                ? Object.keys(parsed.context)
+                                : null,
+                            clientKeys:
+                              parsed.context?.client && typeof parsed.context.client === "object"
+                                ? Object.keys(parsed.context.client)
+                                : null,
+                          };
+                        } catch {}
+                      }
+
                       const replayHeaders = {
-                        "content-type": h["content-type"] ?? "application/json",
+                        "content-type": "application/json",
                         "x-youtube-client-name": h["x-youtube-client-name"] ?? "",
                         "x-youtube-client-version": h["x-youtube-client-version"] ?? "",
                         "origin": "https://www.youtube.com",
@@ -253,7 +287,7 @@ jobs:
                       const replay = await fetch(transcriptRequest.url, {
                         method: "POST",
                         headers: replayHeaders,
-                        body: transcriptRequest.postData,
+                        body: replayBody,
                       });
                       const replayText = await replay.text();
                       workerTranscriptReplay = {
@@ -261,6 +295,10 @@ jobs:
                         status: replay.status,
                         contentType: replay.headers.get("content-type"),
                         length: replayText.length,
+                        wasGzip: isGzip,
+                        compressedLength: binary.length,
+                        decodedLength,
+                        decodedJson,
                         sample: replayText.slice(0, 10000),
                       };
                     } catch (error) {

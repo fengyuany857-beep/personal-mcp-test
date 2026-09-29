@@ -84,6 +84,51 @@ jobs:
               try {
                 browser = await puppeteer.launch(env.BROWSER);
                 const page = await browser.newPage();
+
+                // YouTube currently sends get_transcript with a gzip-encoded request body.
+                // In Browser Rendering this request can arrive upstream with a broken
+                // content-encoding/body pairing, producing HTTP 400. Normalize just this
+                // request back to plain JSON before it leaves Chromium.
+                await page.setRequestInterception(true);
+                page.on("request", async (req) => {
+                  const url = req.url();
+                  if (!/youtubei\/v1\/get_transcript/i.test(url)) {
+                    try { await req.continue(); } catch {}
+                    return;
+                  }
+
+                  try {
+                    const headers = { ...req.headers() };
+                    const postData = req.postData() ?? "";
+                    const binary = Uint8Array.from(
+                      Array.from(postData, (ch) => ch.charCodeAt(0) & 0xff)
+                    );
+                    const isGzip =
+                      String(headers["content-encoding"] ?? "").toLowerCase().includes("gzip") ||
+                      (binary.length >= 2 && binary[0] === 0x1f && binary[1] === 0x8b);
+
+                    if (!isGzip) {
+                      await req.continue();
+                      return;
+                    }
+
+                    const ds = new DecompressionStream("gzip");
+                    const decompressed = await new Response(
+                      new Blob([binary]).stream().pipeThrough(ds)
+                    ).arrayBuffer();
+                    const jsonBody = new TextDecoder().decode(decompressed);
+                    JSON.parse(jsonBody);
+
+                    delete headers["content-encoding"];
+                    delete headers["content-length"];
+                    headers["content-type"] = "application/json";
+                    await req.continue({ headers, postData: jsonBody });
+                  } catch (error) {
+                    console.log("TRANSCRIPT_INTERCEPT_ERROR", String(error).slice(0, 500));
+                    try { await req.continue(); } catch {}
+                  }
+                });
+
                 const transcriptNetwork = [];
                 let transcriptRequest = null;
                 page.on("request", (req) => {

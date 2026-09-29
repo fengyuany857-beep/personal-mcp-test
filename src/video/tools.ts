@@ -647,6 +647,16 @@ async function youtubeAudioAsr(
     };
   }
 
+  const maxAudioBytes = 32 * 1024 * 1024;
+  const clients = [
+    "VISIONOS",
+    "ANDROID_VR",
+    "TV",
+    "WEB_EMBEDDED",
+    "TV_SIMPLY",
+  ] as const;
+  const clientDiagnostics: string[] = [];
+
   try {
     const youtubeModule = await import("youtubei.js/cf-worker");
     const Innertube = youtubeModule.Innertube;
@@ -656,94 +666,134 @@ async function youtubeAudioAsr(
       retrieve_player: true,
     });
 
-    const info = await yt.getBasicInfo(videoId);
-    const format = info.chooseFormat({ type: "audio", quality: "bestefficiency" });
-    const approxDurationMs = Number(format.approx_duration_ms ?? 0);
-    const durationMinutes = approxDurationMs > 0 ? approxDurationMs / 60_000 : 0;
+    let audio: ArrayBuffer | null = null;
+    let approxDurationMs = 0;
+    let selectedClient = "";
 
-    if (durationMinutes > maxAsrMinutes) {
+    for (const client of clients) {
+      try {
+        const info = await yt.getBasicInfo(videoId, { client });
+        const streaming = info.streaming_data;
+        if (!streaming) {
+          clientDiagnostics.push(client + ":no_streaming_data");
+          continue;
+        }
+
+        const candidates = [
+          ...(streaming.adaptive_formats ?? []),
+          ...(streaming.formats ?? []),
+        ]
+          .filter((format) => {
+            const mime = String(format.mime_type ?? "");
+            return (
+              format.has_audio &&
+              mime.startsWith("audio/") &&
+              !format.drm_families?.length &&
+              Boolean(format.url || format.signature_cipher || format.cipher)
+            );
+          })
+          .sort((a, b) => {
+            const directA = a.url ? 0 : 1;
+            const directB = b.url ? 0 : 1;
+            if (directA !== directB) return directA - directB;
+            const sizeA = Number(a.content_length ?? Number.MAX_SAFE_INTEGER);
+            const sizeB = Number(b.content_length ?? Number.MAX_SAFE_INTEGER);
+            if (sizeA !== sizeB) return sizeA - sizeB;
+            return Number(a.bitrate ?? 0) - Number(b.bitrate ?? 0);
+          });
+
+        if (!candidates.length) {
+          clientDiagnostics.push(client + ":no_audio_url_format");
+          continue;
+        }
+
+        for (const format of candidates) {
+          const durationMs = Number(format.approx_duration_ms ?? 0);
+          const durationMinutes = durationMs > 0 ? durationMs / 60_000 : 0;
+          if (durationMinutes > maxAsrMinutes) {
+            return {
+              ok: false,
+              source: "youtube",
+              videoId,
+              provider: "workers-ai-whisper-large-v3-turbo",
+              code: "ASR_TOO_LONG",
+              message:
+                "Video is about " +
+                durationMinutes.toFixed(1) +
+                " minutes, above the configured ASR limit of " +
+                maxAsrMinutes +
+                " minutes.",
+            };
+          }
+
+          const declaredBytes = Number(format.content_length ?? 0);
+          if (declaredBytes > maxAudioBytes) continue;
+
+          let audioUrl = format.url ?? "";
+          if (!audioUrl) {
+            try {
+              audioUrl = await format.decipher(yt.session.player);
+            } catch {
+              continue;
+            }
+          }
+          if (!audioUrl) continue;
+
+          const audioResponse = await timedFetch(
+            audioUrl,
+            {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36",
+              },
+            },
+            45_000,
+          );
+
+          if (!audioResponse.ok) {
+            clientDiagnostics.push(client + ":http_" + audioResponse.status);
+            continue;
+          }
+
+          const headerBytes = Number(audioResponse.headers.get("content-length") ?? 0);
+          if (headerBytes > maxAudioBytes) {
+            clientDiagnostics.push(client + ":audio_too_large");
+            continue;
+          }
+
+          const buffer = await audioResponse.arrayBuffer();
+          if (buffer.byteLength > maxAudioBytes) {
+            clientDiagnostics.push(client + ":audio_too_large");
+            continue;
+          }
+
+          audio = buffer;
+          approxDurationMs = durationMs;
+          selectedClient = client;
+          break;
+        }
+
+        if (audio) break;
+        clientDiagnostics.push(client + ":no_fetchable_audio");
+      } catch (error) {
+        const diagnostic =
+          error instanceof Error
+            ? error.message.replace(/\s+/g, " ").slice(0, 120)
+            : String(error).slice(0, 120);
+        clientDiagnostics.push(client + ":" + diagnostic);
+      }
+    }
+
+    if (!audio) {
       return {
         ok: false,
         source: "youtube",
         videoId,
-        provider: "workers-ai-whisper-large-v3-turbo",
-        code: "ASR_TOO_LONG",
+        provider: "youtubei.js",
+        code: "YOUTUBE_BLOCKED",
         message:
-          "Video is about " +
-          durationMinutes.toFixed(1) +
-          " minutes, above the configured ASR limit of " +
-          maxAsrMinutes +
-          " minutes.",
-      };
-    }
-
-    const declaredBytes = Number(format.content_length ?? 0);
-    const maxAudioBytes = 32 * 1024 * 1024;
-    if (declaredBytes > maxAudioBytes) {
-      return {
-        ok: false,
-        source: "youtube",
-        videoId,
-        provider: "workers-ai-whisper-large-v3-turbo",
-        code: "ASR_TOO_LARGE",
-        message: "Selected audio stream exceeds the 32 MiB ASR safety bound.",
-      };
-    }
-
-    const audioUrl = await format.decipher(yt.session.player);
-    if (!audioUrl) {
-      return {
-        ok: false,
-        source: "youtube",
-        videoId,
-        provider: "youtubei.js",
-        code: "UPSTREAM_PROTOCOL_ERROR",
-        message: "YouTube audio format could not be deciphered.",
-      };
-    }
-
-    const audioResponse = await timedFetch(
-      audioUrl,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36",
-        },
-      },
-      45_000,
-    );
-    if (!audioResponse.ok) {
-      return {
-        ok: false,
-        source: "youtube",
-        videoId,
-        provider: "youtubei.js",
-        code: audioResponse.status === 403 || audioResponse.status === 429 ? "YOUTUBE_BLOCKED" : "UPSTREAM_UNAVAILABLE",
-        message: "YouTube audio stream returned HTTP " + audioResponse.status + ".",
-      };
-    }
-
-    const headerBytes = Number(audioResponse.headers.get("content-length") ?? 0);
-    if (headerBytes > maxAudioBytes) {
-      return {
-        ok: false,
-        source: "youtube",
-        videoId,
-        provider: "workers-ai-whisper-large-v3-turbo",
-        code: "ASR_TOO_LARGE",
-        message: "Fetched audio stream exceeds the 32 MiB ASR safety bound.",
-      };
-    }
-
-    const audio = await audioResponse.arrayBuffer();
-    if (audio.byteLength > maxAudioBytes) {
-      return {
-        ok: false,
-        source: "youtube",
-        videoId,
-        provider: "workers-ai-whisper-large-v3-turbo",
-        code: "ASR_TOO_LARGE",
-        message: "Fetched audio stream exceeds the 32 MiB ASR safety bound.",
+          "No fetchable audio-only stream was available from the bounded YouTube client set. " +
+          clientDiagnostics.join(" | ").slice(0, 900),
       };
     }
 
@@ -788,7 +838,10 @@ async function youtubeAudioAsr(
       ok: true,
       source: "youtube",
       videoId,
-      provider: "youtubei.js+workers-ai-whisper-large-v3-turbo",
+      provider:
+        "youtubei.js:" +
+        selectedClient +
+        "+workers-ai-whisper-large-v3-turbo",
       language: language ?? null,
       isAutoGenerated: true,
       text: capped.text,

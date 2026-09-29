@@ -1,4 +1,4 @@
-name: Probe Kome YouTube Transcript
+name: Probe Third-Party YouTube Transcript
 
 on:
   workflow_dispatch:
@@ -16,19 +16,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Probe target video
+      - name: Probe NoteGPT target video
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail-with-body --silent --show-error --max-time 30             -o /tmp/kome.json             -H 'content-type: application/json'             --data '{"video_id":"teKcE8YhLhA","format":true}'             https://kome.ai/api/transcript
+          UUID=$(python -c 'import uuid; print(uuid.uuid4())')
+          curl --fail-with-body --silent --show-error --max-time 30             -o /tmp/notegpt.json             -H "Cookie: anonymous_user_id=$UUID"             "https://notegpt.io/api/v2/video-transcript-v2?platform=youtube&video_id=teKcE8YhLhA"
           python - <<'PY'
           import json
-          data=json.load(open("/tmp/kome.json"))
-          text=data.get("transcript") or ""
-          print("KOME_KEYS=", sorted(data.keys()))
-          print("KOME_CHARS=", len(text))
-          print("KOME_SAMPLE=", text[:500].replace("\n"," "))
-          if len(text) < 500:
-              raise SystemExit("KOME_PROBE=FAIL")
-          print("KOME_PROBE=PASS")
+          data=json.load(open("/tmp/notegpt.json"))
+          print("NOTEGPT_CODE=", data.get("code"))
+          print("NOTEGPT_MESSAGE=", data.get("message"))
+          d=data.get("data") or {}
+          tracks=d.get("transcripts") or {}
+          count=0
+          chars=0
+          sample=""
+          for lang, variants in tracks.items():
+              if not isinstance(variants, dict): continue
+              for name in ("default","auto","custom"):
+                  rows=variants.get(name) or []
+                  if rows:
+                      count=len(rows)
+                      chars=sum(len(str(x.get("text",""))) for x in rows if isinstance(x,dict))
+                      sample=" ".join(str(x.get("text","")) for x in rows[:8] if isinstance(x,dict))
+                      print("NOTEGPT_TRACK=", lang, name)
+                      break
+              if count: break
+          print("NOTEGPT_SEGMENTS=", count)
+          print("NOTEGPT_CHARS=", chars)
+          print("NOTEGPT_SAMPLE=", sample[:500])
+          if data.get("code") != 100000 or count < 3 or chars < 500:
+              raise SystemExit("NOTEGPT_PROBE=FAIL")
+          print("NOTEGPT_PROBE=PASS")
           PY

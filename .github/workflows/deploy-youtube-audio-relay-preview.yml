@@ -1,0 +1,93 @@
+name: Deploy YouTube Audio Relay Preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/deploy-youtube-audio-relay-preview.yml
+      - YOUTUBE_RELAY_PREVIEW_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+      VERCEL_ORG_ID: team_VKQCPwtBTZViPSpnQhSSf48d
+      VERCEL_PROJECT_ID: prj_bOdNw2LmN9l7Basw0fiW4SN2lGdi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Verify deploy credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${VERCEL_TOKEN}" ]; then
+            echo "VERCEL_TOKEN_CONFIGURED=false"
+            exit 42
+          fi
+          if [ -z "${HUB_RELAY_TOKEN}" ]; then
+            echo "HUB_RELAY_TOKEN_CONFIGURED=false"
+            exit 43
+          fi
+          echo "VERCEL_TOKEN_CONFIGURED=true"
+          echo "HUB_RELAY_TOKEN_CONFIGURED=true"
+
+      - name: Link existing Vercel project locally
+        working-directory: relay/vercel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .vercel
+          printf '%s\n' '{"projectId":"prj_bOdNw2LmN9l7Basw0fiW4SN2lGdi","orgId":"team_VKQCPwtBTZViPSpnQhSSf48d"}' > .vercel/project.json
+
+      - name: Deploy isolated preview
+        id: deploy
+        working-directory: relay/vercel
+        shell: bash
+        run: |
+          set -euo pipefail
+          deployment_url="$(
+            npx --yes vercel@59.19.1 deploy               --yes               --target=preview               --token "${VERCEL_TOKEN}"               --env "HUB_RELAY_TOKEN=${HUB_RELAY_TOKEN}"
+          )"
+          test -n "${deployment_url}"
+          echo "url=${deployment_url}" >> "${GITHUB_OUTPUT}"
+          echo "PREVIEW_DEPLOYMENT_URL=${deployment_url}"
+
+      - name: Verify target YouTube audio through Vercel egress
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/youtube-audio.bin /tmp/youtube-audio.headers /tmp/youtube-audio.body
+          status="$(
+            curl -sS               -D /tmp/youtube-audio.headers               -o /tmp/youtube-audio.body               -w '%{http_code}'               -X POST               -H 'content-type: application/json'               -H "x-hub-relay-token: ${HUB_RELAY_TOKEN}"               --data '{"videoId":"teKcE8YhLhA"}'               "${DEPLOYMENT_URL%/}/api/youtube-audio"
+          )"
+          echo "YOUTUBE_AUDIO_HTTP=${status}"
+          if [ "${status}" != "200" ]; then
+            head -c 2000 /tmp/youtube-audio.body || true
+            echo
+            exit 44
+          fi
+          mv /tmp/youtube-audio.body /tmp/youtube-audio.bin
+          bytes="$(wc -c < /tmp/youtube-audio.bin)"
+          content_type="$(awk 'BEGIN{IGNORECASE=1} /^content-type:/{gsub("\r",""); print $2}' /tmp/youtube-audio.headers | tail -n1)"
+          provider="$(awk 'BEGIN{IGNORECASE=1} /^x-youtube-audio-provider:/{gsub("\r",""); print $2}' /tmp/youtube-audio.headers | tail -n1)"
+          elapsed="$(awk 'BEGIN{IGNORECASE=1} /^x-relay-elapsed-ms:/{gsub("\r",""); print $2}' /tmp/youtube-audio.headers | tail -n1)"
+          test "${bytes}" -gt 100000
+          case "${content_type}" in audio/*) ;; *) echo "unexpected content-type: ${content_type}"; exit 45 ;; esac
+          echo "YOUTUBE_AUDIO_PREVIEW=PASS bytes=${bytes} content_type=${content_type} provider=${provider} relay_elapsed_ms=${elapsed}"

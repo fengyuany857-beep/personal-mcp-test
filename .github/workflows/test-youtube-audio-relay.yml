@@ -1,16 +1,13 @@
 name: Verify YouTube Audio Relay
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - feat/academic-evidence-capability
     paths:
-      - relay/vercel/api/youtube-audio.mjs
-      - relay/vercel/youtube-audio-test.mjs
-      - relay/vercel/package.json
-      - relay/vercel/vercel.json
       - .github/workflows/test-youtube-audio-relay.yml
-  workflow_dispatch:
+      - YOUTUBE_AUDIO_VERIFY_TRIGGER
 
 permissions:
   contents: read
@@ -18,16 +15,22 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    defaults:
-      run:
-        working-directory: relay/vercel
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-      - name: Install relay dependencies
-        run: npm install --no-audit --no-fund
-      - name: Run live YouTube audio regression
-        run: npm run test:youtube
+      - name: Verify production YouTube audio relay
+        env:
+          HUB_RELAY_TOKEN: ${{ secrets.HUB_RELAY_TOKEN }}
+          RELAY_URL: https://personal-mcp-hub-relay.vercel.app/api/youtube-audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HUB_RELAY_TOKEN"
+          curl --fail-with-body --silent --show-error --max-time 55             -D /tmp/headers.txt             -o /tmp/audio.bin             -H "content-type: application/json"             -H "x-hub-relay-token: $HUB_RELAY_TOKEN"             --data '{"videoId":"teKcE8YhLhA"}'             "$RELAY_URL"
+          BYTES=$(wc -c < /tmp/audio.bin)
+          TYPE=$(awk 'BEGIN{IGNORECASE=1} /^content-type:/ {print $2}' /tmp/headers.txt | tr -d '\r' | tail -1)
+          echo "YOUTUBE_AUDIO_BYTES=$BYTES"
+          echo "YOUTUBE_AUDIO_CONTENT_TYPE=$TYPE"
+          sed -n '1,30p' /tmp/headers.txt
+          test "$BYTES" -gt 100000
+          case "$TYPE" in audio/*) ;; *) echo "unexpected content type"; exit 1;; esac

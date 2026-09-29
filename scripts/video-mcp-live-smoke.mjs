@@ -5,6 +5,22 @@ const endpoint = process.env.MCP_ENDPOINT;
 const videoUrl = process.env.VIDEO_URL ?? "https://www.youtube.com/watch?v=teKcE8YhLhA";
 if (!endpoint) throw new Error("MCP_ENDPOINT is required");
 
+const { Innertube } = await import("youtubei.js");
+const ytProbe = await Innertube.create({ enable_session_cache: false, generate_session_locally: true, retrieve_player: true });
+for (const probeClient of ["VISIONOS", "ANDROID_VR", "TV", "WEB_EMBEDDED"]) {
+  const started = Date.now();
+  try {
+    const info = await ytProbe.getBasicInfo("teKcE8YhLhA", { client: probeClient });
+    const formats = [
+      ...(info.streaming_data?.adaptive_formats ?? []),
+      ...(info.streaming_data?.formats ?? []),
+    ].filter((format) => format.has_audio);
+    console.log("YT_PROBE=" + probeClient + " ms=" + (Date.now() - started) + " formats=" + formats.length + " direct=" + formats.filter((f) => Boolean(f.url)).length + " cipher=" + formats.filter((f) => Boolean(f.signature_cipher || f.cipher)).length);
+  } catch (error) {
+    console.log("YT_PROBE=" + probeClient + " ms=" + (Date.now() - started) + " ERROR=" + String(error).slice(0,240));
+  }
+}
+
 const client = new Client(
   { name: "video-transcript-smoke", version: "1.1.0" },
   { versionNegotiation: { mode: "legacy" }, listMaxPages: 8 },

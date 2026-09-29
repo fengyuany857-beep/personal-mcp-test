@@ -1,0 +1,291 @@
+name: Probe Cloudflare Browser YouTube
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/probe-cloudflare-browser-youtube.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Build isolated Browser Run probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/lattice-video-browser-probe
+          mkdir -p /tmp/lattice-video-browser-probe/src
+          cat > /tmp/lattice-video-browser-probe/package.json <<'JSON'
+          {
+            "name": "lattice-video-browser-probe",
+            "private": true,
+            "type": "module",
+            "dependencies": {
+              "@cloudflare/puppeteer": "1.1.0"
+            },
+            "devDependencies": {
+              "wrangler": "4.131.2"
+            }
+          }
+          JSON
+          cat > /tmp/lattice-video-browser-probe/wrangler.jsonc <<'JSON'
+          {
+            "$schema": "node_modules/wrangler/config-schema.json",
+            "name": "lattice-video-browser-probe",
+            "main": "src/index.js",
+            "compatibility_date": "2026-09-29",
+            "browser": {
+              "binding": "BROWSER"
+            }
+          }
+          JSON
+          cat > /tmp/lattice-video-browser-probe/src/index.js <<'JS'
+          import puppeteer from "@cloudflare/puppeteer";
+
+          const VIDEO_ID = "teKcE8YhLhA";
+          const WATCH_URL = "https://www.youtube.com/watch?v=" + VIDEO_ID;
+
+          function summarizeUrl(raw) {
+            try {
+              const url = new URL(raw);
+              return {
+                host: url.hostname,
+                path: url.pathname,
+                itag: url.searchParams.get("itag"),
+                mime: url.searchParams.get("mime"),
+                hasPot: url.searchParams.has("pot"),
+              };
+            } catch {
+              return { host: null, path: null, itag: null, mime: null, hasPot: false };
+            }
+          }
+
+          export default {
+            async fetch(_request, env) {
+              let browser;
+              const media = [];
+              try {
+                browser = await puppeteer.launch(env.BROWSER);
+                const page = await browser.newPage();
+                await page.setUserAgent(
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                  "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+                );
+
+                page.on("request", (req) => {
+                  const url = req.url();
+                  if (/googlevideo\.com\/videoplayback/i.test(url)) {
+                    if (!media.includes(url) && media.length < 12) media.push(url);
+                  }
+                });
+
+                const response = await page.goto(WATCH_URL, {
+                  waitUntil: "domcontentloaded",
+                  timeout: 30000,
+                });
+                await new Promise((resolve) => setTimeout(resolve, 2500));
+
+                const pageState = await page.evaluate(() => {
+                  const body = document.body?.innerText ?? "";
+                  const initial = globalThis.ytInitialPlayerResponse ?? null;
+                  const tracks =
+                    initial?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+                  return {
+                    title: document.title,
+                    bodySample: body.slice(0, 800),
+                    playability: initial?.playabilityStatus?.status ?? null,
+                    playabilityReason: initial?.playabilityStatus?.reason ?? null,
+                    captionTracks: tracks.map((track) => ({
+                      languageCode: track.languageCode ?? null,
+                      kind: track.kind ?? null,
+                      baseUrl: track.baseUrl ?? null,
+                    })),
+                    streamingFormats:
+                      (initial?.streamingData?.adaptiveFormats?.length ?? 0) +
+                      (initial?.streamingData?.formats?.length ?? 0),
+                  };
+                });
+
+                let captionProbe = null;
+                const firstCaption = pageState.captionTracks.find((track) => track.baseUrl)?.baseUrl;
+                if (firstCaption) {
+                  captionProbe = await page.evaluate(async (url) => {
+                    try {
+                      const res = await fetch(url);
+                      const text = await res.text();
+                      return {
+                        ok: res.ok,
+                        status: res.status,
+                        contentType: res.headers.get("content-type"),
+                        sample: text.slice(0, 1200),
+                      };
+                    } catch (error) {
+                      return { ok: false, status: 0, error: String(error).slice(0, 300) };
+                    }
+                  }, firstCaption);
+                }
+
+                try {
+                  await page.evaluate(() => {
+                    const button =
+                      document.querySelector(".ytp-large-play-button") ||
+                      document.querySelector("button.ytp-play-button");
+                    if (button) button.click();
+                  });
+                  await new Promise((resolve) => setTimeout(resolve, 8000));
+                } catch {}
+
+                const mediaSummary = media.map(summarizeUrl);
+                const candidateIndex = media.findIndex((url) => {
+                  const decoded = decodeURIComponent(url);
+                  return /mime=audio\//i.test(decoded) || /[?&]itag=(139|140|141|249|250|251)(?:&|$)/.test(url);
+                });
+                const candidate = candidateIndex >= 0 ? media[candidateIndex] : media[0];
+
+                let browserMediaProbe = null;
+                let workerMediaProbe = null;
+                if (candidate) {
+                  browserMediaProbe = await page.evaluate(async (url) => {
+                    try {
+                      const res = await fetch(url, { headers: { Range: "bytes=0-65535" } });
+                      const buf = await res.arrayBuffer();
+                      return {
+                        ok: res.ok,
+                        status: res.status,
+                        bytes: buf.byteLength,
+                        contentType: res.headers.get("content-type"),
+                      };
+                    } catch (error) {
+                      return { ok: false, status: 0, bytes: 0, error: String(error).slice(0, 300) };
+                    }
+                  }, candidate);
+
+                  try {
+                    const res = await fetch(candidate, {
+                      headers: {
+                        Range: "bytes=0-65535",
+                        Referer: WATCH_URL,
+                        "User-Agent":
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36",
+                      },
+                    });
+                    const buf = await res.arrayBuffer();
+                    workerMediaProbe = {
+                      ok: res.ok,
+                      status: res.status,
+                      bytes: buf.byteLength,
+                      contentType: res.headers.get("content-type"),
+                    };
+                  } catch (error) {
+                    workerMediaProbe = {
+                      ok: false,
+                      status: 0,
+                      bytes: 0,
+                      error: String(error).slice(0, 300),
+                    };
+                  }
+                }
+
+                const bodyLower = String(pageState.bodySample).toLowerCase();
+                const botBlocked =
+                  bodyLower.includes("confirm you’re not a bot") ||
+                  bodyLower.includes("confirm you're not a bot") ||
+                  bodyLower.includes("unusual traffic") ||
+                  bodyLower.includes("sign in to confirm");
+
+                return Response.json({
+                  ok: true,
+                  navigationStatus: response?.status() ?? null,
+                  botBlocked,
+                  page: {
+                    title: pageState.title,
+                    playability: pageState.playability,
+                    playabilityReason: pageState.playabilityReason,
+                    captionTracks: pageState.captionTracks.map(({ languageCode, kind }) => ({
+                      languageCode,
+                      kind,
+                    })),
+                    streamingFormats: pageState.streamingFormats,
+                  },
+                  captionProbe,
+                  mediaCount: media.length,
+                  media: mediaSummary,
+                  browserMediaProbe,
+                  workerMediaProbe,
+                });
+              } catch (error) {
+                return Response.json(
+                  { ok: false, error: error instanceof Error ? error.message : String(error) },
+                  { status: 500 }
+                );
+              } finally {
+                if (browser) {
+                  try { await browser.close(); } catch {}
+                }
+              }
+            },
+          };
+          JS
+          cd /tmp/lattice-video-browser-probe
+          npm install --no-audit --no-fund
+
+      - name: Deploy isolated Browser Run probe
+        working-directory: /tmp/lattice-video-browser-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --config wrangler.jsonc
+
+      - name: Run target video probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://lattice-video-browser-probe.3254849126a.workers.dev"
+          curl -fsS --max-time 70 "$url" | tee /tmp/browser-probe.json
+          python - <<'PY'
+          import json
+          data=json.load(open("/tmp/browser-probe.json"))
+          print("\nBROWSER_PROBE_SUMMARY", json.dumps({
+              "ok": data.get("ok"),
+              "botBlocked": data.get("botBlocked"),
+              "page": data.get("page"),
+              "captionProbe": data.get("captionProbe"),
+              "mediaCount": data.get("mediaCount"),
+              "browserMediaProbe": data.get("browserMediaProbe"),
+              "workerMediaProbe": data.get("workerMediaProbe"),
+          }, ensure_ascii=False))
+          if not data.get("ok"):
+              raise SystemExit("BROWSER_PROBE=FAIL worker error")
+          if data.get("botBlocked"):
+              raise SystemExit("BROWSER_PROBE=FAIL YouTube bot wall")
+          if not data.get("captionProbe") and not (
+              (data.get("browserMediaProbe") or {}).get("bytes",0) > 4096
+              or (data.get("workerMediaProbe") or {}).get("bytes",0) > 4096
+          ):
+              raise SystemExit("BROWSER_PROBE=FAIL no readable captions or media bytes")
+          print("BROWSER_PROBE=PASS")
+          PY
+
+      - name: Delete isolated probe Worker
+        if: always()
+        working-directory: /tmp/lattice-video-browser-probe
+        shell: bash
+        run: |
+          npx wrangler delete --name lattice-video-browser-probe --force || true

@@ -84,6 +84,26 @@ jobs:
               try {
                 browser = await puppeteer.launch(env.BROWSER);
                 const page = await browser.newPage();
+                const transcriptNetwork = [];
+                page.on("response", async (res) => {
+                  const url = res.url();
+                  if (!/youtubei\/v1\/get_transcript/i.test(url)) return;
+                  try {
+                    const text = await res.text();
+                    transcriptNetwork.push({
+                      status: res.status(),
+                      contentType: res.headers()["content-type"] ?? null,
+                      length: text.length,
+                      sample: text.slice(0, 8000),
+                    });
+                  } catch (error) {
+                    transcriptNetwork.push({
+                      status: res.status(),
+                      length: 0,
+                      error: String(error).slice(0, 500),
+                    });
+                  }
+                });
                 await page.setUserAgent(
                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -147,7 +167,13 @@ jobs:
                     return { clicked: true, text: (target.textContent ?? "").trim(), aria: target.getAttribute?.("aria-label") ?? null };
                   });
 
-                  await new Promise((resolve) => setTimeout(resolve, 2200));
+                  try {
+                    await page.waitForSelector(
+                      "ytd-transcript-segment-renderer, ytd-engagement-panel-section-list-renderer[target-id='engagement-panel-searchable-transcript']",
+                      { timeout: 10000 }
+                    );
+                  } catch {}
+                  await new Promise((resolve) => setTimeout(resolve, 1200));
 
                   const transcriptDom = await page.evaluate(() => {
                     const rows = Array.from(
@@ -189,12 +215,14 @@ jobs:
                     segments: transcriptDom.segments.slice(0, 3000),
                     transcriptNodes: transcriptDom.transcriptNodes.slice(0, 20),
                     bodyHasTranscript: transcriptDom.bodyHasTranscript,
+                    networkResponses: transcriptNetwork,
                   };
                 } catch (error) {
                   uiTranscriptProbe = {
                     error: String(error).slice(0, 500),
                     segmentCount: 0,
                     segments: [],
+                    networkResponses: transcriptNetwork,
                   };
                 }
 
@@ -374,6 +402,7 @@ jobs:
                   "segmentCount": (data.get("uiTranscriptProbe") or {}).get("segmentCount"),
                   "clickResult": (data.get("uiTranscriptProbe") or {}).get("clickResult"),
                   "sample": ((data.get("uiTranscriptProbe") or {}).get("segments") or [])[:8],
+                  "networkResponses": (data.get("uiTranscriptProbe") or {}).get("networkResponses"),
               },
               "captionProbe": data.get("captionProbe"),
               "mediaCount": data.get("mediaCount"),
@@ -386,7 +415,12 @@ jobs:
               raise SystemExit("BROWSER_PROBE=FAIL YouTube bot wall")
           ui_segments=(data.get("uiTranscriptProbe") or {}).get("segments") or []
           variants=(data.get("captionProbe") or {}).get("variants") or []
-          caption_ok=len(ui_segments) >= 3 or any(v.get("ok") and v.get("length",0) > 100 for v in variants)
+          network=(data.get("uiTranscriptProbe") or {}).get("networkResponses") or []
+          caption_ok=(
+              len(ui_segments) >= 3
+              or any(r.get("status")==200 and r.get("length",0) > 200 for r in network)
+              or any(v.get("ok") and v.get("length",0) > 100 for v in variants)
+          )
           if not caption_ok and not (
               (data.get("browserMediaProbe") or {}).get("bytes",0) > 4096
               or (data.get("workerMediaProbe") or {}).get("bytes",0) > 4096

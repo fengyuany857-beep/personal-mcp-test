@@ -1,0 +1,34 @@
+name: Probe Kome YouTube Transcript
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/probe-kome-transcript.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe target video
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --max-time 30             -o /tmp/kome.json             -H 'content-type: application/json'             --data '{"video_id":"teKcE8YhLhA","format":true}'             https://kome.ai/api/transcript
+          python - <<'PY'
+          import json
+          data=json.load(open("/tmp/kome.json"))
+          text=data.get("transcript") or ""
+          print("KOME_KEYS=", sorted(data.keys()))
+          print("KOME_CHARS=", len(text))
+          print("KOME_SAMPLE=", text[:500].replace("\n"," "))
+          if len(text) < 500:
+              raise SystemExit("KOME_PROBE=FAIL")
+          print("KOME_PROBE=PASS")
+          PY

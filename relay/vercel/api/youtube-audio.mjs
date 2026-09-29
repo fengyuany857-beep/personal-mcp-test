@@ -151,12 +151,14 @@ async function fetchAudio(videoId, poToken) {
     enable_session_cache: false,
     generate_session_locally: true,
     retrieve_player: true,
-    po_token: poToken,
   });
 
+  // mweb currently needs a PO token for GVS/media requests, not for the
+  // Innertube player request. Supplying a video-bound GVS token to player
+  // can suppress streamingData, so fetch formats normally and attach POT
+  // only to the final googlevideo URL.
   const info = await yt.getBasicInfo(videoId, {
     client: "MWEB",
-    po_token: poToken,
   });
   const streaming = info.streaming_data;
   if (!streaming) throw new Error("MWEB returned no streaming data");

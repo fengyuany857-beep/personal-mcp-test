@@ -1,0 +1,33 @@
+name: Verify YouTube Audio Relay
+
+on:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - relay/vercel/api/youtube-audio.mjs
+      - relay/vercel/youtube-audio-test.mjs
+      - relay/vercel/package.json
+      - relay/vercel/vercel.json
+      - .github/workflows/test-youtube-audio-relay.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: relay/vercel
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Install relay dependencies
+        run: npm install --no-audit --no-fund
+      - name: Run live YouTube audio regression
+        run: npm run test:youtube

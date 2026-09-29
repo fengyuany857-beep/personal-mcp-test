@@ -64,3 +64,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## LuanRT/BgUtils
+
+Dependency: `bgutils-js@4.0.3`
+
+Used by the isolated Vercel relay to generate YouTube WebPO proof-of-origin tokens. Licensed under the MIT License.
+
+## LuanRT/YouTube.js (Vercel relay)
+
+Dependency: `youtubei.js@18.1.0`
+
+Used by the isolated Vercel relay to request public YouTube audio formats with a generated PO token. Licensed under the MIT License.

@@ -3,12 +3,19 @@
   "functions": {
     "api/exa-mcp.mjs": {
       "maxDuration": 60
+    },
+    "api/youtube-audio.mjs": {
+      "maxDuration": 60
     }
   },
   "routes": [
     {
       "src": "/api/exa-mcp",
       "dest": "/api/exa-mcp.mjs"
+    },
+    {
+      "src": "/api/youtube-audio",
+      "dest": "/api/youtube-audio.mjs"
     }
   ]
 }

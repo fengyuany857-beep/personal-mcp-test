@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
       - name: Verify production YouTube transcript
         env:
           MCP_ENDPOINT: https://lattice-mcp.3254849126a.workers.dev/mcp

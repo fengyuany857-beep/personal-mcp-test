@@ -1,0 +1,33 @@
+name: Verify Video Transcript Remote
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/academic-evidence-capability
+    paths:
+      - .github/workflows/test-video-transcript-remote.yml
+      - VIDEO_VERIFY_TRIGGER
+      - scripts/video-mcp-live-smoke.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  verify-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Verify production YouTube transcript
+        env:
+          MCP_ENDPOINT: https://lattice-mcp.3254849126a.workers.dev/mcp
+          VIDEO_URL: https://www.youtube.com/watch?v=teKcE8YhLhA
+        run: node scripts/video-mcp-live-smoke.mjs

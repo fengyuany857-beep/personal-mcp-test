@@ -451,6 +451,7 @@ function createServer(env: Env) {
 
   registerResearchTools(server, env);
   registerVideoTools(server, env);
+  registerTeachingTools(server);
 
   return server;
 }

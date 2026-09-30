@@ -76,3 +76,36 @@ Used by the isolated Vercel relay to generate YouTube WebPO proof-of-origin toke
 Dependency: `youtubei.js@18.1.0`
 
 Used by the isolated Vercel relay to request public YouTube audio formats with a generated PO token. Licensed under the MIT License.
+
+
+## csteinmetz1/pyloudnorm
+
+Selected implementation units: `pyloudnorm/meter.py` and `pyloudnorm/iirfilter.py`
+
+Pinned upstream revision:
+
+`b8d67bfd3ce5deef872f688fcfa491a0ca69fddd`
+
+The Lattice audio analyzer ports the K-weighting filter topology and gated integrated-loudness method for a bounded TypeScript implementation. No Python runtime or SciPy dependency is embedded in the Worker.
+
+MIT License
+
+Copyright (c) 2018 Christian Steinmetz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

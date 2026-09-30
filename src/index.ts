@@ -6,6 +6,7 @@ import { registerResearchTools } from "./research/tools.ts";
 import type { ResearchEnv } from "./research/types.ts";
 import { registerVideoTools, type VideoEnv } from "./video/tools.ts";
 import { registerTeachingTools } from "./teaching/tools.ts";
+import { registerAudioTools } from "./audio/tools.ts";
 
 const SERVER_NAME = "lattice-mcp" as const;
 const SERVER_VERSION = "1.7.0" as const;
@@ -453,6 +454,7 @@ function createServer(env: Env) {
   registerResearchTools(server, env);
   registerVideoTools(server, env);
   registerTeachingTools(server);
+  registerAudioTools(server);
 
   return server;
 }

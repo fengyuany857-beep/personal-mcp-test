@@ -4,10 +4,10 @@ import { z } from "zod";
 import { toSafeUpstreamFailure, withUpstreamClient } from "./upstream";
 import { registerResearchTools } from "./research/tools.ts";
 import type { ResearchEnv } from "./research/types.ts";
-import { registerVideoTools, type VideoEnv } from "./video/tools.ts";
+import { registerVideoTools, type VideoEnv } from "./video/tools.ts";\nimport { registerTeachingTools } from "./teaching/tools.ts";
 
 const SERVER_NAME = "lattice-mcp" as const;
-const SERVER_VERSION = "1.6.0" as const;
+const SERVER_VERSION = "1.7.0" as const;
 const EXA_TOOL = "web_search_exa" as const;
 const EXA_ENDPOINT = `https://mcp.exa.ai/mcp?tools=${EXA_TOOL}`;
 const FIRECRAWL_TOOL = "firecrawl_scrape" as const;

@@ -1,12 +1,12 @@
 {
   "name": "lattice-mcp",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "build": "wrangler deploy --dry-run --outdir=dist",
-    "test": "node --test --experimental-strip-types tests/research.test.ts tests/video.test.ts",
+    "test": "node --test --experimental-strip-types tests/research.test.ts tests/video.test.ts tests/teaching.test.ts",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
@@ -19,4 +19,4 @@
   "devDependencies": {
     "wrangler": "4.131.2"
   }
-}
+}\n

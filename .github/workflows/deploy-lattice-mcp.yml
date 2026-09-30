@@ -94,3 +94,11 @@ jobs:
         run: |
           set -euo pipefail
           MCP_ENDPOINT="${DEPLOYMENT_URL%/}/mcp" node scripts/video-mcp-live-smoke.mjs
+
+
+      - name: Remote teaching module smoke
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          set -euo pipefail
+          MCP_ENDPOINT="${DEPLOYMENT_URL%/}/mcp" node scripts/teaching-mcp-live-smoke.mjs

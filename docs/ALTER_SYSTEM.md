@@ -1,6 +1,6 @@
 # Alter System
 
-适用版本：`1.0.1-rc28`
+适用版本：`1.0.1-rc36`
 
 ## 定位
 
@@ -73,3 +73,4 @@ Alter 分析复用模型预设、Provider、OpenAI-compatible 协议、超时和
 - 侧模型调用不阻塞本轮可见回复；故障也不会影响已经保存的主剧本。
 - 自定义 NarrativeProvider 没有实现 `analyzeAlter` 时保留累计值并记录警告。
 - 旧残留字段 `lastTriggerAlter` 在读取时迁移为方向值。
+

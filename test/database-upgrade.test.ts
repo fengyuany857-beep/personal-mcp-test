@@ -33,7 +33,7 @@ test('existing installations extend raw script entries with persistent embedding
     } },
     { name: 'interlude_qzone_post', fields: {
       id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
-      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)', commentNum: 'unsigned',
       status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
     } },
     { name: 'interlude_endpoint', fields: {
@@ -42,11 +42,28 @@ test('existing installations extend raw script entries with persistent embedding
       userId: 'string(127)', channelId: 'string(127)', groupId: 'string(127)',
       conversationKind: 'string(16)', enabled: 'boolean', createdAt: 'timestamp', updatedAt: 'timestamp',
     } },
+    { name: 'interlude_endpoint_state', fields: {
+      endpointId: 'string(63)', state: 'json', updatedAt: 'timestamp',
+    } },
     { name: 'interlude_story_alias', fields: {
       aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
     } },
     { name: 'interlude_work', fields: {
       id: 'string(64)', storyId: 'string(255)', participantId: 'string(255)', generation: 'unsigned', state: 'json',
+    } },
+    { name: 'interlude_long_arc_guidance', fields: {
+      id: 'unsigned', storyId: 'string(255)', version: 'unsigned', status: 'string(16)',
+      title: 'string(255)', premise: 'text', direction: 'text',
+      payload: 'json', currentStage: 'string(80)', intensity: 'string(16)',
+      confidence: 'double', triggerEntryId: 'unsigned', evidenceEntryIds: 'json',
+      supersedesId: 'unsigned', createdAt: 'timestamp', updatedAt: 'timestamp',
+      completedAt: 'timestamp', expiresAt: 'timestamp',
+    } },
+    { name: 'interlude_long_arc_progress', fields: {
+      storyId: 'string(255)', lastCountedEntryId: 'unsigned', totalScore: 'double',
+      privateCount: 'unsigned', privateScore: 'double', groupCount: 'unsigned', groupScore: 'double',
+      unknownCount: 'unsigned', lastGenerationScore: 'double', lastGenerationEntryId: 'unsigned',
+      updatedAt: 'timestamp',
     } },
   ])
 })
@@ -73,7 +90,7 @@ test('knowledge evidence is an additive nullable field and reload does not rebui
     } },
     { name: 'interlude_qzone_post', fields: {
       id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
-      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+      targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)', commentNum: 'unsigned',
       status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
     } },
     { name: 'interlude_endpoint', fields: {
@@ -82,11 +99,28 @@ test('knowledge evidence is an additive nullable field and reload does not rebui
       userId: 'string(127)', channelId: 'string(127)', groupId: 'string(127)',
       conversationKind: 'string(16)', enabled: 'boolean', createdAt: 'timestamp', updatedAt: 'timestamp',
     } },
+    { name: 'interlude_endpoint_state', fields: {
+      endpointId: 'string(63)', state: 'json', updatedAt: 'timestamp',
+    } },
     { name: 'interlude_story_alias', fields: {
       aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
     } },
     { name: 'interlude_work', fields: {
       id: 'string(64)', storyId: 'string(255)', participantId: 'string(255)', generation: 'unsigned', state: 'json',
+    } },
+    { name: 'interlude_long_arc_guidance', fields: {
+      id: 'unsigned', storyId: 'string(255)', version: 'unsigned', status: 'string(16)',
+      title: 'string(255)', premise: 'text', direction: 'text',
+      payload: 'json', currentStage: 'string(80)', intensity: 'string(16)',
+      confidence: 'double', triggerEntryId: 'unsigned', evidenceEntryIds: 'json',
+      supersedesId: 'unsigned', createdAt: 'timestamp', updatedAt: 'timestamp',
+      completedAt: 'timestamp', expiresAt: 'timestamp',
+    } },
+    { name: 'interlude_long_arc_progress', fields: {
+      storyId: 'string(255)', lastCountedEntryId: 'unsigned', totalScore: 'double',
+      privateCount: 'unsigned', privateScore: 'double', groupCount: 'unsigned', groupScore: 'double',
+      unknownCount: 'unsigned', lastGenerationScore: 'double', lastGenerationEntryId: 'unsigned',
+      updatedAt: 'timestamp',
     } },
   ])
 })

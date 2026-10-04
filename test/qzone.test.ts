@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   callQzoneAction, evaluateQzoneGate, freshQzoneFeeds, matchQzoneFeedContent, normalizeQzoneFeedEntry, normalizeQzoneMsgEntry,
   probeQzoneAvailable, qzoneFeedCandidates, qzoneIntentFromPayload, qzoneVisibilityLabel, QzoneActionError, resolveQzoneConfig,
+  qzoneReactionDeltas,
   type QzoneFeedEntry, type QzonePostRecord,
 } from '../src/qzone'
 
@@ -250,4 +251,38 @@ test('executeQzoneIntent rejects comment/like tids that were never observed', as
   await (InterludeService.prototype as unknown as { executeQzoneIntent: Function }).executeQzoneIntent.call(svc, story, { id: 9, payload: { action: 'like', tid: 'deadbeefcafe' } }, new Date())
   assert.equal(executed, 0, '未入账的 tid 不得触达执行器')
   assert.deepEqual(intentUpdates, [{ id: 9, status: 'completed' }], '意图仍要完成，防止账本排水被卡')
+})
+
+test('被评论感知：首次立基线不报，增量>0 报，回落下修，不在列表不动', () => {
+  const entries = [
+    { tid: 'a', content: '今天的晚霞', time: new Date(0), commentNum: 3, isPrivate: false, images: [] },
+    { tid: 'b', content: '考试结束啦', time: new Date(0), commentNum: 1, isPrivate: false, images: [] },
+  ]
+  // 首次观测：只立基线，零感知（新帖自带评论是常态）
+  const first = qzoneReactionDeltas([{ storyId: 's', kind: 'post', tid: 'a', status: 'confirmed', createdAt: new Date() }], entries)
+  assert.equal(first.deltas.length, 0)
+  assert.deepEqual(first.baselines, [{ tid: 'a', commentNum: 3 }])
+  // 增量：a 3→5 报 2 条；b 首次立基线不报
+  const second = qzoneReactionDeltas([
+    { storyId: 's', kind: 'post', tid: 'a', status: 'confirmed', commentNum: 3, createdAt: new Date() },
+    { storyId: 's', kind: 'post', tid: 'b', status: 'confirmed', createdAt: new Date() },
+  ], [
+    { ...entries[0], commentNum: 5 }, entries[1],
+  ])
+  assert.equal(second.deltas.length, 1)
+  assert.equal(second.deltas[0].previous, 3)
+  assert.equal(second.deltas[0].current, 5)
+  assert.equal(second.deltas[0].contentExcerpt, '今天的晚霞')
+  assert.deepEqual(second.baselines.map(b => b.tid), ['a', 'b'])
+  // 回落（删评）：5→4 静默下修基线，不产出
+  const third = qzoneReactionDeltas([{ storyId: 's', kind: 'post', tid: 'a', status: 'confirmed', commentNum: 5, createdAt: new Date() }], [{ ...entries[0], commentNum: 4 }])
+  assert.equal(third.deltas.length, 0)
+  assert.deepEqual(third.baselines, [{ tid: 'a', commentNum: 4 }])
+  // 帖子不在拉取列表：基线保持、不产出、不写 baselines
+  const absent = qzoneReactionDeltas([{ storyId: 's', kind: 'post', tid: 'zzz', status: 'confirmed', commentNum: 2, createdAt: new Date() }], entries)
+  assert.equal(absent.deltas.length, 0)
+  assert.equal(absent.baselines.length, 0)
+  // 空 tid / 未确认帖不参与
+  const empty = qzoneReactionDeltas([{ storyId: 's', kind: 'post', tid: ' ', status: 'confirmed', createdAt: new Date() }], entries)
+  assert.equal(empty.baselines.length, 0)
 })

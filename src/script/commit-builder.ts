@@ -69,6 +69,7 @@ export function decisionToScriptCommit(input: ScriptFirstDecisionInput): ScriptC
     if (!action.content || (action.mode !== 'immediate' && action.mode !== 'delayed')) continue
     addMessageEvent(add, {
       participantId: action.participantId,
+      endpointId: action.endpointId,
       content: action.content,
       mode: action.mode,
       occurredAt: action.mode === 'delayed' && action.sendAt ? action.sendAt : input.now.toISOString(),
@@ -159,6 +160,7 @@ function addMessageEvent(
   add: (event: Omit<ScriptEventDraft, 'eventId' | 'commitId'>) => ScriptEventDraft,
   input: {
     participantId: string
+    endpointId?: string
     content: string
     mode: ScriptDeliveryMode
     occurredAt: string
@@ -173,6 +175,7 @@ function addMessageEvent(
   add({
     kind: 'outgoing-message', actor: 'protagonist', occurredAt: input.occurredAt,
     causedByEventIds: input.causedByEventIds, participantId: input.participantId,
+    ...(input.endpointId ? { endpointId: input.endpointId } : {}),
     content: canonicalBubbleContent(input.content, bubbles, input.separator, input.split),
     bubbles,
     deliveryMode: input.mode,

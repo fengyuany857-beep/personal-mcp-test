@@ -204,13 +204,72 @@ export function channelContextMetadata(endpoint: EndpointDescriptor, extra: { us
   }
 }
 
-// ── EndpointState（v3 §四）：三维时效，过期即保守，重启归零 ───────────────────
+// ── EndpointState（v3 §四）：三维时效，过期即保守 ─────────────────────────────
 
 export interface EndpointState {
   endpointId: string
   connection: { online: boolean, observedAt: number }
   deliverable: { allowed: boolean, checkedAt: number, cooldownUntil?: number, note?: string }
   initiate?: { allowed: boolean, observedAt: number, expiresAt?: number, reason?: string }
+}
+
+/** interlude_endpoint_state 持久快照。动态状态写入独立表，避免污染身份注册表。 */
+export interface EndpointStateRecord {
+  endpointId: string
+  state: EndpointState
+  updatedAt: Date
+}
+
+function finiteTimestamp(value: unknown, fallback: number) {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+/** 防御性读取持久快照；坏快照不会阻塞端点注册表启动。 */
+export function normalizeEndpointState(raw: unknown, endpointId?: string): EndpointState | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const row = raw as Record<string, unknown>
+  const source = row.state && typeof row.state === 'object' ? row.state as Record<string, unknown> : row
+  const id = String(endpointId ?? source.endpointId ?? row.endpointId ?? '').trim()
+  if (!id) return undefined
+  const connection = source.connection && typeof source.connection === 'object' ? source.connection as Record<string, unknown> : {}
+  const deliverable = source.deliverable && typeof source.deliverable === 'object' ? source.deliverable as Record<string, unknown> : {}
+  const initiate = source.initiate && typeof source.initiate === 'object' ? source.initiate as Record<string, unknown> : undefined
+  const now = Date.now()
+  const state: EndpointState = {
+    endpointId: id,
+    connection: {
+      online: connection.online === true,
+      observedAt: finiteTimestamp(connection.observedAt, now),
+    },
+    deliverable: {
+      allowed: deliverable.allowed === true,
+      checkedAt: finiteTimestamp(deliverable.checkedAt, now),
+      ...(Number.isFinite(Number(deliverable.cooldownUntil)) ? { cooldownUntil: Number(deliverable.cooldownUntil) } : {}),
+      ...(typeof deliverable.note === 'string' && deliverable.note ? { note: deliverable.note.slice(0, 500) } : {}),
+    },
+    ...(initiate ? {
+      initiate: {
+        allowed: initiate.allowed === true,
+        observedAt: finiteTimestamp(initiate.observedAt, now),
+        ...(Number.isFinite(Number(initiate.expiresAt)) ? { expiresAt: Number(initiate.expiresAt) } : {}),
+        ...(typeof initiate.reason === 'string' && initiate.reason ? { reason: initiate.reason.slice(0, 500) } : {}),
+      },
+    } : {}),
+  }
+  return state
+}
+
+/** Restart recovery keeps diagnostic observations but never restores live connection truth. */
+export function restoreEndpointState(endpointId: string, snapshot: EndpointState | undefined, now = Date.now()): EndpointState {
+  const state = snapshot ? normalizeEndpointState(snapshot, endpointId) : undefined
+  if (!state) return freshEndpointState(endpointId, now)
+  return {
+    ...state,
+    endpointId,
+    connection: { online: false, observedAt: now },
+    deliverable: { ...state.deliverable, note: state.deliverable.note ?? 'restart-awaiting-connection' },
+  }
 }
 
 /** 进程重启后的保守初值：一切未知按不可用处理，待连接器/首次投递/入站恢复。 */
@@ -247,8 +306,8 @@ export function stateAfterOutbound(state: EndpointState, ok: boolean, note: stri
 
 /** deliverable 确认的保质期（P2-8）：超过 TTL 的 allowed 按未知保守处理，
  *  直到下一次出站/入站观测刷新——陈旧的"可投递"不是事实。
- *  注：isEndpointDeliverable 的投递门控属 M3 范围——M1/M2 不在出站路径消费
- *  （重启保守初值会误伤正常投递）；当前仅用于健康面板/管理命令展示。 */
+ *  M3 出站路径会消费该函数；重启快照即使保存了上次成功，也必须先经过
+ *  当前连接器的在线事实确认。 */
 export const ENDPOINT_DELIVERABLE_TTL_MS = 24 * 3_600_000
 
 /** 冷却期内视为不可投递（保守）；冷却结束允许重试探测；allowed 超过 TTL 视为过期。 */
@@ -258,8 +317,14 @@ export function isEndpointDeliverable(state: EndpointState | undefined, now = Da
   if (state.deliverable.allowed) {
     return now - state.deliverable.checkedAt <= ENDPOINT_DELIVERABLE_TTL_MS
   }
-  if (state.deliverable.cooldownUntil && now >= state.deliverable.cooldownUntil) return state.connection.online
-  return false
+  if (state.deliverable.cooldownUntil) return now >= state.deliverable.cooldownUntil
+  // A connector lifecycle event is enough to make a freshly started endpoint
+  // eligible for its first probe.  Without this exception the M3 gate would
+  // deadlock: the first outbound could never refresh deliverable because the
+  // gate required a previous outbound observation.  Explicit failures still
+  // remain blocked unless their cooldown has elapsed.
+  return state.deliverable.note === 'fresh-start'
+    || state.deliverable.note === 'restart-awaiting-connection'
 }
 
 /** token 过期按不允许保守处理；重新获得有效信号（入站/探测）即恢复。 */

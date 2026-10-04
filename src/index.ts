@@ -206,6 +206,7 @@ const RestWindowSchema: Schema<RestWindow> = Schema.object({
 const Runtime: Schema<RuntimeConfig> = Schema.object({
   splitReplyMessages: Schema.boolean().default(true).description('是否将主叙事回复中的 <sep/> 拆成多条 QQ 消息。'),
   messageSeparator: Schema.string().default('<sep/>').description('分段消息标记。通常保持 <sep/>；模型会在需要多条气泡时输出它。'),
+  convertNewlineToSeparator: Schema.boolean().default(false).description('小模型适配：模型没有输出分句标记而是用换行分条时，把每个换行自动视作一条消息的分隔再发送。默认关闭；Gemma 等不遵守 <sep/> 合约的小模型建议开启。'),
   typingBaseDelaySeconds: Schema.number().min(0).max(60).default(1).description('发送第二条及后续分段消息前的基础打字等待秒数。'),
   typingCharactersPerSecond: Schema.number().min(1).max(100).default(8).description('模拟打字速度，每秒字符数；数值越小，长消息等待越久。'),
   typingMaxDelaySeconds: Schema.number().min(0).max(120).default(12).description('单条后续分段消息的最长打字等待秒数。'),
@@ -227,8 +228,8 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(35).description('近期原始记录的最低保留条目数。'),
-  contextTimeWindowMinutes: Schema.natural().min(0).max(1_440).default(45).description('额外保留最近多少分钟的记录；0 关闭。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(35).description('写入主叙事上下文的近期原始剧本条目数。小模型可调小（如 15）；注意与下方时间窗叠加——时间窗内条目会全部并入，需要更小上下文时请同时调小或关闭时间窗。'),
+  contextTimeWindowMinutes: Schema.natural().min(0).max(1_440).default(45).description('额外并入最近多少分钟内的全部条目（上限 500）；0 关闭，仅按条数保留。小模型建议与条数一起调小。'),
   memoryLimit: Schema.natural().min(1).max(200).default(20).description('主叙事读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
@@ -440,6 +441,7 @@ const GroupChatRuleSchema: Schema<GroupChatRule> = (Schema.object({
   contextLimit: Schema.natural().min(4).max(100).default(20).description('进入主叙事时附带的最近群消息条数。'),
   debounceSeconds: Schema.number().min(0).max(10).default(1).description('合并短时间连续群消息后再开始主叙事的等待秒数。'),
   cooldownSeconds: Schema.natural().min(0).max(86_400).default(60).description('主角群发言后的冷却时间，避免连续刷屏。'),
+  historicalImageLimit: Schema.natural().min(0).max(6).default(3).description('一次群聊主叙事最多附带的最近历史图片张数；图片消息本身不会因此自动触发模型。'),
   willingnessPreset: Schema.union([
     Schema.const('off').description('关闭（默认）：仅响应模式与冷却生效；旧数值门已启用时自动按 custom 兼容'),
     WillingnessTierChoice,
@@ -480,6 +482,7 @@ const Stickers: Schema<StickerLibraryConfig> = Schema.object({
   catalogLimit: Schema.natural().min(1).max(80).default(40).description('单次主模型最多读取多少条表情包描述。'),
   descriptionMaxTokens: Schema.natural().min(256).max(4_096).default(768).description('单张表情包描述的最大输出 token。'),
   descriptionResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('表情包描述输出格式。'),
+  deliveryBaseUrl: Schema.string().default('').description('表情包投递基址；留空自动推导（selfUrl → http://127.0.0.1:5140）。Koishi 与 OneBot 实现（NapCat/Lagrange）分容器或不共享文件系统时，file:// 路径对方读不到（retcode 1200/100），需要让 OneBot 实现经此 HTTP 地址回源下载。'),
 }).collapse(true)
 
 const SharedStory: Schema<SharedStoryConfig> = Schema.object({
@@ -539,6 +542,14 @@ export const Config: Schema<InterludeConfig> = Schema.object({
     maxTokens: Schema.natural().min(256).max(8_192).default(1_000).description('单次输出预算（tokens）。'),
     timeout: Schema.natural().min(5_000).max(300_000).default(60_000).description('请求超时（毫秒）。'),
   }).collapse(true).description('【扩展 15】世界播种器：外部事件的生成与注入（未选模型即关闭）。'),
+  longHorizon: Schema.object({
+    enabled: Schema.boolean().default(false).description('实验：长线叙事催化器（Narrative Attractor）——累计加权叙事证据后异步生成可控的长期发展方向，并允许主叙事在自然场景中尝试一次最小、可撤回的首次表达。'),
+    triggerScore: Schema.natural().min(10).max(500).default(25).description('首次生成的加权分数门槛（默认25；私聊1.0/群聊0.5）。'),
+    reviewIncrement: Schema.natural().min(10).max(500).default(40).description('上次催化器生成后再积累多少分触发一次新的长期发展机会审查。'),
+    privateWeight: Schema.number().min(0.1).max(2.0).step(0.1).default(1.0).description('兼容旧配置；实际固定为 1.0（私聊完全计入）。'),
+    groupWeight: Schema.number().min(0).max(1.0).step(0.1).default(0.5).description('兼容旧配置；实际固定为 0.5（群聊减半计入）。'),
+    intensity: Schema.union(['subtle', 'moderate', 'strong']).default('subtle').description('指导强度（第一版默认 subtle）。'),
+  }).collapse(true).description('【扩展 16】长线叙事催化器（实验）：生成潜在张力与首次微表达许可（默认关闭）。'),
   qzone: Schema.object({
     enabled: Schema.boolean().default(false).description('启用 QQ 空间（说说）通道：需要 SnowLuma 连接在线（qzone 系列扩展动作）。启用后可经 interlude.qzone 命令以她本人身份发说说；叙事决策流（何时发/发什么/对好友动态的反应）随后续版本接入。高频会被 Qzone 风控，请保持保守上限。'),
     dailyPostCap: Schema.natural().min(0).max(20).default(3).description('每日发帖上限（0=禁止发帖）。'),
@@ -546,7 +557,7 @@ export const Config: Schema<InterludeConfig> = Schema.object({
     dailyLikeCap: Schema.natural().min(0).max(120).default(12).description('每日点赞上限（0=禁止点赞）。'),
     minIntervalMinutes: Schema.natural().min(10).max(1_440).default(90).description('任意两次空间动作的最小间隔（分钟），跨类型共享。'),
     feedWindowMinutes: Schema.natural().min(15).max(720).default(120).description('好友动态轮询只消费该时间窗内的新鲜说说（分钟）；轮询节律为窗口的一半（15~60 分钟），单轮最多入账 2 条。'),
-  }).collapse(true).description('【扩展 16】QQ 空间：说说/评论/点赞通道（需 SnowLuma；默认关闭）。'),
+  }).collapse(true).description('【扩展 17】QQ 空间：说说/评论/点赞通道（需 SnowLuma；默认关闭）。'),
   blindMode: BlindMode.description('【维护 15】盲区模式：低频心跳的最小运行形态。'),
   logging: Logging.description('【维护 16】日志：级别、信息密度、布局和隐私预览。'),
   mainPrompt: Schema.string().role('textarea').default('').description('⚠️ 除非有把握，否则不要修改。系统主提示词（主叙事行为指令）：与固定合约、文风和特化块协作，塑造全部回合的写作行为；留空使用内置默认，改动下回合立即生效，出问题清空即可恢复默认。'),
@@ -594,7 +605,8 @@ function registerCommands(ctx: Context, service: InterludeService, config: Inter
   ctx.command('interlude', 'HDS Interlude：管理与查看命令')
 
   const startStoryFromConsole = async (session: Session, legacyName?: string) => {
-    if (!requireManager(service, session)) return '无权限：手动启动共享主剧本需要 HDSI 管理员权限。'
+    const denial = service.manageSessionDenial(session)
+    if (denial) return `无权限：手动启动共享主剧本需要 HDSI 管理员权限。${denial.detail}`
     const readiness = await service.storyStartReadiness(session)
     if (readiness.existing) {
       return readiness.existing.status === 'paused'

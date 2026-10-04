@@ -10,7 +10,7 @@ const now = new Date('2026-09-09T12:00:00Z')
 test('Console sections follow the documented setup order', () => {
   assert.deepEqual(Object.keys(Config.dict), [
     'storyDefaults', 'model', 'onebot', 'sharedStory', 'runtime', 'urge', 'schedulePreplan', 'timelineDirector', 'agency',
-    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'worldSeeder', 'qzone', 'blindMode', 'logging', 'mainPrompt', 'chatRhythm',
+    'chatActions', 'stickers', 'memory', 'alterSystem', 'browser', 'worldSeeder', 'longHorizon', 'qzone', 'blindMode', 'logging', 'mainPrompt', 'chatRhythm',
   ])
   // 分类前缀让配置页按 必填→结构→节奏→表达→内在→扩展→维护 分组可读。
   const headers = Object.values(Config.dict).map((item: any) => String(item.meta?.description ?? ''))
@@ -22,8 +22,9 @@ test('Console sections follow the documented setup order', () => {
   assert.match(headers[13], /^【扩展 14】/)
   assert.match(headers[14], /^【扩展 15】/)
   assert.match(headers[15], /^【扩展 16】/)
-  assert.match(headers[16], /^【维护 15】/)
-  assert.match(headers[17], /^【维护 16】/)
+  assert.match(headers[16], /^【扩展 17】/)
+  assert.match(headers[17], /^【维护 15】/)
+  assert.match(headers[18], /^【维护 16】/)
 })
 
 test('chat actions are opt-in and platform-scoped', () => {
@@ -61,7 +62,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '1.0.1-rc28')
+  assert.equal(version, '1.0.1-rc36')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {
@@ -253,3 +254,4 @@ test('delayed replies outside the allowed window still collapse to none regardle
   assert.deepEqual(normalizeInteraction({ seen: true, reply: { mode: 'delayed', content: '太早', sendAt: tooSoon } }, now, runtime as any),
     { seen: true, reply: { mode: 'none' } })
 })
+

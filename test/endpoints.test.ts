@@ -7,7 +7,7 @@ import { InterludeService } from '../src/service'
 import {
   channelContextMetadata, deriveGroupEndpoint, deriveParticipantUserEndpoint, deriveStoryRoleEndpoint,
   endpointUniqueKey, freshEndpointState, isEndpointDeliverable, isEndpointInitiateAllowed,
-  normalizeEndpointRow, resolveInboundEndpoint, stateAfterConnection, stateAfterInbound, stateAfterOutbound,
+  normalizeEndpointRow, restoreEndpointState, resolveInboundEndpoint, stateAfterConnection, stateAfterInbound, stateAfterOutbound,
   type EndpointRow,
 } from '../src/endpoints'
 
@@ -90,6 +90,21 @@ test('channelContextMetadata carries the full disambiguated structure', () => {
   assert.equal('userId' in meta, false, '空 userId 不落键')
 })
 
+test('restoreEndpointState never restores online truth across a restart', () => {
+  const now = 2_000_000
+  const restored = restoreEndpointState('ep-restart', {
+    endpointId: 'ep-restart',
+    connection: { online: true, observedAt: now - 10_000 },
+    deliverable: { allowed: true, checkedAt: now - 10_000, note: 'last-ok' },
+    initiate: { allowed: true, observedAt: now - 10_000, expiresAt: now + 10_000 },
+  }, now)
+  assert.equal(restored.connection.online, false)
+  assert.equal(restored.connection.observedAt, now)
+  assert.equal(restored.deliverable.allowed, true, 'diagnostic delivery snapshot remains available')
+  assert.equal(restored.deliverable.note, 'last-ok')
+  assert.equal(restored.initiate?.allowed, true)
+})
+
 test('EndpointState is conservative: fresh/unknown, refreshed by inbound, cooled by failures, expired initiate', () => {
   const t0 = 1_000_000
   // 重启初值：一切按不可用
@@ -125,6 +140,8 @@ test('M1a migration derives endpoints that resolve identically to legacy fields'
     endpointRegistryReady: false,
     endpointRows: [] as EndpointRow[],
     endpointStates: new Map(),
+    setEndpointState: function (id: string, state: unknown) { (this.endpointStates as Map<string, unknown>).set(id, state) },
+    persistEndpointState: () => {},
     config: { onebot: { groupChats: [{ groupId: '777', enabled: true }] } },
     dbGet: async (table: string, query: Record<string, unknown>) => (tables[table] ?? []).filter(r => Object.entries(query).every(([k, v]) =>
       v && typeof v === 'object' && Array.isArray((v as any).$in)

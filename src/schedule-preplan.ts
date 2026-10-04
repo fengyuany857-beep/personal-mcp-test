@@ -74,6 +74,39 @@ export function schedulePreplanReviewDue(record: SchedulePreplanRecord | undefin
   return record.lastReviewedLocalDate !== today && localClockMinutes(now, timezone) >= config.reviewAfterLocalHour * 60
 }
 
+/** 当天例外的确定性触发词：取消/改期/新确认安排在已提交剧本中的语言痕迹。
+ * 只作"是否值得跟进审查"的廉价预筛——是否真登记例外仍由审查模型依据
+ * 证据判定（愿望与未实现计划在教学行里被明确排除，见 schedulePreplanPrompt）。 */
+const DATE_CHANGE_TRIGGER = /取消|改期|改成|推迟|提前到|延到|改约|另约|延期|定在|敲定|约好|约了|确认了?(时间|地点|日子)?/
+
+/** 未读证据里出现改约/取消/新确认信号 → 返回命中条目 id（去重，至多 20）。
+ * 输入与 schedulePreplanEvidence 同源（kind=script 的剧本条目）；世界事件/
+ * 好友动态/空间条目是外部观测，不进入该管道，天然不构成她的日程改变。 */
+export function schedulePreplanEvidenceMentionsDateChange(entries: ReadonlyArray<Pick<ScriptEntry, 'id' | 'content'>>): number[] {
+  const matched: number[] = []
+  for (const entry of entries) {
+    if (Number.isSafeInteger(entry.id) && entry.id > 0 && DATE_CHANGE_TRIGGER.test(String(entry.content ?? ''))) matched.push(entry.id)
+  }
+  return [...new Set(matched)].slice(0, 20)
+}
+
+export const SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS = 2 * 60 * 60_000
+
+/** 当天跟进审查是否到期：日审查已完成后（reviewDue=false 的场景），
+ * 未读证据出现改约信号且冷却已过 → 允许一次带外审查。此前单次改约要等
+ * 到次日审查才入例外，而那个改约属于"今天"（backlog：当天例外的及时收束）。 */
+export function schedulePreplanFollowUpDue(
+  record: SchedulePreplanRecord | undefined,
+  unseenEvidence: ReadonlyArray<Pick<ScriptEntry, 'id' | 'content'>>,
+  now: Date,
+  config: SchedulePreplanConfig,
+) {
+  if (!config.enabled || !record) return false
+  if (schedulePreplanReviewDue(record, now, record.timezone, config)) return false
+  if (now.getTime() - record.updatedAt.getTime() < SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS) return false
+  return schedulePreplanEvidenceMentionsDateChange(unseenEvidence).length > 0
+}
+
 export function schedulePreplanNeedsModel(
   record: SchedulePreplanRecord | undefined,
   evidence: ScriptEntry[],

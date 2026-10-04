@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-hds-interlude",
-  "version": "1.0.1-rc28",
+  "version": "1.0.1-rc36",
   "description": "A time-aware, persistent narrative chat framework for Koishi.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -19,6 +19,7 @@
     "command.md",
     "docs/README.md",
     "docs/FORWARD_MESSAGE_READING_DESIGN.md",
+    "docs/GROUP_HISTORICAL_IMAGE_CONTEXT_DESIGN.md",
     "docs/ARCHITECTURE.md",
     "docs/SCRIPT_CENTRIC_ARCHITECTURE_REDESIGN.md",
     "docs/V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md",
@@ -33,6 +34,9 @@
     "docs/QZONE_FEED_DESIGN.md",
     "docs/MULTI_CHANNEL_SINGLE_STORY_DESIGN.md",
     "docs/MULTI_CHANNEL_IMPLEMENTATION_ROADMAP.md",
+    "docs/INDIRECT_SUBJECT_DESIGN.md",
+    "docs/LONG_HORIZON_NARRATIVE_GUIDANCE_DESIGN.md",
+    "docs/OFFLINE_ATTENTION_EXPERIMENT.md",
     "docs/development"
   ],
   "keywords": [

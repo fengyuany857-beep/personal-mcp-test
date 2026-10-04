@@ -1,12 +1,21 @@
 import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { registerTables } from './database'
 import { appendProactiveContact, countProactiveContactsInWindow } from './story-state'
+import {
+  calculateLongHorizonScore,
+  isEligibleNarrativeEntry,
+  LongArcGuidanceRecord,
+  LongArcProgressRow,
+  normalizeLongArcDecision,
+  resolveLongHorizonConfig,
+  shouldTriggerLongHorizon,
+} from './long-arc'
 import { createWorldSeeder, parseWorldSeedEvents, resolveWorldSeederRuntime, seedDomainForRun, validateSeedEvent, type SeedValidationInput, type WorldSeedDomain, type WorldSeeder } from './world-seeder'
-import { callQzoneAction, evaluateQzoneGate, matchQzoneFeedContent, normalizeQzoneFeedEntry, normalizeQzoneMsgEntry, probeQzoneAvailable, qzoneFeedCandidates, qzoneIntentFromPayload, qzoneRecordsForEndpoint, qzoneVisibilityLabel, resolveQzoneConfig, QzoneActionError, type QzoneActionCaller, type QzoneActionKind, type QzoneConfig, type QzoneFeedEntry, type QzonePostRecord } from './qzone'
+import { callQzoneAction, evaluateQzoneGate, matchQzoneFeedContent, normalizeQzoneFeedEntry, normalizeQzoneMsgEntry, probeQzoneAvailable, qzoneFeedCandidates, qzoneIntentFromPayload, qzoneReactionDeltas, qzoneRecordsForEndpoint, qzoneVisibilityLabel, resolveQzoneConfig, QzoneActionError, type QzoneActionCaller, type QzoneActionKind, type QzoneConfig, type QzoneFeedEntry, type QzoneMsgEntry, type QzonePostRecord } from './qzone'
 import {
   channelContextMetadata, deriveGroupEndpoint, deriveParticipantUserEndpoint, deriveStoryRoleEndpoint,
-  endpointAccountKey, endpointUniqueKey, freshEndpointState, normalizeEndpointRow, normalizeStoryAliasRow, resolveInboundEndpoint, resolveStoryAlias,
-  stateAfterConnection, stateAfterInbound, stateAfterOutbound,
+  endpointAccountKey, endpointUniqueKey, freshEndpointState, normalizeEndpointRow, normalizeEndpointState, restoreEndpointState, normalizeStoryAliasRow, resolveInboundEndpoint, resolveStoryAlias,
+  stateAfterConnection, stateAfterInbound, stateAfterOutbound, isEndpointDeliverable, isEndpointInitiateAllowed,
   type EndpointRow, type EndpointState, type StoryAliasRecord,
 } from './endpoints'
 import type { SeededWorldEvent } from './types'
@@ -18,7 +27,7 @@ import { createTurnEngine, shouldSupersedeRequest, type TurnEngine, type TurnBuf
 import { createScheduler, type Scheduler } from './scheduler'
 import { UrgeConfig, resolveUrgeConfig, normalizeUrgeState, urgeUserEvent, planUrge, commitUrge, acknowledgeUrge, urgeBurstActive } from './urge'
 import { extname, relative, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { createReadStream } from 'node:fs'
 import { AudioConfig, compactPromptEntries, createCompactor, createEmbedder, createNarrator, createStickerDescriber, createVisionDescriber, detectMessageRepetition, formatTokenUsageLine, ModelConfig, promptVisibleMessageContent, recentScriptOwnership, StickerDescriber, StickerDescription, TokenUsageRecord, VisionDescriber } from './narrator'
 import { formatModelRouting, ModelRoutingTable, resolveModelRouting } from './model-routing'
 import {
@@ -46,6 +55,7 @@ import { normalizeQQNativeFaceSegments } from './qq-face'
 import { extractForwardIds, readForwardContent, ForwardReadResult } from './forward-message'
 import {
   applySchedulePreplanProposal, nextSchedulePreplanTransition, normalizeSchedulePreplanRecord,
+  SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS, schedulePreplanEvidenceMentionsDateChange,
   refreshSchedulePreplan, resolveSchedulePreplanConfig, SchedulePreplanConfig, schedulePreplanNeedsModel,
   schedulePreplanReviewDue, schedulePreplanWindow,
 } from './schedule-preplan'
@@ -64,7 +74,7 @@ import { advanceSceneFrame, projectSceneFrame, resolveDialogueBurst } from './sc
 import {
   CompactionDecision, CompactionRequest, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
   InterludeParticipant, InterludeStory, MemoryDraft, NarrativeDecision, NarrativeFact, NarrativeIntent,
-  GroupContext, GroupMessageContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
+  GroupContext, GroupMessageContext, NarrativeHistoricalImage, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
   NarrativeEmbedder, OutgoingMessageDraft, ParticipantState, ScriptEntry, ScriptEntryDraft, StatePatchDraft, StatePatchProposal, StorySetting, StoryState,
   BrowserIntentDraft, NarrativeAudio, NarrativeImage, OverlaySnapshot, WebObservation, emptyParticipantState,
   AlterSystemState, AlterSystemConfig, EmotionalOffsetPrompt, ChatRhythmConfig,
@@ -85,6 +95,24 @@ export interface DesktopTimelineRangeRequest {
   cursor?: string
   detailLevel?: 'summary' | 'full'
   limit?: number
+}
+
+/** Read-only endpoint health projection consumed by typ-0.  The desktop must
+ * not read interlude_endpoint or interlude_endpoint_state directly. */
+export interface DesktopEndpointHealth {
+  endpointId: string
+  ownerKind: EndpointRow['ownerKind']
+  ownerId: string
+  platform: string
+  channelKind: EndpointRow['channelKind']
+  enabled: boolean
+  online: boolean
+  observedAt: string
+  deliverable: boolean
+  initiateAllowed: boolean
+  cooldownUntil?: string
+  lastError?: string
+  note?: string
 }
 
 const DESKTOP_TIMELINE_TRACKS: DesktopTimelineTrack[] = ['script', 'messages', 'system', 'scenes', 'facts', 'preplan', 'alter', 'compaction']
@@ -313,6 +341,7 @@ export interface Config {
   /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
   chatActions?: ChatActionsConfig
   stickers?: StickerLibraryConfig
+  longHorizon?: unknown
   alterSystem?: AlterSystemConfig
   chatRhythm?: ChatRhythmConfig
   /** Timeline director for automatic windows; off = automatic turns run without a ledger. */
@@ -372,7 +401,8 @@ export interface StickerLibraryConfig {
   catalogLimit: number
   descriptionMaxTokens?: number
   /** API JSON mode is optional; prompt-only still asks for the compact JSON contract. */
-  descriptionResponseFormat?: 'json-object' | 'prompt-only'
+  descriptionResponseFormat?: 'json-object' | 'prompt-only'  /** 表情包投递基址（空=自动：selfUrl → http://127.0.0.1:5140）。OneBot 实现与 Koishi 不共享文件系统时须经 HTTP 回源。 */
+  deliveryBaseUrl?: string
 }
 
 export interface GroupChatRule {
@@ -385,6 +415,8 @@ export interface GroupChatRule {
   contextLimit: number
   debounceSeconds: number
   cooldownSeconds: number
+  /** Number of recent historical group images attached to a later narrative turn. */
+  historicalImageLimit?: number
   /** 档位化的群聊意愿门：off/quiet/reserved/normal/active/eager/auto/custom。 */
   willingnessPreset?: string
   /** auto 档三态（busy/asleep/idle）各自使用的档位。 */
@@ -468,6 +500,8 @@ export interface RuntimeConfig {
   /** Split model reply.content into multiple QQ messages at the configured separator. */
   splitReplyMessages?: boolean
   messageSeparator?: string
+  /** 小模型适配：可见回复未用分句标记而用换行时，把换行视作气泡边界。 */
+  convertNewlineToSeparator?: boolean
   typingBaseDelaySeconds?: number
   typingCharactersPerSecond?: number
   typingMaxDelaySeconds?: number
@@ -564,13 +598,29 @@ interface AutoAdvanceConfig {
   restWindows: RestWindow[]
 }
 
+interface StoredGroupImageRef {
+  source: string
+  ordinal: number
+  sourceType: 'url' | 'file'
+  sourceEntryId: number
+  senderId: string
+  senderName: string
+  occurredAt: Date
+  messageId?: string
+}
+
+interface GroupMessagesSnapshot {
+  messages: GroupMessageContext[]
+  imageRefs: StoredGroupImageRef[]
+}
+
 interface BufferedGroupTurn {
   storyId: string
   groupId: string
   rule: GroupChatRule
   channelId: string
   latestSession?: Session
-  messages: (GroupMessageContext & { audioSources?: string[], audioSession?: Session, endpointId?: string })[]
+  messages: (GroupMessageContext & { imageSources?: string[], imageSession?: Session, audioSources?: string[], audioSession?: Session, endpointId?: string })[]
   timer?: () => void
   revision: number
   mentionedBot: boolean
@@ -685,6 +735,7 @@ export class InterludeService extends Service {
   /** 端点注册表内存缓存（M1a）：行来自 interlude_endpoint；状态为进程内三维时效。 */
   private endpointRows: EndpointRow[] = []
   private endpointStates = new Map<string, EndpointState>()
+  private endpointStateWriteQueue: Promise<unknown> = Promise.resolve()
   private endpointRegistryReady = false
   /** M1b 剧本别名缓存（interlude_story_alias），随注册表一同加载。 */
   private storyAliasRows: StoryAliasRecord[] = []
@@ -755,7 +806,17 @@ export class InterludeService extends Service {
   private desktopDeliveryHandler?: (delivery: {
     participantId: string, selfId: string, platform: string, channelId: string,
     kind: 'private' | 'group', content: string, quoteMessageId?: string,
+    /** M3：模型显式选择的目标端点（B1-1 桥接透传；缺省按 selfId 路由）。 */
+    endpointId?: string,
+    /** P1-1：业务幂等键（scriptEvent.eventId + bubbleIndex），重试间稳定。
+     * 宿主 outbox 据此跨 deliveryId 去重——迟到回执场景下 worker 30s 后用新
+     * deliveryId 重发时，同一业务消息不会被再次发给用户。 */
+    intentKey?: string,
   }) => Promise<{ ok: boolean, messageIds?: string[], error?: string }>
+
+  /** W3（C2-1）：桥接动作代理出口——desktop-bridge 安装后非空；普通 Koishi 恒空。
+   * qzoneCaller 与 sendSticker 桌面模式经此调用宿主代调上游 OneBot 动作。 */
+  private desktopOnebotActionHandler?: (input: { accountKey: string, action: string, params?: Record<string, unknown>, timeoutMs?: number }) => Promise<{ ok: boolean, data?: unknown, errorCode?: string, ambiguous?: boolean, error?: string }>
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'interlude')
@@ -787,7 +848,9 @@ export class InterludeService extends Service {
       ? this.modelRouting.providers.find(provider => provider.id === rawSeederProvider.id)
         ?? this.modelRouting.providers[(config.model.providers ?? []).indexOf(rawSeederProvider)]
       : undefined
+    this.longHorizonConfig = resolveLongHorizonConfig((config as any).longHorizon)
     this.worldSeederRuntime = resolveWorldSeederRuntime(config.worldSeeder, seederProvider)
+    void (async () => { try { const story = await this.getCanonicalStory(); if (story) { const active = await this.getActiveLongArcGuidance(story.id); if (active) this.activeLongArcGuidanceCache.set(story.id, active) } } catch (error) { this.reportStandaloneOperation('diagnostic', 'debug', '启动期长线指导缓存预加载跳过 错误=%s', error) } })()
     if (this.worldSeederRuntime.enabled) {
       this.worldSeeder = createWorldSeeder(ctx, config.model, this.worldSeederRuntime, onUsage)
       this.reportStandaloneOperation('standard', 'info', '世界播种器已启用 模型=%s 间隔=%d分钟', this.worldSeederRuntime.provider?.model, this.worldSeederRuntime.cadenceMinutes)
@@ -858,8 +921,8 @@ export class InterludeService extends Service {
     })
     // Life advancement and memory compaction are both serialized per story.
     const sweepInterval = Math.max(1, this.config.runtime.sweepIntervalMinutes)
-    this.ctx.setInterval(() => void this.sweep().catch(error => this.reportStandalone('warn', '后台推进失败 错误=%s', error)), sweepInterval * Time.minute)
-    if (this.memoryConfig.enabled || this.schedulePreplanConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('warn', '后台整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
+    this.ctx.setInterval(() => void this.sweep().catch(error => this.reportStandalone('error', '后台推进失败 错误=%s', error)), sweepInterval * Time.minute)
+    if (this.memoryConfig.enabled || this.schedulePreplanConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('error', '后台整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
     if (this.worldSeederRuntime.enabled && this.worldSeeder.available) {
       this.ctx.setInterval(() => void this.worldSeederSweep().catch(error => this.reportStandalone('warn', '世界播种器运行失败 错误=%s', error)), this.worldSeederRuntime.cadenceMinutes * Time.minute)
     }
@@ -886,8 +949,12 @@ export class InterludeService extends Service {
 
   /** Optional typ-0 bridge hook. No sink is installed in normal Koishi use. */
   setDesktopEventSink(sink?: (event: string, payload: unknown) => void) { this.desktopEventSink = sink }
+  /** P2-4：Puppeteer 缺失提示进程内只打一次。 */
+  private puppeteerHintLogged = false
   /** typ-0 bridge 在安装时注册后台投递通道；卸载时传 undefined 复原。 */
   setDesktopDeliveryHandler(handler?: InterludeService['desktopDeliveryHandler']) { this.desktopDeliveryHandler = handler }
+
+  setDesktopOnebotActionHandler(handler?: InterludeService['desktopOnebotActionHandler']) { this.desktopOnebotActionHandler = handler }
   getDesktopRuntimePhase() { return this.desktopRuntimePhase }
   async setDesktopRuntimePhase(phase: DesktopRuntimePhase) {
     if (phase === 'paused' && this.desktopRuntimePhase !== 'paused') {
@@ -924,6 +991,42 @@ export class InterludeService extends Service {
       phase: this.desktopRuntimePhase,
       stories: stories.map(story => ({ id: story.id, status: story.status, cursorAt: story.cursorAt.toISOString(), updatedAt: story.updatedAt.toISOString() })),
     }
+  }
+
+  /**
+   * Endpoint health is deliberately projected by the worker.  This keeps the
+   * desktop read-only and, more importantly, makes all availability decisions
+   * use the same conservative TTL/cooldown rules as delivery itself.
+   */
+  async desktopEndpointHealthSnapshot() {
+    await this.ensureEndpointRegistry()
+    const now = Date.now()
+    const endpoints: DesktopEndpointHealth[] = this.endpointRows.map(row => {
+      const state = this.endpointStates.get(row.id)
+      const deliverable = row.enabled && isEndpointDeliverable(state, now)
+      // `initiate` is optional because QQ/OneBot has no context-token gate;
+      // absence therefore means "no extra gate", not a permanently blocked
+      // endpoint.  We still require the ordinary delivery gate so the desktop
+      // projection cannot advertise a disconnected endpoint as initiable.
+      const initiateAllowed = row.enabled && deliverable
+        && (!state?.initiate || isEndpointInitiateAllowed(state, now))
+      return {
+        endpointId: row.id,
+        ownerKind: row.ownerKind,
+        ownerId: row.ownerId,
+        platform: row.platform,
+        channelKind: row.channelKind,
+        enabled: row.enabled,
+        online: state?.connection.online === true,
+        observedAt: new Date(state?.connection.observedAt ?? now).toISOString(),
+        deliverable,
+        initiateAllowed,
+        ...(state?.deliverable.cooldownUntil ? { cooldownUntil: new Date(state.deliverable.cooldownUntil).toISOString() } : {}),
+        ...(!deliverable && state?.deliverable.note ? { lastError: state.deliverable.note } : {}),
+        ...(state?.deliverable.note ? { note: state.deliverable.note } : {}),
+      }
+    })
+    return { protocol: 1, generatedAt: new Date(now).toISOString(), endpoints }
   }
 
   /** Read-only desktop projection. The host never opens or mutates HDSI tables directly. */
@@ -1137,12 +1240,24 @@ export class InterludeService extends Service {
   }
 
   canManageSession(session: Session): boolean {
-    if (!this.canHandleSession(session)) {
-      this.reportStandaloneOperation('diagnostic', 'debug', '私聊被 OneBot 白名单拦截 平台=%s 机器人ID=%s 用户ID=%s', session.platform, session.selfId, session.userId)
-      return false
+    return this.manageSessionDenial(session) === undefined
+  }
+
+  /** 管理命令被拒的具体原因（两层：OneBot 互动白名单 / managerAccounts）。
+   * 拒绝时记 standard 级 warn——此前区分线索藏在 diagnostic debug 里，新部署
+   * 排障完全看不见。 */
+  manageSessionDenial(session: Session): ManageSessionDenial | undefined {
+    const denial = manageSessionDenialReason({
+      platform: session.platform,
+      selfId: session.selfId,
+      userId: session.userId,
+      onebot: this.config.onebot,
+      managers: this.sharedStoryConfig.managerAccounts,
+    })
+    if (denial) {
+      this.reportStandaloneOperation('standard', 'warn', '管理命令被拒 层=%s 平台=%s 机器人ID=%s 用户ID=%s 原因=%s', denial.layer, session.platform, session.selfId, session.userId, denial.detail)
     }
-    const managers = this.sharedStoryConfig.managerAccounts.map(value => String(value ?? '').trim()).filter(Boolean)
-    return !managers.length || managers.some(value => normalizeAccountId(value) === normalizeAccountId(session.userId))
+    return denial
   }
 
   /** Background life updates only require the bot account to remain enabled. */
@@ -1252,7 +1367,7 @@ export class InterludeService extends Service {
     for (const story of active) {
       if (story.id === canonical.id) continue
       await this.dbSet('interlude_story', { id: story.id }, { status: 'archived', updatedAt: now })
-      this.reportStandalone('warn', '主剧本归档完成 原因=检测到多个活动故事 保留=%s 已归档=%s 范围=%s', canonical.id, story.id, '全局')
+      this.reportStandalone('info', '主剧本归档完成 原因=检测到多个活动故事 保留=%s 已归档=%s 范围=%s', canonical.id, story.id, '全局')
     }
     return canonical
   }
@@ -1363,6 +1478,8 @@ export class InterludeService extends Service {
     const blockers: string[] = []
     const warnings: string[] = []
     if (!this.canHandleSession(session)) blockers.push('当前机器人账号或用户账号未通过 OneBot 白名单。')
+    const manageDenial = this.manageSessionDenial(session)
+    if (manageDenial) warnings.push(`当前会话无管理权限：${manageDenial.detail}`)
     if (!setting.character.name.trim()) blockers.push('storyDefaults.characterName 为空。')
     if (!setting.character.profile.trim()) blockers.push('storyDefaults.characterProfile 尚未填写。')
     try { new Intl.DateTimeFormat('en-US', { timeZone: setting.timezone }) } catch { blockers.push(`时区无效：${setting.timezone}`) }
@@ -1487,10 +1604,7 @@ export class InterludeService extends Service {
    * A burst of conversation can therefore exceed the nominal turn count
    * without immediately erasing everything said earlier in the same hour. */
   private async recentEntriesForPrompt(storyId: string, now: Date) {
-    // M4.1 restores a substantial raw-script continuation window. High-density
-    // chat may add dozens of entries without demoting yesterday's causal tail.
-    const count = Math.max(35, Math.min(this.config.runtime.contextEntryLimit ?? 20, 200))
-    const minutes = Math.max(0, Math.min(this.config.runtime.contextTimeWindowMinutes ?? 45, 1_440))
+    const { count, minutes } = resolveScriptContextBudget(this.config.runtime)
     const [countRows, timeRows] = await Promise.all([
       this.dbGet('interlude_script_entry', { storyId }, { limit: count, sort: { occurredAt: 'desc' } }),
       minutes > 0
@@ -1898,7 +2012,11 @@ export class InterludeService extends Service {
     const mentionedBot = mentionsBot(session)
     const quotedBot = quotesBot(session)
     const audioSources = extractSessionAudioSources(session)
-    if (rule.responseMode === 'mention-only' && !mentionedBot && !audioSources.length) return false
+    const imageSources = extractSessionImageSources(session)
+    // In mention-only mode a plain text message is ignored before story lookup,
+    // but an unmentioned image is durable evidence for a later real turn. It is
+    // persisted below without entering the model debounce queue.
+    if (rule.responseMode === 'mention-only' && !mentionedBot && !audioSources.length && !imageSources.length) return false
     let story = await this.findStory(session)
     if (!story && this.config.runtime.autoCreate) story = await this.createStory(session)
     if (!story || story.status !== 'active') return false
@@ -1935,19 +2053,27 @@ export class InterludeService extends Service {
           groupId, senderId, senderName, channelId: session.channelId, messageId: session.messageId,
           ...(groupChannelMeta ? { channel: groupChannelMeta } : {}),
           ...(quote ? { quote } : {}),
+          ...(imageSources.length ? {
+            imageCount: imageSources.length,
+            groupImageRefs: groupImageRefsForStorage(imageSources),
+          } : {}),
         },
       }, now)
       await this.pauseAutomaticAdvanceAfterUserMessage(current.id, now)
       return entry
     })
+    // An unmentioned image is evidence-only in mention-only mode. It has now
+    // been written to the script, but must not itself consume willingness,
+    // cooldown, or a main-model call.
+    if (rule.responseMode === 'mention-only' && !mentionedBot && !audioSources.length) return true
     const messageId = targetableMessageId(session.messageId)
     this.bufferGroupMessage(story, rule, session, {
       senderId, senderName, speaker: formatGroupSpeaker(senderName, senderId),
       ...(messageId ? { messageId, messageRef: groupMessageRef(accepted.id) } : {}),
         ...(quote ? { quote } : {}),
         content: messageContent, occurredAt: now, direction: 'user',
-      }, mentionedBot, quotedBot, audioSources, groupChannelMeta?.endpointId)
-    this.reportOperation('summary', 'info', story, 'user-message', '收到群聊消息 群=%s 发送者=%s', groupId, senderId)
+      }, mentionedBot, quotedBot, audioSources, imageSources, groupChannelMeta?.endpointId)
+    this.reportOperation('summary', 'info', story, 'user-message', '收到群聊消息 群=%s 发送者=%s', maskQqIds(groupId), maskQqIds(senderId))
     return true
   }
 
@@ -2010,7 +2136,7 @@ export class InterludeService extends Service {
     const inboundEndpointId = inboundResolution?.userEndpoint?.id ?? inboundResolution?.roleEndpoint?.id ?? 'unknown'
     this.inboundSeq += 1
     const inboundReceivedSeq = this.inboundSeq
-    this.reportOperation('summary', 'info', story, 'user-message', '收到参与者私聊消息 参与者=%s', participant.id)
+    this.reportOperation('summary', 'info', story, 'user-message', '收到参与者私聊消息 参与者=%s', maskQqIds(participant.id))
     if (this.config.logging?.logMessageContent) {
       this.reportOperation('diagnostic', 'info', story, 'user-message', '用户消息内容：%s', userInput.content.slice(0, this.config.logging.previewLength))
     }
@@ -2085,7 +2211,7 @@ export class InterludeService extends Service {
     }
   }
 
-  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean, audioSources: string[] = [], endpointId?: string) {
+  private bufferGroupMessage(story: InterludeStory, rule: GroupChatRule, session: Session, message: GroupMessageContext, mentionedBot: boolean, quotedBot: boolean, audioSources: string[] = [], imageSources: string[] = [], endpointId?: string) {
     const key = `${story.id}:${normalizeGroupId(rule.groupId)}`
     const existing = this.bufferedGroupTurns.get(key)
     const turn: BufferedGroupTurn = existing ?? {
@@ -2096,7 +2222,12 @@ export class InterludeService extends Service {
     turn.channelId = session.channelId
     turn.latestSession = session
     // Transport sources belong only to this fresh batch, never to durable history.
-    turn.messages.push({ ...message, ...(audioSources.length ? { audioSources, audioSession: session } : {}), ...(endpointId ? { endpointId } : {}) })
+    turn.messages.push({
+      ...message,
+      ...(imageSources.length ? { imageSources, imageSession: session } : {}),
+      ...(audioSources.length ? { audioSources, audioSession: session } : {}),
+      ...(endpointId ? { endpointId } : {}),
+    })
     turn.mentionedBot ||= mentionedBot
     turn.quotedBot ||= quotedBot
     const revision = ++turn.revision
@@ -2178,14 +2309,14 @@ export class InterludeService extends Service {
     try {
       const snapshot = await this.serial(story.id, async () => {
         const current = await this.getStory(story.id)
-        const contextMessages = await this.groupMessages(current.id, turn.groupId, turn.rule.contextLimit)
+        const groupSnapshot = await this.groupMessages(current.id, turn.groupId, turn.rule.contextLimit)
         const now = new Date()
-        return { story: current, from: narrativeCursor(current, now), now, contextMessages }
+        return { story: current, from: narrativeCursor(current, now), now, ...groupSnapshot }
       })
       const groupContext: GroupContext = {
         groupId: turn.groupId, channelId: channelId, label: turn.rule.label,
         purpose: turn.rule.purpose, characterRole: turn.rule.characterRole,
-        messages: snapshot.contextMessages,
+        messages: snapshot.messages,
       }
       const chatCapabilities = this.groupChatCapabilities(session, groupContext.messages)
       const userMessage = batch.map((message, index) => `[群聊连续消息 ${index + 1}｜${message.speaker}]\n${message.content}`).join('\n\n')
@@ -2193,6 +2324,16 @@ export class InterludeService extends Service {
         ? await this.embedText(userMessage.slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
         : undefined
       const stickerCatalog = await this.stickerCatalogForSession(session, turnQueryEmbedding)
+      const currentImageSources = Array.from(new Set(batch.flatMap(message => message.imageSources ?? []))).slice(0, 3)
+      const imageSession = batch.find(message => message.imageSession)?.imageSession ?? session
+      const currentImages = await this.loadNativeImages(snapshot.story, currentImageSources, imageSession)
+      const historicalGroupImages = await this.loadHistoricalGroupImages(
+        snapshot.story,
+        snapshot.imageRefs,
+        turn.rule.historicalImageLimit ?? 3,
+        imageSession,
+        currentImageSources,
+      )
       const audio: NarrativeAudio[] = []
       const audioBatchMaxCount = Math.max(1, this.audioConfig.maxPerMessage * 4)
       const audioBatchMaxBytes = Math.max(1, this.audioConfig.maxFileSizeMB * 1_000_000 * 4)
@@ -2217,7 +2358,10 @@ export class InterludeService extends Service {
       if (hasAudio) this.reportOperation('standard', audio.length ? 'info' : 'warn', story, 'user-message',
         '群音频直接触发主叙事（跳过意愿/冷却），已载入音频=%s；实际发言由剧本决定%s', audio.length,
         audio.length ? '' : '；音频未载入，请检查原生音频开关、格式、大小或读取日志')
-      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, [], audio, chatCapabilities, [], stickerCatalog, turnQueryEmbedding)
+      const visionMode = this.config?.model?.vision?.mode ?? 'native'
+       const images = visionMode === 'native' ? currentImages : []
+       const historicalImages = visionMode === 'native' ? historicalGroupImages : []
+       const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, images, audio, chatCapabilities, [], stickerCatalog, turnQueryEmbedding, undefined, undefined, historicalImages)
       const chatActions = normalizeGroupChatActions(decision, chatCapabilities, groupContext)
       const sticker = this.resolveSticker(decision.localMedia, stickerCatalog)
       const nativeFace = sticker ? undefined : this.resolveNativeFace(decision, chatCapabilities)
@@ -2306,31 +2450,68 @@ export class InterludeService extends Service {
       if (result.messages.length) await this.sendOutgoingMessages(snapshot.story, result.messages)
       this.scheduleCompaction(story.id)
     } catch (error) {
-      this.report('warn', story, 'user-message', '群聊主叙事失败，保持静默 群=%s 错误=%s', turn.groupId, error)
+      this.report('error', story, 'user-message', '群聊主叙事失败，保持静默 群=%s 错误=%s', turn.groupId, error)
     }
   }
-  private async groupMessages(storyId: string, groupId: string, limit: number) {
+  private async groupMessages(storyId: string, groupId: string, limit: number): Promise<GroupMessagesSnapshot> {
     const rows = await this.dbGet('interlude_script_entry', { storyId }, {
-      limit: Math.max(20, Math.min(200, limit * 8)), sort: { occurredAt: 'desc' },
+      // Keep enough lookback to find the last few image-bearing entries even
+      // when the visible text context is small.
+      limit: Math.max(60, Math.min(300, limit * 12)), sort: { occurredAt: 'desc' },
     })
-    return rows
-      .filter(entry => ['group-message', 'character-group-message'].includes(entry.kind) && normalizeGroupId(String(entry.metadata?.groupId ?? '')) === normalizeGroupId(groupId))
-      .slice(0, Math.max(1, limit))
-      .reverse()
-      .map(entry => ({
-        senderId: String(entry.metadata?.senderId ?? (entry.actor === 'character' ? 'character' : 'unknown')),
-        senderName: String(entry.metadata?.senderName ?? (entry.actor === 'character' ? '主角' : entry.metadata?.senderId ?? '群成员')),
-        speaker: formatGroupSpeaker(
-          String(entry.metadata?.senderName ?? (entry.actor === 'character' ? '主角' : entry.metadata?.senderId ?? '群成员')),
-          String(entry.metadata?.senderId ?? (entry.actor === 'character' ? 'character' : 'unknown')),
-        ),
-        ...(targetableMessageId(entry.metadata?.messageId)
-          ? { messageId: targetableMessageId(entry.metadata?.messageId), messageRef: groupMessageRef(entry.id) }
-          : {}),
-        ...(normalizeQuotedMessageContext(entry.metadata?.quote) ? { quote: normalizeQuotedMessageContext(entry.metadata?.quote) } : {}),
-        content: entry.content, occurredAt: entry.occurredAt,
-        direction: entry.actor === 'character' ? 'character' as const : 'user' as const,
-      }))
+    const groupRows = rows.filter(entry => ['group-message', 'character-group-message'].includes(entry.kind)
+      && normalizeGroupId(String(entry.metadata?.groupId ?? '')) === normalizeGroupId(groupId))
+    const visibleRows = groupRows.slice(0, Math.max(1, limit)).reverse()
+    const messages = visibleRows.map(entry => ({
+      senderId: String(entry.metadata?.senderId ?? (entry.actor === 'character' ? 'character' : 'unknown')),
+      senderName: String(entry.metadata?.senderName ?? (entry.actor === 'character' ? '主角' : entry.metadata?.senderId ?? '群成员')),
+      speaker: formatGroupSpeaker(
+        String(entry.metadata?.senderName ?? (entry.actor === 'character' ? '主角' : entry.metadata?.senderId ?? '群成员')),
+        String(entry.metadata?.senderId ?? (entry.actor === 'character' ? 'character' : 'unknown')),
+      ),
+      ...(targetableMessageId(entry.metadata?.messageId)
+        ? { messageId: targetableMessageId(entry.metadata?.messageId), messageRef: groupMessageRef(entry.id) }
+        : {}),
+      ...(normalizeQuotedMessageContext(entry.metadata?.quote) ? { quote: normalizeQuotedMessageContext(entry.metadata?.quote) } : {}),
+      content: entry.content, occurredAt: entry.occurredAt,
+      direction: entry.actor === 'character' ? 'character' as const : 'user' as const,
+    }))
+    const imageRefs: StoredGroupImageRef[] = []
+    for (const entry of groupRows) {
+      if (entry.actor !== 'user' || !Array.isArray(entry.metadata?.groupImageRefs)) continue
+      const senderId = String(entry.metadata?.senderId ?? 'unknown')
+      const senderName = String(entry.metadata?.senderName ?? senderId)
+      const messageId = targetableMessageId(entry.metadata?.messageId)
+      for (const raw of entry.metadata.groupImageRefs as unknown[]) {
+        if (!isRecord(raw)) continue
+        const source = String(raw.source ?? '').trim()
+        if (!source || /^data:image\//i.test(source) || source.length > 8 * 1024 * 1024) continue
+        const sourceType = raw.sourceType === 'file' ? 'file' : raw.sourceType === 'url' ? 'url' : undefined
+        if (!sourceType) continue
+        imageRefs.push({ source, ordinal: Number(raw.ordinal) || 0, sourceType, sourceEntryId: entry.id, senderId, senderName, occurredAt: entry.occurredAt, ...(messageId ? { messageId } : {}) })
+      }
+    }
+    imageRefs.sort((left, right) => right.occurredAt.getTime() - left.occurredAt.getTime() || right.sourceEntryId - left.sourceEntryId || right.ordinal - left.ordinal)
+    return { messages, imageRefs }
+  }
+
+  private async loadHistoricalGroupImages(story: InterludeStory, refs: StoredGroupImageRef[], limit: number, session?: Session, currentSources: string[] = []): Promise<NarrativeHistoricalImage[]> {
+    if (!this.config?.model?.vision?.enabled || limit <= 0 || !refs.length) return []
+    const selected: NarrativeHistoricalImage[] = []
+    const seen = new Set(currentSources)
+    const max = Math.min(6, Math.max(0, Math.floor(limit)))
+    for (const ref of refs) {
+      if (selected.length >= max || seen.has(ref.source)) continue
+      seen.add(ref.source)
+      try {
+        const image = await this.fetchNativeImage(ref.source, (session as any)?.bot)
+        if (!image) continue
+        selected.push({ id: `group-history-image-${selected.length + 1}`, ...image, sourceEntryId: ref.sourceEntryId, senderId: ref.senderId, senderName: ref.senderName, occurredAt: ref.occurredAt, ...(ref.messageId ? { messageId: ref.messageId } : {}) })
+      } catch (error) {
+        this.report('warn', story, 'user-message', '历史群聊图片读取失败，已跳过图片 entry=%s 错误=%s', ref.sourceEntryId, error)
+      }
+    }
+    return selected.reverse()
   }
 
   private async groupCooldownActive(storyId: string, groupId: string, cooldownSeconds: number) {
@@ -2456,7 +2637,30 @@ export class InterludeService extends Service {
     }
     let platformDelivered = false
     try {
-      await session.bot.sendMessage(channelId, h('img', { src: pathToFileURL(file).href }))
+      if (this.desktopOnebotActionHandler) {
+        // W3（C2-2）桌面模式：经宿主动作代理 send_msg，贴纸以宿主本地文件路径
+        // 作 CQ 码（worker 与宿主同机），auto_escape=false 让 CQ 码被解析。
+        // 绕开 HTTP 回源的 port:0 问题；独立部署仍走 HTTP 回源。
+        const kind = groupId ? 'send_group_msg' : 'send_private_msg'
+        const targetId = onebotTargetId(channelId)
+        const outcome = await this.desktopOnebotActionHandler({
+          accountKey: 'onebot:' + String(session.selfId ?? ''),
+          action: kind,
+          params: {
+            ...(groupId ? { group_id: targetId } : { user_id: targetId }),
+            message: `[CQ:image,file=file:///${file.replace(/\\/g, '/')}]`,
+            auto_escape: false,
+          },
+        })
+        if (!outcome.ok) throw new Error(outcome.error || `宿主动作代理失败：${outcome.errorCode ?? 'unknown'}`)
+      } else {
+        // 独立 Koishi：经自身 HTTP 服务回源投递（file:/// 指向 Koishi 侧文件系统，
+        // OneBot 实现分容器/分进程部署时读不到——retcode 1200/100 实测）。HTTP URL
+        // 由 OneBot 实现主动下载，跨容器/跨机通吃，也不必把图片内联进载荷。
+        this.registerStickerRoute()
+        const src = stickerDeliveryUrl(this.stickerDeliveryBase(), asset.assetId)
+        await session.bot.sendMessage(channelId, h('img', { src }))
+      }
       platformDelivered = true
       const now = new Date()
       await this.serial(story.id, async () => {
@@ -2499,7 +2703,24 @@ export class InterludeService extends Service {
     try {
       // OneBot 11 规范 face.id 是 int32；字符串 id 会被严格校验的实现直接
       // 拒绝（"is not a valid segment"）。宽容实现两者都收，统一发数字。
-      await session.bot.sendMessage(channelId, h('face', { id: Number(QQ_NATIVE_FACE_IDS[semantic]) }))
+      const faceId = Number(QQ_NATIVE_FACE_IDS[semantic])
+      if (this.desktopOnebotActionHandler) {
+        // P1-3：桌面合成 session 没有 bot 属性，此前直接 session.bot.sendMessage
+        // 必然 TypeError 后被外层 catch 吞掉。改走宿主动作代理（与贴纸同型）。
+        const targetId = onebotTargetId(channelId)
+        const outcome = await this.desktopOnebotActionHandler({
+          accountKey: 'onebot:' + String(session.selfId ?? ''),
+          action: groupId ? 'send_group_msg' : 'send_private_msg',
+          params: {
+            ...(groupId ? { group_id: targetId } : { user_id: targetId }),
+            message: `[CQ:face,id=${faceId}]`,
+            auto_escape: false,
+          },
+        })
+        if (!outcome.ok) throw new Error(outcome.error || `宿主动作代理失败：${outcome.errorCode ?? 'unknown'}`)
+      } else {
+        await session.bot.sendMessage(channelId, h('face', { id: faceId }))
+      }
       platformDelivered = true
       const now = new Date()
       await this.serial(story.id, async () => {
@@ -2537,38 +2758,74 @@ export class InterludeService extends Service {
       deliveredSegments: [], complete: false,
       segmentOutcomes: segments.map((segment, index) => ({ index, content: segment, status: 'failed' as const, reason })),
     })
+    try {
+      await this.ensureEndpointRegistry()
+    } catch (error) {
+      this.report('warn', story, 'user-message', '群消息端点注册表不可用 群频道=%s 错误=%s', targetGroupId, error)
+      return failed('endpoint-registry-unavailable')
+    }
     const endpointRows: EndpointRow[] = Array.isArray(this.endpointRows) ? this.endpointRows : []
     let fallbackAddress: { platform: string, selfId: string, endpointId?: string } | undefined
+    let selectedEndpoint: EndpointRow | undefined
+    let endpointOwner: { kind: 'story-role' | 'group', id: string } = { kind: 'story-role', id: story.id }
     let bot: any
+    const sessionGroupId = normalizeGroupId(String((session as any)?.guildId ?? session?.channelId ?? ''))
+    const sessionBot = (!sessionGroupId || sessionGroupId === targetGroupId) && session?.bot && typeof (session.bot as any).sendMessage === 'function'
+      ? session.bot
+      : undefined
+    const sessionMatchesEndpoint = (endpoint: EndpointRow | undefined) => !!endpoint && !!sessionBot
+      && String(session?.selfId ?? '') === String(endpoint.selfId)
+      && (session?.platform === endpoint.platform || isOneBotPlatform(String(session?.platform ?? '')) && isOneBotPlatform(endpoint.platform))
+    const observeSessionEndpoint = (endpoint: EndpointRow | undefined) => {
+      if (!endpoint || !session || !sessionMatchesEndpoint(endpoint)) return
+      const previous = this.endpointStates.get(endpoint.id) ?? freshEndpointState(endpoint.id)
+      if (!previous.connection.online) this.setEndpointState(endpoint.id, stateAfterConnection(previous, true))
+    }
     if (endpointId) {
       // Explicit group routing may only select this story's role endpoint or
       // the registered endpoint belonging to the requested group.
-      const endpoint = endpointRows.find(row => row.id === endpointId && row.enabled && (
+      const endpoint = endpointRows.find(row => row.id === endpointId && (
         row.ownerKind === 'story-role' && row.ownerId === story.id
         || row.ownerKind === 'group' && normalizeGroupId(row.groupId ?? row.ownerId) === targetGroupId
       ))
       if (!endpoint) {
         this.report('warn', story, 'user-message', '群消息指定端点无效或不属于目标群 端点=%s 群频道=%s', endpointId, targetGroupId)
-        return failed('endpoint-not-allowed')
+        return failed('endpoint-not-found')
       }
-      fallbackAddress = { platform: endpoint.platform, selfId: endpoint.selfId, endpointId: endpoint.id }
+      // The incoming group Session is a current connection observation. Apply
+      // it before the delivery gate so the first immediate reply is not
+      // rejected as offline merely because lifecycle events arrived later.
+      observeSessionEndpoint(endpoint)
+      const gated = this.endpointForDelivery(endpoint.id, endpoint.ownerKind === 'group'
+        ? { kind: 'group', id: endpoint.ownerId }
+        : { kind: 'story-role', id: story.id })
+      if (gated.reason || !gated.row) return failed(gated.reason ?? 'endpoint-not-deliverable')
+      selectedEndpoint = gated.row
+      endpointOwner = selectedEndpoint.ownerKind === 'group'
+        ? { kind: 'group', id: selectedEndpoint.ownerId }
+        : { kind: 'story-role', id: story.id }
+      fallbackAddress = { platform: gated.row.platform, selfId: gated.row.selfId, endpointId: gated.row.id }
       bot = this.ctx.bots.find(item => String(item.selfId) === String(endpoint.selfId)
         && (item.platform === endpoint.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(endpoint.platform)))
     } else {
       // A private session that authored a cross-group action is not a valid
       // group transport session. Use it only when its channel is this group.
-      const sessionGroupId = normalizeGroupId(String((session as any)?.guildId ?? session?.channelId ?? ''))
       // Older adapters do not expose guildId/channelId on the synthetic
       // session passed to this helper. Preserve their live-session routing;
       // when a channel is known, only reuse it for the same target group.
-      const sessionBot = (!sessionGroupId || sessionGroupId === targetGroupId) && session?.bot && typeof (session.bot as any).sendMessage === 'function'
-        ? session.bot
-        : undefined
       fallbackAddress = this.endpointAddressSync({ platform: story.platform, selfId: story.selfId }, { kind: 'story-role', id: story.id })
-      bot = sessionBot ?? this.ctx.bots.find(item => String(item.selfId) === String(fallbackAddress!.selfId)
+      if (fallbackAddress.endpointId) {
+        const candidate = endpointRows.find(row => row.id === fallbackAddress!.endpointId)
+        observeSessionEndpoint(candidate)
+        const gated = this.endpointForDelivery(fallbackAddress.endpointId, { kind: 'story-role', id: story.id })
+        if (gated.reason || !gated.row) return failed(gated.reason ?? 'endpoint-not-deliverable')
+        selectedEndpoint = gated.row
+      }
+      const sessionMatches = !selectedEndpoint || sessionMatchesEndpoint(selectedEndpoint)
+      bot = sessionBot && sessionMatches ? sessionBot : this.ctx.bots.find(item => String(item.selfId) === String(fallbackAddress!.selfId)
         && (item.platform === fallbackAddress!.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(fallbackAddress!.platform)))
     }
-    if (!bot) {
+    if (!bot && !this.desktopDeliveryHandler) {
       this.report('warn', story, 'user-message', '没有可用机器人账号投递群消息 群频道=%s 故事平台=%s 故事账号=%s', targetGroupId, story.platform, story.selfId)
       return failed('bot-not-found')
     }
@@ -2580,19 +2837,40 @@ export class InterludeService extends Service {
         ? [h('quote', { id: replyToMessageId }), segment]
         : segment
       try {
-        const receipt = await bot.sendMessage(transportGroupId, outgoing)
-        if (Array.isArray(receipt) && !receipt.length) throw new Error('Group transport returned no message receipt.')
+        const address = selectedEndpoint
+          ? { platform: selectedEndpoint.platform, selfId: selectedEndpoint.selfId }
+          : { platform: fallbackAddress!.platform, selfId: fallbackAddress!.selfId }
+        if (this.desktopDeliveryHandler) {
+          const outcome = await this.desktopDeliveryHandler({
+            participantId: `group:${targetGroupId}`,
+            selfId: address.selfId,
+            platform: address.platform,
+            channelId: transportGroupId,
+            kind: 'group',
+            content: segment,
+            ...(index === 0 && replyToMessageId ? { quoteMessageId: replyToMessageId } : {}),
+            ...(selectedEndpoint?.id ? { endpointId: selectedEndpoint.id } : {}),
+          })
+          if (!outcome.ok) throw new Error(outcome.error || 'typ-0 群消息投递失败。')
+        } else {
+          const receipt = await bot.sendMessage(transportGroupId, outgoing)
+          if (Array.isArray(receipt) && !receipt.length) throw new Error('Group transport returned no message receipt.')
+        }
         // P2-8：状态按实际投递的 bot 归因——实时群会话优先时归因到 session.bot，
         // 否则归因到解析出的兜底账号（多角色下不再错刷 fallback）。
-        const actualBot = (bot as unknown as { platform?: string, selfId?: string })
-        this.noteEndpointOutbound({ kind: 'story-role', id: story.id }, true, 'group-delivered', { platform: String(actualBot?.platform ?? fallbackAddress!.platform), selfId: String(actualBot?.selfId ?? fallbackAddress!.selfId) })
+        const actualBot = (bot as unknown as { platform?: string, selfId?: string } | undefined)
+        this.noteEndpointOutbound(endpointOwner, true, 'group-delivered', { platform: String(actualBot?.platform ?? address.platform), selfId: String(actualBot?.selfId ?? address.selfId) })
         deliveredSegments.push(segment)
         segmentOutcomes.push({ index, content: segment, status: 'delivered' })
       }
       catch (error) {
         allDelivered = false
         segmentOutcomes.push({ index, content: segment, status: 'failed', reason: clip(String(error), 500) })
-        this.report('warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', targetGroupId, error)
+        const address = selectedEndpoint
+          ? { platform: selectedEndpoint.platform, selfId: selectedEndpoint.selfId }
+          : { platform: fallbackAddress!.platform, selfId: fallbackAddress!.selfId }
+        this.noteEndpointOutbound(endpointOwner, false, String(error), address)
+        this.report('error', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', targetGroupId, error)
       }
     }
     return { deliveredSegments, complete: allDelivered, segmentOutcomes }
@@ -2702,7 +2980,8 @@ export class InterludeService extends Service {
     if (!extractForwardIds(session.content).length) return undefined
     if (this.config.runtime.forwardMessage?.enabled === false) return undefined
     const result = await readForwardContent(session, this.config.runtime.forwardMessage)
-    if (result?.failed) this.reportStandaloneOperation('diagnostic', 'warn', '合并转发读取失败 平台=%s 机器人ID=%s 用户ID=%s', session.platform, session.selfId, session.userId)
+    if (result?.failed) this.reportStandaloneOperation('diagnostic', 'warn', '合并转发读取失败 平台=%s 机器人ID=%s 用户ID=%s%s', session.platform, session.selfId, session.userId, result.cause ? ` 原因=${clip(result.cause, 120)}` : '')
+    else if (result?.nestedFailed) this.reportStandaloneOperation('diagnostic', 'warn', '合并转发部分嵌套内容读取失败 次数=%d（正文以占位符降级） 平台=%s', result.nestedFailed, session.platform)
     else if (result) this.reportStandaloneOperation('diagnostic', 'debug', '合并转发读取完成 节点=%d 嵌套=%d 截断=%s', result.nodeCount, result.forwardCount, result.truncated)
     return result
   }
@@ -2715,7 +2994,20 @@ export class InterludeService extends Service {
       const root = resolve(this.ctx.baseDir, config.directory)
       const files = await listStickerFiles(root)
       const existing = await this.dbGet('interlude_sticker', {}) as StickerAsset[]
-      const byPath = new Map(existing.map(item => [item.filePath, item]))
+      // 旧版 assetId 折叠缺陷留下的重复行会让每轮扫描在 UNIQUE 约束上崩掉；
+      // 扫描前按 assetId/filePath 去重（保留 updatedAt 最新一条），库自愈。
+      const dedupeKey = (item: StickerAsset) => `${item.assetId}\u0000${item.filePath}`
+      const newestByKey = new Map<string, StickerAsset>()
+      for (const item of existing) {
+        const key = dedupeKey(item)
+        const prior = newestByKey.get(key)
+        if (!prior || item.updatedAt > prior.updatedAt) newestByKey.set(key, item)
+      }
+      for (const item of existing) {
+        if (newestByKey.get(dedupeKey(item)) !== item) await this.dbRemove('interlude_sticker', { id: item.id })
+      }
+      const deduped = [...newestByKey.values()]
+      const byPath = new Map(deduped.map(item => [item.filePath, item]))
       const seen = new Set<string>()
       const pending: Array<{ asset: StickerAsset, bytes: Buffer }> = []
       for (const file of files) {
@@ -2789,6 +3081,35 @@ export class InterludeService extends Service {
       this.stickerScanRunning = false
     }
   }
+
+  /** 表情包投递基址：显式配置 > Koishi selfUrl > 本机默认端口。 */
+  private stickerDeliveryBase() {
+    const configured = String(this.stickerConfig.deliveryBaseUrl ?? '').trim()
+    if (configured) return configured
+    const selfUrl = String((this.ctx as any).options?.selfUrl ?? (this.ctx as any).config?.selfUrl ?? '').trim()
+    return selfUrl || 'http://127.0.0.1:5140'
+  }
+
+  /** 表情包 HTTP 回源路由：OneBot 实现（NapCat/Lagrange）分容器时经此下载文件。
+   * 仅服务素材库内、资产表登记过的文件；assetId 即查询键，无目录穿越面。 */
+  private registerStickerRoute() {
+    if (!this.stickerRouteRegistered || !(this.ctx as any).router) return
+    this.stickerRouteRegistered = true
+    ;(this.ctx as any).router.get('/hds-interlude/sticker/:assetId', async (koa: any) => {
+      const asset = this.stickerById.get(koa.params.assetId)
+      if (!asset || asset.status !== 'active') { koa.status = 404; return }
+      const root = resolve(this.ctx.baseDir, this.stickerConfig.directory)
+      const file = resolve(root, asset.filePath)
+      const inside = relative(root, file)
+      if (!inside || inside === '..' || inside.startsWith(`..${sep}`) || inside.includes(':')) { koa.status = 404; return }
+      koa.type = asset.mimeType || 'image/png'
+      koa.set('cache-control', 'public, max-age=86400')
+      koa.body = createReadStream(file)
+    })
+    this.reportStandaloneOperation('diagnostic', 'debug', '表情包回源路由已注册 基址=%s', this.stickerDeliveryBase())
+  }
+
+  private stickerRouteRegistered = false
 
   private async refreshStickerCatalog() {
     const rows = await this.dbGet('interlude_sticker', { status: 'active' }, { sort: { updatedAt: 'desc' } }) as StickerAsset[]
@@ -3138,7 +3459,7 @@ export class InterludeService extends Service {
   }
 
   private async loadNativeImages(story: InterludeStory, sources: string[], session?: Session): Promise<NarrativeImage[]> {
-    if (!this.config.model.vision?.enabled || !sources.length) return []
+    if (!this.config?.model?.vision?.enabled || !sources.length) return []
     const images: NarrativeImage[] = []
     for (const [index, source] of sources.slice(0, 3).entries()) {
       try {
@@ -3228,7 +3549,11 @@ export class InterludeService extends Service {
     if (isAnimatedImageMime(normalized)) {
       const frame = await this.renderAnimatedImageFrame(dataUri)
       if (frame) return frame
-      this.reportStandalone('warn', '动态图片未能抽帧，已使用原始图片输入；请启用 Puppeteer 以提高识别兼容性。')
+      // P2-4：配置建议只需提醒一次——每张动态图都刷一遍 warn 是噪音。
+      if (!this.puppeteerHintLogged) {
+        this.puppeteerHintLogged = true
+        this.reportStandalone('warn', '动态图片未能抽帧，已使用原始图片输入；请启用 Puppeteer 以提高识别兼容性。')
+      }
     }
     const scaled = await this.downscaleImageForVision({ mimeType: normalized, dataUri })
     return scaled ?? { mimeType: normalized, dataUri }
@@ -3693,11 +4018,13 @@ export class InterludeService extends Service {
         if (reference) await this.updateScriptDeliveryOutcome(story.id, reference, 'cancelled', now, 'delivery-target-unavailable')
         continue
       }
+      const scriptEvent = restoreMessageEvent(intent.payload, content)
       const message: OutgoingMessageDraft = {
         participantId: participant.id,
         content,
         automaticDelivery,
-        scriptEvent: restoreMessageEvent(intent.payload, content),
+        ...(scriptEvent?.endpointId ? { endpointId: scriptEvent.endpointId } : {}),
+        scriptEvent,
       }
       const delivered = await this.sendOutgoingMessages(
         story,
@@ -3887,7 +4214,8 @@ export class InterludeService extends Service {
     return messages
   }
 
-  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], audio: NarrativeAudio[] = [], extraWebContext: WebObservation[] = [], outputRecovery = false, chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], timelinePlan?: TimelinePlan, onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>) {
+  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], audio: NarrativeAudio[] = [], extraWebContext: WebObservation[] = [], outputRecovery = false, chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], timelinePlan?: TimelinePlan, onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>, historicalGroupImages: NarrativeHistoricalImage[] = []) {
+    if (this.longHorizonConfig.enabled) await this.ensureLongHorizonGuidanceLoaded(story.id)
     // 这里是主模型上下文的唯一入口。recentEntries 保留近距离质感，场景、弧线和
     // facts 负责把很长的过去压缩成连续性线索。参与者摘要让模型知道角色
     // 同时还在与谁维系关系，而不是把每个 QQ 当成独立世界。
@@ -4008,7 +4336,7 @@ export class InterludeService extends Service {
     const endpointSelection = this.narrativeEndpointSelection(story, allParticipants, availableGroupTargets)
     return reconcileTransportReferences(await this.narrator.decide({
       urgeEnabled: this.urgeConfig.enabled && !dueIntents.some(intent => intent.type === 'narrative-retry'),
-      phase, refreshContinuity, outputRecovery, story, from, now, userMessage, userReportedTimes, images, audio, visualObservations, timelinePlan, developmentTendencies,
+      phase, refreshContinuity, outputRecovery, story, from, now, userMessage, userReportedTimes, images, audio, visualObservations, historicalGroupImages, timelinePlan, developmentTendencies,
       writingOptions: {
         messageSeparator: this.config.runtime.messageSeparator?.trim() || '<sep/>',
         splitReplyMessages: this.config.runtime.splitReplyMessages !== false,
@@ -4026,6 +4354,7 @@ export class InterludeService extends Service {
         availableOutgoingEndpoints: endpointSelection.options,
         channelSelectionEnabled: true,
       } : {}),
+      ...(this.longHorizonConfig.enabled ? { longHorizonGuidance: this.longHorizonPromptProjection(story.id) } : {}),
       dueIntents: visibleDueIntents, upcomingIntents: visibleUpcomingIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
       recentEntries: promptEntries, memories, sceneContext: { scene, arc, ...(previousScenes.length ? { previousScenes } : {}) }, facts, groupContext, chatCapabilities,
@@ -4283,7 +4612,7 @@ export class InterludeService extends Service {
     }
   }
 
-  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], audio: NarrativeAudio[] = [], chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>) {
+  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], audio: NarrativeAudio[] = [], chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>, historicalGroupImages: NarrativeHistoricalImage[] = []) {
     let immediateObservations: WebObservation[] = []
     let effectiveNow = now
     const automaticPhase = phase === 'advance' || phase === 'conversation-follow-up' || phase === 'intent-due'
@@ -4317,7 +4646,7 @@ export class InterludeService extends Service {
         if (committed) earlyReplyCommitted = true
         return committed
       } : undefined
-      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, [], false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan, earlyReply)
+      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, [], false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan, earlyReply, historicalGroupImages)
       const immediate = phase === 'user-message' && participant && !groupContext && this.browserConfig.enabled && this.browserConfig.mode === 'allow-immediate'
         ? decision.browserIntents?.map(intent => normalizeBrowserIntentDraft(intent, this.browserConfig)).find(intent => intent?.timing === 'immediate')
         : undefined
@@ -4330,7 +4659,7 @@ export class InterludeService extends Service {
         const observation = await this.collectWebObservation(story, immediate, participant.id, null, new Date(), false)
         immediateObservations = [observation]
         effectiveNow = new Date()
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, immediateObservations, false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan)
+        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, immediateObservations, false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan, undefined, historicalGroupImages)
       }
       // 用户自报的钟点（“八点赶到”）对守卫背书：模型复述它们不是时间越界。
       // 提取是 O(消息长度) 的本地正则，只在实况用户回合发生一次。
@@ -4357,7 +4686,7 @@ export class InterludeService extends Service {
         // 缺失"）；recoverySaved 在恢复稿通过校验后才计数（不是进入恢复就计）。
         if (initialVisibleRecovery) this.health?.recordStructureMissing(story.id)
         else if (initialTimeOverflow) { /* 时间越界不在此计数 */ }
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, immediateObservations, true, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan)
+        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, audio, immediateObservations, true, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan, undefined, historicalGroupImages)
         const recoveredTimeOverflow = detectLiveScriptTimeOverflow(decision.script, phase, from, effectiveNow, story.setting.timezone, endorsedClocks)
         if (recoveredTimeOverflow) throw new Error(`Narrative provider crossed the live time boundary after one recovery attempt: ${recoveredTimeOverflow}`)
         // 恢复成功 = 第二稿不再需要回复恢复。
@@ -4401,15 +4730,17 @@ export class InterludeService extends Service {
         Date.now() - startedAt, result.decision.script?.length ?? 0, visibleReplyMode(result.decision, phase, groupContext))
       this.health?.recordNarrativeComplete(story.id, Date.now() - startedAt, visibleReplyMode(result.decision, phase, groupContext))
       this.lastActiveStoryId = story.id
-      // 无可见回复的私聊回合打出最终 interaction（standard 级：文件日志可见，
-      // 远程排查能直接区分模型主动 none / 未读沉默 / 引用矛盾被重写前的形态）。
-      if (phase === 'user-message' && !groupContext && result.decision.interaction?.reply?.mode === 'none') {
+      // 无可见回复的私聊回合打出最终 interaction（P2-5：纳入 logScriptPreview
+      // 门控——JSON 里可能带 reply 草稿，不能绕过隐私开关；需要时与剧本预览
+      // 一起打开）。
+      if (phase === 'user-message' && !groupContext && result.decision.interaction?.reply?.mode === 'none' && this.config.logging?.logScriptPreview) {
         this.reportOperation('standard', 'info', story, phase, '本回合无可见回复 interaction=%s',
           safeJsonPreview(result.decision.interaction))
       }
       return result
     } catch (error) {
-      this.report('warn', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s', Date.now() - startedAt, error)
+      // P2-4：主叙事失败是最高优先级故障（角色无响应）——升 error 供运维告警。
+      this.report('error', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s', Date.now() - startedAt, error)
       this.health?.recordNarrativeFailed(story.id)
       return { decision: {}, succeeded: false, effectiveNow, immediateObservations, timelinePlan }
     }
@@ -4667,18 +4998,51 @@ export class InterludeService extends Service {
           // 每日上限（全模式）：防自然模式下的高频打扰；触顶不排重查，交由下一次推进自然判断。
           const dailyCap = Math.max(0, this.agencyConfig.proactiveDailyCap ?? 3)
           const capPasses = dailyCap <= 0 || countProactiveContactsInWindow(state.proactiveContactLog, agencyCandidate.participantId, now) < dailyCap
-          agencyAllowsSend = agencyCandidate.outcome === 'send-now' && capacity.allowed && willingnessPasses && capPasses
+          // M3/M4 endpoint policy belongs to the Agency decision boundary as
+          // well as the final delivery boundary.  The action is the only
+          // authoritative place where the model can explicitly choose a
+          // participant endpoint; when omitted, preserve the legacy most-active
+          // endpoint resolution and let the final sender perform the hard gate.
+          const agencyAction = decision.crossConversationActions.find(action =>
+            action.participantId === agencyCandidate!.participantId && action.mode === 'immediate')
+          const candidateEndpointId = agencyAction?.endpointId
+            ?? (agencyCandidate as unknown as { endpointId?: string }).endpointId
+          let agencyEndpointReason: string | undefined
+          let chosenEndpointId = candidateEndpointId
+          try {
+            await this.ensureEndpointRegistry()
+            if (!chosenEndpointId) chosenEndpointId = this.resolveMostActiveEndpointId(agencyCandidate.participantId)
+            if (chosenEndpointId) {
+              const gated = this.endpointForDelivery(chosenEndpointId, { kind: 'participant-user', id: agencyCandidate.participantId })
+              agencyEndpointReason = gated.reason
+              if (!agencyEndpointReason) agencyEndpointReason = this.endpointInitiateGateReason(chosenEndpointId)
+            }
+          } catch (error) {
+            agencyEndpointReason = 'endpoint-registry-unavailable'
+            this.reportOperation('diagnostic', 'warn', story, phase,
+              'Agency 端点注册表不可用，阻止主动联系 参与者=%s 端点=%s 错误=%s',
+              agencyCandidate.participantId, chosenEndpointId ?? '(legacy)', error)
+          }
+          if (agencyEndpointReason) {
+            // This is an operational route failure, not a character decision.
+            // Keep it visible and classified so it cannot be mistaken for
+            // willingness/capacity refusal in logs or recheck reasoning.
+            this.reportOperation('standard', 'warn', story, phase,
+              'Agency 端点门控阻止主动联系 参与者=%s 端点=%s 原因=%s',
+              agencyCandidate.participantId, chosenEndpointId ?? '(legacy)', agencyEndpointReason)
+          }
+          const agencyPolicyAllows = !agencyEndpointReason
+          agencyAllowsSend = agencyCandidate.outcome === 'send-now'
+            && capacity.allowed && willingnessPasses && capPasses && agencyPolicyAllows
           if (agencyAllowsSend) {
             // M3 §八：渠道选择审计——记录实际投递端点 + 通道级原因
-            const chosenEndpointId = (agencyCandidate as unknown as { endpointId?: string }).endpointId
-              ?? this.resolveMostActiveEndpointId(agencyCandidate.participantId)
             nextState.proactiveContactLog = appendProactiveContact(state.proactiveContactLog, agencyCandidate.participantId, now, chosenEndpointId)
           }
           if (!agencyAllowsSend && agencyCandidate.outcome !== 'let-go' && willingnessPasses && capPasses) {
             agencyRecheck = {
               candidate: agencyCandidate,
               window: agencyWindow,
-              reason: capacity.allowed ? 'model-requested-recheck' : capacity.reason,
+              reason: agencyEndpointReason ?? (capacity.allowed ? 'model-requested-recheck' : capacity.reason),
               at: proactiveRecheckAt(agencyCandidate, capacity, agencyWindow, now),
             }
           }
@@ -4686,7 +5050,7 @@ export class InterludeService extends Service {
             'Agency 主动联系判断 参与者=%s 结果=%s 原因=%s 意愿=%s 阈值=%s 模式=%s',
             agencyCandidate.participantId,
             agencyAllowsSend ? '立即联系' : agencyRecheck ? '稍后重查' : '自然放下',
-            capacity.reason,
+            agencyEndpointReason ?? capacity.reason,
             willingness.toFixed(2),
             willingnessThreshold.toFixed(2),
             this.agencyConfig.contactMode)
@@ -4738,17 +5102,19 @@ export class InterludeService extends Service {
     }
     if (participant && permitMessages && interaction?.reply?.mode === 'delayed' && interaction.reply.content && interaction.reply.sendAt) {
       const sendAt = new Date(interaction.reply.sendAt)
+      const delayedEndpointId = this.endpointRegistryReady ? this.resolveMostActiveEndpointId(participant.id) : undefined
       await this.appendIntent(story.id, {
         type: 'delayed-reply',
         summary: 'The character decided to send a delayed reply.',
         notBefore: interaction.reply.sendAt,
         payload: {
           content: interaction.reply.content,
+          ...(delayedEndpointId ? { endpointId: delayedEndpointId } : {}),
           userInitiated: phase === 'user-message',
           interaction: true,
           ...(commit
               ? scriptEventPayload(attachMessageEvent(
-                  { participantId: participant.id, content: interaction.reply.content },
+                  { participantId: participant.id, content: interaction.reply.content, ...(delayedEndpointId ? { endpointId: delayedEndpointId } : {}) },
                   findPrivateOutgoingMessageEvent(commit, participant.id, 'delayed', interaction.reply.content, this.config.runtime.messageSeparator),
                   scriptEntry?.id,
                 ))
@@ -4797,7 +5163,7 @@ export class InterludeService extends Service {
           // group sends, and keep the originating event for receipt projection.
           messages.push(attachMessageEvent({
             participantId: action.participantId, content: action.content, endpointId: action.endpointId, userInitiated: phase === 'user-message',
-          }, commit ? findPrivateOutgoingMessageEvent(commit, action.participantId, 'immediate', action.content, this.config.runtime.messageSeparator) : undefined, scriptEntry?.id))
+          }, commit ? findGroupScriptEvent(commit) : undefined, scriptEntry?.id))
           continue
         }
         // P2 Fix: 主动联系计数移到投递结果处——加入数组不等于发送成功。
@@ -4817,7 +5183,7 @@ export class InterludeService extends Service {
             willingness: action.willingness, reason: action.reason,
             ...(commit
               ? scriptEventPayload(attachMessageEvent(
-                  { participantId: action.participantId, content: action.content },
+                  { participantId: action.participantId, content: action.content, endpointId: action.endpointId },
                   findPrivateOutgoingMessageEvent(commit, action.participantId, 'delayed', action.content, this.config.runtime.messageSeparator),
                   scriptEntry?.id,
                 ))
@@ -4847,6 +5213,10 @@ export class InterludeService extends Service {
         this.reportStandalone('warn', 'Urge 调度交接保存失败，保留既有剧本与投递 错误=%s', error)
       }
     }
+    // 长线指导：剧本提交成功后异步扫描（不阻塞主回合）。DB 抖动沿浮动
+    // promise 逃逸会变成 unhandledRejection，必须就地吸收。
+    void this.longHorizonSweep(story, now).catch(error =>
+      this.reportStandalone('warn', '长线扫描失败，保留既有剧本与投递 错误=%s', error))
     return { messages: prepared, commit, scriptEntry }
   }
 
@@ -5503,11 +5873,13 @@ export class InterludeService extends Service {
           // arrived before this point sets interruptedTypingParticipants and
           // cancels the chain; input after this point cannot retract a message
           // whose adapter send has already begun.
+          const scriptEvent = restoreMessageEvent(intent.payload, content)
           const message: OutgoingMessageDraft = {
             participantId: participant.id,
             content,
             automaticDelivery,
-            scriptEvent: restoreMessageEvent(intent.payload, content),
+            ...(scriptEvent?.endpointId ? { endpointId: scriptEvent.endpointId } : {}),
+            scriptEvent,
           }
           const delivered = await this.sendOutgoingMessages(
             story,
@@ -5829,6 +6201,20 @@ export class InterludeService extends Service {
     const missingIds = ids.filter(id => !byId.has(id))
     const participants = await Promise.all(missingIds.map(id => this.getParticipant(id)))
     for (const participant of participants) if (participant) byId.set(participant.id, participant)
+    // Do not silently fall back to an arbitrary transport when the endpoint
+    // registry cannot be reconciled. Health gates only make sense after the
+    // persisted registry and snapshots are available.
+    try {
+      await this.ensureEndpointRegistry()
+    } catch (error) {
+      this.reportStandalone('warn', '出站端点注册表不可用，已阻止本批消息投递 错误=%s', error)
+      if (recordFailures) {
+        for (const message of messages) {
+          await this.recordOutgoingDeliveryFailure(story, message.participantId, message, 'endpoint-registry-unavailable')
+        }
+      }
+      return delivered
+    }
     let typingFloorApplied = false
     for (const message of messages) {
       if (message.participantId.startsWith('group:')) {
@@ -5863,8 +6249,70 @@ export class InterludeService extends Service {
         this.reportOperation('standard', 'info', story, 'user-message', '新消息打断主角输入，停止发送后续分段 参与者=%s', target.id)
         continue
       }
+      let attemptedAddress: { platform: string, selfId: string } | undefined
       try {
         this.reportOperation('standard', 'info', story, 'intent-due', '消息投递开始 参与者=%s', target.id)
+        const legacyAddress = this.endpointAddressSync({ platform: target.platform, selfId: target.selfId }, { kind: 'participant-user', id: target.id })
+        // Keep the distinction between a caller-selected route and the legacy
+        // default route.  The latter is still allowed to reuse the live
+        // incoming Session; assigning its resolved endpointId below must not
+        // accidentally turn an ordinary reply into a background delivery.
+        const explicitEndpointId = typeof message.endpointId === 'string' && message.endpointId.trim()
+          ? message.endpointId.trim() : undefined
+        const selectedEndpointId = explicitEndpointId ?? legacyAddress.endpointId
+        const endpointCandidate = selectedEndpointId
+          ? this.endpointRows.find(row => row.id === selectedEndpointId
+            && row.ownerKind === 'participant-user' && row.ownerId === target.id)
+          : undefined
+        const sessionMatchesCandidate = !endpointCandidate || (
+          String(session?.selfId ?? '') === String(endpointCandidate.selfId)
+          && (session?.platform === endpointCandidate.platform || isOneBotPlatform(String(session?.platform ?? '')) && isOneBotPlatform(endpointCandidate.platform))
+        )
+        // A live incoming Session is a current connection observation. Record
+        // it before the gate, otherwise the first immediate reply can be
+        // rejected as offline before the connector emits a lifecycle event.
+        if (session && current?.id === target.id && endpointCandidate && sessionMatchesCandidate) {
+          const previous = this.endpointStates.get(endpointCandidate.id) ?? freshEndpointState(endpointCandidate.id)
+          if (!previous.connection.online) this.setEndpointState(endpointCandidate.id, stateAfterConnection(previous, true))
+        }
+        const resolved = this.endpointForDelivery(selectedEndpointId, { kind: 'participant-user', id: target.id })
+        if (resolved.reason) {
+          this.report('warn', story, 'intent-due', '消息被端点门控阻止 参与者=%s 端点=%s 原因=%s', target.id, selectedEndpointId, resolved.reason)
+          if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, resolved.reason)
+          continue
+        }
+        const endpoint = resolved.row
+        const address = endpoint ? { platform: endpoint.platform, selfId: endpoint.selfId } : legacyAddress
+        attemptedAddress = address
+        if (endpoint && !explicitEndpointId) {
+          message.endpointId = endpoint.id
+          if (message.scriptEvent && !message.scriptEvent.endpointId) {
+            message.scriptEvent = { ...message.scriptEvent, endpointId: endpoint.id }
+          }
+        }
+        const sessionMatchesEndpoint = !endpoint || (
+          String(session?.selfId ?? '') === String(endpoint.selfId)
+          && (session?.platform === endpoint.platform || isOneBotPlatform(String(session?.platform ?? '')) && isOneBotPlatform(endpoint.platform))
+        )
+        const gateReason = endpoint ? this.endpointGateReason(endpoint.id) : undefined
+        if (gateReason) {
+          this.report('warn', story, 'intent-due', '消息被端点状态门控阻止 参与者=%s 端点=%s 原因=%s', target.id, endpoint.id, gateReason)
+          if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, gateReason)
+          continue
+        }
+        // User-triggered replies are not proactive contact.  Background,
+        // delayed, and Agency messages must also pass the channel-specific
+        // initiation gate when that transport exposes one (for example a
+        // WeChat context token).  QQ/OneBot endpoints have no optional
+        // initiate state and therefore retain the legacy behavior.
+        const initiateReason = message.userInitiated === true || !endpoint
+          ? undefined
+          : this.endpointInitiateGateReason(endpoint.id)
+        if (initiateReason) {
+          this.report('warn', story, 'intent-due', '消息被主动联系端点门控阻止 参与者=%s 端点=%s 原因=%s', target.id, endpoint?.id, initiateReason)
+          if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, initiateReason)
+          continue
+        }
         const literalQuoteMessageId = await this.resolveLiteralQuoteMessageId(story.id, target.id, message.content)
         const literalQuoteOnly = isLiteralQuoteOnly(message.content)
         if (literalQuoteOnly && !literalQuoteMessageId) {
@@ -5879,73 +6327,66 @@ export class InterludeService extends Service {
         if (this.config.logging?.logMessageContent) {
           this.report('info', story, 'intent-due', '主角消息内容：%s', message.content.slice(0, this.config.logging.previewLength))
         }
-        if (session && current?.id === target.id) {
+        if (!explicitEndpointId && session && current?.id === target.id && sessionMatchesEndpoint) {
           const receipt = await session.send(outgoingContent)
           if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
           // P2-5：即时会话投递成功同样刷新端点状态（与 bot/desktop 路径一致）。
-          this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'session-delivered', { platform: target.platform, selfId: target.selfId })
+          this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'session-delivered', address)
           delivered.push(message)
           continue
         }
+        // A private endpoint's user id is not necessarily a Koishi channel id.
+        // In particular, OneBot interprets a bare numeric channel as a group
+        // target, so delayed/split messages could be routed to send_group_msg
+        // even though the first live-session reply was sent privately.
+        const privateChannelId = privateDeliveryChannelId(
+          address.platform,
+          endpoint?.userId || target.userId,
+          endpoint?.channelId || target.channelId,
+        )
         if (this.desktopDeliveryHandler) {
           // typ-0 worker：没有 adapter bot，后台投递统一走宿主渠道。结果语义与
           // bot.sendMessage 一致——成功 resolve 进 delivered 由账本确认，失败
           // reject 进 catch 由 recordOutgoingDeliveryFailure 记录。
           const outcome = await this.desktopDeliveryHandler({
-            participantId: target.id, selfId: target.selfId, platform: target.platform,
-            channelId: target.channelId, kind: 'private', content: message.content,
+            participantId: target.id, selfId: address.selfId, platform: address.platform,
+            channelId: privateChannelId, kind: 'private', content: message.content,
             ...(message.quoteMessageId ? { quoteMessageId: message.quoteMessageId } : {}),
+            ...(selectedEndpointId ? { endpointId: selectedEndpointId } : {}),
+            ...(message.scriptEvent ? { intentKey: `${message.scriptEvent.eventId}:${message.scriptEvent.bubbleIndex}` } : {}),
           })
           if (outcome.ok) {
             // P2-9：桌面宿主投递成功同样刷新端点 deliverable 状态。
-            this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'desktop-delivered', { platform: target.platform, selfId: target.selfId })
+            this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'desktop-delivered', address)
             delivered.push(message)
           }
           else throw new Error(outcome.error || 'typ-0 宿主投递失败。')
           continue
         }
-        // M3 §八：显式端点优先——message.endpointId 指定时按该端点地址选 bot
-        if (message.endpointId) {
-          // A model-provided endpoint may only select one of this participant's
-          // registered user endpoints. Without the owner check, an arbitrary
-          // enabled story/group endpoint could be used to send to a private
-          // target under the wrong account.
-          const endpoint = this.endpointRows.find(row => row.id === message.endpointId
-            && row.enabled && row.ownerKind === 'participant-user' && row.ownerId === target.id)
-          if (endpoint) {
-            const exact = this.ctx.bots.find(item => String(item.selfId) === String(endpoint.selfId)
-              && (item.platform === endpoint.platform
-                || isOneBotPlatform(item.platform) && isOneBotPlatform(endpoint.platform)))
-            if (exact) {
-              try {
-                const receipt = await exact.sendMessage(target.channelId, outgoingContent)
-                if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
-                this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'endpoint-explicit', { platform: endpoint.platform, selfId: endpoint.selfId })
-                delivered.push(message)
-                continue
-              } catch (error) {
-                this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, false, String(error), { platform: endpoint.platform, selfId: endpoint.selfId })
-                this.report('warn', story, 'intent-due', '指定端点投递失败 参与者=%s 端点=%s 错误=%s', target.id, message.endpointId, error)
-                if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, `endpoint-error: ${String(error)}`)
-                continue
-              }
-            }
-          }
-          // 端点不存在或 bot 不在线——落入默认路径（不硬失败）
-        }
-        const bot = this.findBotForParticipant(target)
+        // The endpoint selected above is a hard route.  Once a caller/model has
+        // selected an endpoint, a missing bot or transport error must never
+        // fall back to another account and create a misleading delivery.
+        const bot = endpoint
+          ? this.ctx.bots.find(item => String(item.selfId) === String(endpoint.selfId)
+            && (item.platform === endpoint.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(endpoint.platform)))
+          : this.findBotForParticipant(target)
         if (!bot) {
           this.report('warn', story, 'intent-due', '没有可用机器人账号投递消息 参与者=%s', target.id)
           if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'bot-not-found')
           continue
         }
-        const receipt = await bot.sendMessage(target.channelId, outgoingContent)
+        const receipt = await bot.sendMessage(privateChannelId, outgoingContent)
         if (Array.isArray(receipt) && !receipt.length) throw new Error('Private transport returned no message receipt.')
-        this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, 'private-delivered', { platform: target.platform, selfId: target.selfId })
+        this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, true, endpoint ? 'endpoint-explicit' : 'private-delivered', address)
         delivered.push(message)
       } catch (error) {
-        this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
-        if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, `transport-error: ${String(error)}`)
+        // Keep the address selected for this attempt.  Re-resolving here can
+        // pick a different sibling endpoint after a failure and poison its
+        // cooldown/diagnostics in a multi-account story.
+        const address = attemptedAddress ?? this.endpointAddressSync({ platform: target.platform, selfId: target.selfId }, { kind: 'participant-user', id: target.id })
+        this.noteEndpointOutbound({ kind: 'participant-user', id: target.id }, false, String(error), address)
+        this.report('error', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
+        if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, `transport-failed: ${String(error)}`)
       }
     }
     return delivered
@@ -6135,10 +6576,11 @@ export class InterludeService extends Service {
   }
 
   private splitOutgoingMessage(content: string) {
-    if (this.config.runtime.splitReplyMessages === false) return [content]
-    const separator = this.config.runtime.messageSeparator?.trim() || '<sep/>'
-    if (!separator || !content.includes(separator)) return [content]
-    return content.split(separator).map(part => part.trim()).filter(Boolean)
+    return splitVisibleReplyBubbles(content, {
+      separator: this.config.runtime.messageSeparator?.trim() || '<sep/>',
+      splitEnabled: this.config.runtime.splitReplyMessages !== false,
+      newlineAsSeparator: this.config.runtime.convertNewlineToSeparator === true,
+    })
   }
 
   private typingDelayMilliseconds(nextSegment: string) {
@@ -6771,6 +7213,18 @@ export class InterludeService extends Service {
   /** 从当前在线的 OneBot（SnowLuma/NapCat）连接取通用动作调用口。
    * 指定 preferSelfId 时严格匹配该账号——空间动作落在别的 QQ 上比失败更糟。 */
   private qzoneCaller(preferSelfId?: string): QzoneActionCaller | undefined {
+    // W3（C2-3）：桌面桥接模式经动作代理——worker 内无 ctx.bots，qzone 动作由
+    // 宿主代调真实上游。accountKey = onebot:<selfId>（B2 多账号注册表路由）。
+    if (this.desktopOnebotActionHandler) {
+      const accountKey = 'onebot:' + String(preferSelfId ?? '').trim()
+      return async (action: string, params?: Record<string, unknown>) => {
+        const outcome = await this.desktopOnebotActionHandler!({ accountKey, action, params })
+        if (outcome.ok) return outcome.data
+        // ambiguous 语义对齐 QzoneActionError：可能已到达服务端 → 不自动重试。
+        const error = new QzoneActionError(outcome.error || `宿主动作代理失败：${outcome.errorCode ?? 'unknown'}`, action, undefined, outcome.ambiguous === true)
+        throw error
+      }
+    }
     const bot = preferSelfId
       ? this.ctx.bots.find(item => isOneBotPlatform(item.platform) && String(item.selfId) === String(preferSelfId))
       : this.ctx.bots.find(item => isOneBotPlatform(item.platform))
@@ -6924,7 +7378,10 @@ export class InterludeService extends Service {
       try {
         const raw = await callQzoneAction<{ feeds?: unknown[] }>(caller, 'get_qzone_feeds', { page_num: 1, count: 20 })
         feeds = (Array.isArray(raw.feeds) ? raw.feeds : []).map(item => normalizeQzoneFeedEntry(item, now)).filter((item): item is QzoneFeedEntry => !!item)
-      } catch { return }
+      } catch (error) {
+        // P1-2：feeds CGI 间歇失败跳过本轮，但必须可见（此前零日志）。
+        this.report('warn', story, 'advance', '好友动态列表拉取失败，本轮跳过 错误=%s', error)
+      }
       // 去重账本：feed-seen 行的 tid 即 feeds.key（7 天窗足够覆盖时间窗的双倍）。
       const seenRows = (await this.dbGet('interlude_qzone_post', { kind: 'feed-seen', createdAt: { $gte: new Date(now.getTime() - 7 * 24 * Time.hour) } })) as unknown as QzonePostRecord[]
       const seenKeys = new Set(seenRows.map(row => String(row.tid ?? '')).filter(Boolean))
@@ -6934,21 +7391,113 @@ export class InterludeService extends Service {
           const listRaw = await callQzoneAction<{ msglist?: unknown[] }>(caller, 'get_qzone_msg_list', { target_uin: Number(feed.uin), num: 5 })
           const entries = (Array.isArray(listRaw.msglist) ? listRaw.msglist : []).map(item => normalizeQzoneMsgEntry(item)).filter((item): item is NonNullable<typeof item> => !!item)
           content = matchQzoneFeedContent(entries, feed)
-        } catch { /* 正文拉取失败按元数据处理 */ }
+        } catch (error) {
+          // 正文拉取失败按元数据处理，但必须可见。
+          this.reportOperation('diagnostic', 'debug', story, 'advance', '好友动态正文拉取失败，按元数据入账 uin=%s 错误=%s', feed.uin, error)
+        }
         const owner = feed.nickname || `QQ ${feed.uin}`
-        await this.appendEntry(story.id, {
-          kind: 'friend-feed', actor: 'system',
-          content: `[好友动态] ${owner}发布了说说${content ? `：${clip(content, 80)}` : ''}`,
-          occurredAt: feed.time.toISOString(),
-          metadata: { qzoneFeedKey: feed.key, qzoneFeedUin: feed.uin, qzoneFeedNickname: feed.nickname },
-        }, now)
-        await this.dbCreate('interlude_qzone_post', { storyId: story.id, kind: 'feed-seen', tid: feed.key, targetUin: feed.uin, ...(sweepEndpointId ? { endpointId: sweepEndpointId } : {}), content: feed.nickname.slice(0, 100), status: 'confirmed', createdAt: now })
+        // P1-2：先落 feed-seen 账本再写条目——账本失败则本轮跳过该条（下轮
+        // 重新发现），杜绝"条目已写、账本未落"造成的重复 [好友动态] 入账。
+        try {
+          await this.dbCreate('interlude_qzone_post', { storyId: story.id, kind: 'feed-seen', tid: feed.key, targetUin: feed.uin, ...(sweepEndpointId ? { endpointId: sweepEndpointId } : {}), content: feed.nickname.slice(0, 100), status: 'confirmed', createdAt: now })
+        } catch (error) {
+          this.report('warn', story, 'advance', '好友动态账本写入失败，该条延后到下轮 key=%s 错误=%s', feed.key, error)
+          continue
+        }
+        try {
+          await this.appendEntry(story.id, {
+            kind: 'friend-feed', actor: 'system',
+            content: `[好友动态] ${owner}发布了说说${content ? `：${clip(content, 80)}` : ''}`,
+            occurredAt: feed.time.toISOString(),
+            metadata: { qzoneFeedKey: feed.key, qzoneFeedUin: feed.uin, qzoneFeedNickname: feed.nickname },
+          }, now)
+        } catch (error) {
+          // 账本已落：条目失败即该动态让位（不回滚账本），只留日志。
+          this.report('warn', story, 'advance', '好友动态条目写入失败，该动态让位 key=%s 错误=%s', feed.key, error)
+          continue
+        }
         this.reportOperation('diagnostic', 'debug', story, 'advance', '好友动态已入账 归属=%s 正文=%s', owner, content ? '有' : '无')
       }
+      await this.qzoneReactionSweep(story, caller, sweepAddress, now)
     } catch (error) {
       this.reportStandalone('warn', 'QQ 空间动态轮询失败 错误=%s', error)
     } finally {
       this.qzoneFeedSweepRunning = false
+    }
+  }
+
+  /** 被评论感知：她的说说评论数增量轮询。感知零动作配额；产出 [空间动态] 条目
+   * （ SOCIAL SURFACE 规则现成，零提示词改动），由下一次推进（自动或对话）自然
+   * 携带——轮询本身绝不调度推进（用户要求：被赞不立即开 advance）。 */
+  private async qzoneReactionSweep(
+    story: InterludeStory,
+    caller: QzoneActionCaller,
+    address: { platform: string, selfId: string },
+    now: Date,
+  ) {
+    const posts = (await this.dbGet('interlude_qzone_post', {
+      storyId: story.id, kind: 'post', status: 'confirmed',
+      createdAt: { $gte: new Date(now.getTime() - 7 * 24 * Time.hour) },
+    })) as unknown as QzonePostRecord[]
+    const tracked = posts.filter(row => String(row.tid ?? '').trim())
+    if (!tracked.length) return
+    let entries: QzoneMsgEntry[] = []
+    try {
+      const raw = await callQzoneAction<{ msglist?: unknown[] }>(caller, 'get_qzone_msg_list', { target_uin: Number(address.selfId), num: 10 })
+      entries = (Array.isArray(raw.msglist) ? raw.msglist : []).map(item => normalizeQzoneMsgEntry(item)).filter((item): item is QzoneMsgEntry => !!item)
+    } catch (error) {
+      // P1-2：拉取失败基线不动、下轮重试，但必须可见（此前零日志）。
+      this.report('warn', story, 'advance', '被评论列表拉取失败，本轮感知跳过 错误=%s', error)
+      return
+    }
+    const { deltas, baselines } = qzoneReactionDeltas(tracked, entries)
+    // 无增量的帖子照常推进基线（含 commentNum 为 null 的首次观察初始化——
+    // 跳过会让该帖增量感知永久失效）；有增量的帖子留给下方逐条提交处理。
+    const deltaTids = new Set(deltas.map(delta => delta.tid))
+    for (const baseline of baselines) {
+      if (deltaTids.has(baseline.tid)) continue
+      const row = tracked.find(post => String(post.tid ?? '') === baseline.tid)
+      if (row?.id !== undefined && (row.commentNum ?? null) !== baseline.commentNum) {
+        await this.dbSet('interlude_qzone_post', { id: row.id }, { commentNum: baseline.commentNum })
+          .catch(error => this.report('warn', story, 'advance', '被评论基线初始化失败（不影响本轮感知） tid=%s 错误=%s', baseline.tid, error))
+      }
+    }
+    // P1-2：逐条提交——先推进该帖基线再写感知条目。单轮预算 3 条之外的
+    // delta 不推进基线（下轮重新发现），杜绝"第 4 条起永久丢失"；基线回写
+    // 失败则本轮中止（不写条目），杜绝"旧基线重算出相同 delta 的重复入账"。
+    const reactionBudget = 3
+    let accounted = 0
+    let accountedNew = 0
+    let processed = 0
+    for (const delta of deltas) {
+      if (accounted >= reactionBudget) break
+      processed += 1
+      const baseline = baselines.find(item => item.tid === delta.tid)
+      const row = tracked.find(post => String(post.tid ?? '') === delta.tid)
+      if (!baseline || row?.id === undefined) continue
+      try {
+        await this.dbSet('interlude_qzone_post', { id: row.id }, { commentNum: baseline.commentNum })
+      } catch (error) {
+        this.report('warn', story, 'advance', '被评论基线回写失败，本轮感知中止（下轮重算） tid=%s 错误=%s', delta.tid, error)
+        break
+      }
+      const excerpt = clip(delta.contentExcerpt, 24)
+      try {
+        await this.appendEntry(story.id, {
+          kind: 'friend-feed', actor: 'system',
+          content: `[空间动态] 她的说说${excerpt ? `「${excerpt}」` : ''}收到了 ${delta.current - delta.previous} 条新评论（累计 ${delta.current} 条）`,
+          occurredAt: now.toISOString(),
+          metadata: { qzoneTid: delta.tid, qzoneReactions: { previous: delta.previous, current: delta.current } },
+        }, now)
+        accounted += 1
+        accountedNew += delta.current - delta.previous
+      } catch (error) {
+        // 基线已推进：该增量让位（不回滚基线，避免重复入账），只留日志。
+        this.report('warn', story, 'advance', '被评论感知条目写入失败，该增量让位 tid=%s 错误=%s', delta.tid, error)
+      }
+    }
+    if (deltas.length) {
+      this.reportOperation('diagnostic', 'debug', story, 'advance', '被评论感知已入账 新评论=%d 入账帖数=%d/%d（预算 %d）', accountedNew, accounted, deltas.length, reactionBudget)
     }
   }
 
@@ -6969,6 +7518,71 @@ export class InterludeService extends Service {
     return run
   }
 
+  /** Keep health snapshots durable without making connector lifecycle writes part of
+   * the message transaction. The global DB writer still serializes physical writes. */
+  private persistEndpointState(endpointId: string, state: EndpointState) {
+    const run = this.endpointStateWriteQueue.then(async () => {
+      const now = new Date()
+      const existing = await this.dbGet('interlude_endpoint_state', { endpointId }, { limit: 1 })
+      if (existing.length) {
+        await this.dbSet('interlude_endpoint_state', { endpointId }, { state, updatedAt: now })
+      } else {
+        await this.dbCreate('interlude_endpoint_state', { endpointId, state, updatedAt: now })
+      }
+    }, async () => {
+      const now = new Date()
+      const existing = await this.dbGet('interlude_endpoint_state', { endpointId }, { limit: 1 })
+      if (existing.length) await this.dbSet('interlude_endpoint_state', { endpointId }, { state, updatedAt: now })
+      else await this.dbCreate('interlude_endpoint_state', { endpointId, state, updatedAt: now })
+    })
+    this.endpointStateWriteQueue = run.catch(() => undefined)
+    void run.catch(error => this.reportStandalone('warn', '端点状态快照写入失败（不影响连接/投递） 端点=%s 错误=%s', endpointId, error))
+  }
+
+  private setEndpointState(endpointId: string, state: EndpointState) {
+    this.endpointStates.set(endpointId, state)
+    this.persistEndpointState(endpointId, state)
+  }
+
+  private endpointGateReason(endpointId: string | undefined, now = Date.now()): string | undefined {
+    if (!endpointId || !this.endpointRegistryReady) return undefined
+    const endpoint = this.endpointRows.find(row => row.id === endpointId)
+    if (!endpoint) return 'endpoint-not-found'
+    if (!endpoint.enabled) return 'endpoint-disabled'
+    const state = this.endpointStates.get(endpointId)
+    if (!state || !state.connection.online) return 'endpoint-offline'
+    if (state.deliverable.cooldownUntil && now < state.deliverable.cooldownUntil) return 'endpoint-cooldown'
+    if (!isEndpointDeliverable(state, now)) {
+      return state.deliverable.allowed ? 'endpoint-state-expired' : 'endpoint-not-deliverable'
+    }
+    return undefined
+  }
+
+  /**
+   * Agency uses the normal delivery gate plus the optional channel-specific
+   * initiation gate.  EndpointState.initiate is intentionally optional: QQ
+   * and other transports without a context-token concept remain compatible
+   * with the historical proactive path, while a present-but-expired token is
+   * a hard, explicitly classified failure.
+   */
+  private endpointInitiateGateReason(endpointId: string | undefined, now = Date.now()): string | undefined {
+    const deliveryReason = this.endpointGateReason(endpointId, now)
+    if (deliveryReason || !endpointId || !this.endpointRegistryReady) return deliveryReason
+    const state = this.endpointStates.get(endpointId)
+    if (!state?.initiate) return undefined
+    if (state.initiate.expiresAt !== undefined && now >= state.initiate.expiresAt) return 'endpoint-state-expired'
+    return isEndpointInitiateAllowed(state, now) ? undefined : 'endpoint-initiate-forbidden'
+  }
+
+  private endpointForDelivery(endpointId: string | undefined, owner: { kind: 'story-role' | 'participant-user' | 'group', id: string }, now = Date.now()): { row?: EndpointRow, reason?: string } {
+    if (!endpointId) return {}
+    const row = this.endpointRows.find(item => item.id === endpointId)
+    if (!row) return { reason: 'endpoint-not-found' }
+    if (row.ownerKind !== owner.kind || row.ownerId !== owner.id) return { reason: 'endpoint-not-found' }
+    const reason = this.endpointGateReason(endpointId, now)
+    return reason ? { reason } : { row }
+  }
+
   private async ensureEndpointRegistry() {
     if (this.endpointRegistryReady) return
     if (this.endpointRegistryInFlight) return this.endpointRegistryInFlight
@@ -6981,6 +7595,13 @@ export class InterludeService extends Service {
     const now = new Date()
     const existing = (((await this.dbGet('interlude_endpoint', {})) as unknown[]) ?? [])
       .map(row => normalizeEndpointRow(row)).filter((row): row is EndpointRow => !!row)
+    const stateRows = (((await this.dbGet('interlude_endpoint_state', {})) as unknown[]) ?? [])
+    const persistedStates = new Map<string, EndpointState>()
+    for (const raw of stateRows) {
+      const endpointId = String((raw as any)?.endpointId ?? '').trim()
+      const state = normalizeEndpointState(raw)
+      if (endpointId && state) persistedStates.set(endpointId, state)
+    }
     const byKey = new Map(existing.map(row => [endpointUniqueKey(row), row]))
     const drafts: EndpointRow[] = []
     const addDraft = (draft: EndpointRow) => {
@@ -7014,7 +7635,9 @@ export class InterludeService extends Service {
     if (persisted.length) this.reportStandaloneOperation('diagnostic', 'debug', '端点注册表迁移完成 新增=%d/%d 总数=%d', persisted.length, drafts.length, existing.length + persisted.length)
     this.endpointRows = [...existing, ...persisted]
     for (const row of this.endpointRows) {
-      if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+      if (!this.endpointStates.has(row.id)) {
+        this.setEndpointState(row.id, restoreEndpointState(row.id, persistedStates.get(row.id)))
+      }
     }
     // M1b：剧本别名迁移（与端点同一幂等通道）——为每个故事登记"按账号推导的
     // ID → 既有剧本 ID"。故事主键保持不动（即冻结的稳定角色 ID），推导形态
@@ -7051,7 +7674,7 @@ export class InterludeService extends Service {
         const row: EndpointRow = { ...draft, id: randomUUID() }
         await this.dbCreate('interlude_endpoint', row)
         this.endpointRows.push(row)
-        if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+        if (!this.endpointStates.has(row.id)) this.setEndpointState(row.id, freshEndpointState(row.id))
         await this.recordStoryAlias(storyIdForCharacter(story.platform, story.selfId), story.id, 'story-created', false)
       } catch (error) {
         this.endpointRegistryReady = false
@@ -7070,7 +7693,7 @@ export class InterludeService extends Service {
         const row: EndpointRow = { ...draft, id: randomUUID() }
         await this.dbCreate('interlude_endpoint', row)
         this.endpointRows.push(row)
-        if (!this.endpointStates.has(row.id)) this.endpointStates.set(row.id, freshEndpointState(row.id))
+        if (!this.endpointStates.has(row.id)) this.setEndpointState(row.id, freshEndpointState(row.id))
       } catch (error) {
         this.endpointRegistryReady = false
         this.reportStandalone('warn', '参与者端点登记失败，注册表已置脏待重试 参与者=%s 错误=%s', participant.id, error)
@@ -7194,7 +7817,7 @@ export class InterludeService extends Service {
         return { ok: false, error: `写入失败：${error instanceof Error ? error.message : String(error)}` }
       }
       this.endpointRows.push(row)
-      this.endpointStates.set(row.id, freshEndpointState(row.id))
+      this.setEndpointState(row.id, freshEndpointState(row.id))
     // 第二端点的推导 ID 同步登记别名——其消息经 M1b 重定向直达本故事。
     await this.recordStoryAlias(storyIdForCharacter(platform, account), story.id, 'endpoint-added', false)
     await this.appendEntry(story.id, {
@@ -7307,7 +7930,7 @@ export class InterludeService extends Service {
       return { ok: false, error: `写入失败：${error instanceof Error ? error.message : String(error)}` }
     }
     this.endpointRows.push(row)
-    this.endpointStates.set(row.id, freshEndpointState(row.id))
+    this.setEndpointState(row.id, freshEndpointState(row.id))
     await this.appendEntry(participant.storyId, {
       kind: 'system', actor: 'system',
       content: `[通道迁移] 用户端点已链接：${platform} ${account} → 参与者 ${participant.displayName || participant.id}`,
@@ -7390,7 +8013,7 @@ export class InterludeService extends Service {
     for (const endpoint of [resolution.roleEndpoint, resolution.userEndpoint, resolution.groupEndpoint]) {
       if (!endpoint) continue
       const previous = this.endpointStates.get(endpoint.id) ?? freshEndpointState(endpoint.id, now)
-      this.endpointStates.set(endpoint.id, stateAfterInbound(previous, now))
+      this.setEndpointState(endpoint.id, stateAfterInbound(previous, now))
     }
   }
 
@@ -7400,7 +8023,7 @@ export class InterludeService extends Service {
     for (const row of this.endpointRows) {
       if (row.accountKey !== accountKey) continue
       const previous = this.endpointStates.get(row.id) ?? freshEndpointState(row.id, now)
-      this.endpointStates.set(row.id, stateAfterConnection(previous, online, now))
+      this.setEndpointState(row.id, stateAfterConnection(previous, online, now))
     }
   }
 
@@ -7451,7 +8074,7 @@ export class InterludeService extends Service {
       if (row.ownerKind !== owner.kind || row.ownerId !== owner.id) continue
       if (address && (row.platform !== address.platform || String(row.selfId) !== String(address.selfId))) continue
       const previous = this.endpointStates.get(row.id) ?? freshEndpointState(row.id, now)
-      this.endpointStates.set(row.id, stateAfterOutbound(previous, ok, note, ok ? 0 : 5 * 60_000, now))
+      this.setEndpointState(row.id, stateAfterOutbound(previous, ok, note, ok ? 0 : 5 * 60_000, now))
     }
   }
 
@@ -7664,6 +8287,302 @@ export class InterludeService extends Service {
     return normalizeSchedulePreplanRecord(row)
   }
 
+  // ── Long-Horizon Narrative Guidance（Narrative Attractor）────────────────
+  private longHorizonConfig = resolveLongHorizonConfig(undefined)
+  private longHorizonSweepRunning = new Set<string>()
+  private longHorizonLastScore = new Map<string, number>()
+  private longHorizonGenerationRunning = new Set<string>()
+  /** Story ids whose active guidance row has already been loaded for this process. */
+  private longHorizonGuidanceLoaded = new Set<string>()
+
+  private async longHorizonSweep(story: InterludeStory, _now?: Date) {
+    if (!this.longHorizonConfig.enabled || this.longHorizonSweepRunning.has(story.id) || this.longHorizonGenerationRunning.has(story.id)) return
+    this.longHorizonSweepRunning.add(story.id)
+    try {
+      const progress = await this.longHorizonProgress(story.id)
+      const lastEntryId = progress?.lastCountedEntryId ?? 0
+      const entries = (await this.dbGet('interlude_script_entry', {
+        storyId: story.id, id: { $gt: lastEntryId },
+      }, { sort: { id: 'asc' }, limit: 500 })) as unknown as ScriptEntry[]
+      if (!entries.length) return
+
+      const score = calculateLongHorizonScore(entries, this.longHorizonConfig)
+      const lastScannedEntryId = Math.max(...entries.map(entry => Number(entry.id) || 0), lastEntryId)
+      const total = (progress?.totalScore ?? 0) + score.totalScore
+      const cumulative = {
+        storyId: story.id,
+        lastCountedEntryId: lastScannedEntryId,
+        totalScore: total,
+        privateCount: (progress?.privateCount ?? 0) + score.privateCount,
+        privateScore: (progress?.privateScore ?? 0) + score.privateScore,
+        groupCount: (progress?.groupCount ?? 0) + score.groupCount,
+        groupScore: (progress?.groupScore ?? 0) + score.groupScore,
+        unknownCount: (progress?.unknownCount ?? 0) + score.unknownCount,
+        lastGenerationScore: progress?.lastGenerationScore ?? 0,
+        lastGenerationEntryId: progress?.lastGenerationEntryId ?? 0,
+        updatedAt: new Date(),
+      } satisfies LongArcProgressRow
+      await this.saveLongHorizonProgress(cumulative)
+      this.longHorizonLastScore.set(story.id, total)
+
+      const active = await this.getActiveLongArcGuidance(story.id)
+      const lastGen = cumulative.lastGenerationScore
+      const trigger = shouldTriggerLongHorizon(
+        { ...score, totalScore: total },
+        active, lastGen, this.longHorizonConfig,
+      )
+      if (!trigger.trigger) return
+      this.reportOperation('diagnostic', 'debug', story, 'advance',
+        '长线指导触发 原因=%s 总分=%.1f 私聊=%.1f 群聊=%.1f', trigger.reason, total, cumulative.privateScore, cumulative.groupScore)
+      this.longHorizonGenerationRunning.add(story.id)
+      void this.longHorizonGenerate(story, entries, total, cumulative).catch(error =>
+        this.reportStandalone('warn', '长线指导生成失败 错误=%s', error)).finally(() =>
+          this.longHorizonGenerationRunning.delete(story.id))
+    } finally {
+      this.longHorizonSweepRunning.delete(story.id)
+    }
+  }
+
+  private async longHorizonProgress(storyId: string): Promise<LongArcProgressRow | undefined> {
+    const rows = await this.dbGet('interlude_long_arc_progress', { storyId }, { limit: 1 }) as unknown as LongArcProgressRow[]
+    return rows[0]
+  }
+
+  private async saveLongHorizonProgress(progress: LongArcProgressRow) {
+    const existing = await this.dbGet('interlude_long_arc_progress', { storyId: progress.storyId }, { limit: 1 })
+    if (existing.length) {
+      await this.dbSet('interlude_long_arc_progress', { storyId: progress.storyId }, progress)
+    } else {
+      await this.dbCreate('interlude_long_arc_progress', progress)
+    }
+  }
+
+  private async getActiveLongArcGuidance(storyId: string): Promise<LongArcGuidanceRecord | undefined> {
+    const rows = (await this.dbGet('interlude_long_arc_guidance', { storyId, status: 'active' }, { sort: { version: 'desc' }, limit: 1 })) as unknown as Array<Record<string, unknown>>
+    const active = rows[0] as unknown as LongArcGuidanceRecord | undefined
+    if (!active) return undefined
+    const expiresAt = toDate(active.expiresAt)
+    if (expiresAt && expiresAt.getTime() <= Date.now()) {
+      // Expiration is a lifecycle transition, not merely a prompt-time filter:
+      // an expired row must no longer block the next first-trigger generation.
+      if (active.id !== undefined) {
+        await this.dbSet('interlude_long_arc_guidance', { id: active.id }, { status: 'expired', updatedAt: new Date() })
+      }
+      this.activeLongArcGuidanceCache.delete(storyId)
+      return undefined
+    }
+    return active
+  }
+
+  private async ensureLongHorizonGuidanceLoaded(storyId: string) {
+    if (!this.longHorizonConfig.enabled || this.longHorizonGuidanceLoaded.has(storyId)) return
+    const active = await this.getActiveLongArcGuidance(storyId)
+    if (active) this.activeLongArcGuidanceCache.set(storyId, active)
+    this.longHorizonGuidanceLoaded.add(storyId)
+  }
+
+  private async longHorizonGenerate(story: InterludeStory, evidence: ScriptEntry[], currentScore: number, progress: LongArcProgressRow) {
+    const config = this.longHorizonConfig
+    // The accumulator is story-level, but privacy is still enforced at the
+    // boundary of the background model. When participant details are disabled,
+    // only global entries may cross this boundary; the score itself remains
+    // unchanged and still counts private entries at full weight.
+    const primaryParticipantId = participantIdForStory(story.id, story.platform, story.selfId, story.userId)
+    const isVisibleToLongHorizon = (entry: Pick<ScriptEntry, 'participantId'>) =>
+      this.sharedStoryConfig.shareParticipantDetails
+      || !entry.participantId
+      || entry.participantId === primaryParticipantId
+    const eligible = evidence.filter(entry => isEligibleNarrativeEntry(entry) && isVisibleToLongHorizon(entry))
+    if (!eligible.length) return
+    // 构造模型输入（分层：设定 + 关系 + 近期剧本 + 新增证据 + 有界历史代表证据）
+    const input = await this.longHorizonInput(story, eligible)
+    // The model may cite either this review window or the bounded historical
+    // sample supplied by longHorizonInput. Both sets are host-validated below.
+    const historicalIds = Array.isArray((input as any).historicalEvidence)
+      ? (input as any).historicalEvidence.map((item: any) => Number(item?.id)).filter((id: number) => Number.isSafeInteger(id) && id > 0)
+      : []
+    const validIds = new Set([...eligible.map(entry => entry.id), ...historicalIds])
+    // 调用长线模型（复用 compaction route）
+    const output = await this.compactor.planLongArcGuidance?.(input)
+    if (!output) return
+    const result = normalizeLongArcDecision(output, validIds, config)
+    if (!result) {
+      this.reportStandaloneOperation('diagnostic', 'warn', '长线指导输出被归一化拒绝（决策/证据引用/催化结构不合法）')
+      return
+    }
+    const triggerEntryId = eligible[eligible.length - 1].id
+    // A dormant review is a valid no-write decision. It advances the review
+    // baseline, but must not supersede an already useful active catalyst.
+    if (result.decision === 'dormant' || !result.payload) {
+      await this.saveLongHorizonProgress({ ...progress, totalScore: currentScore, lastGenerationScore: currentScore, lastGenerationEntryId: triggerEntryId, updatedAt: new Date() })
+      this.longHorizonLastScore.set(story.id + ':gen', currentScore)
+      this.reportOperation('diagnostic', 'debug', story, 'advance',
+        '长线指导本轮保持休眠：%s', result.reason ?? '当前没有适合播种的长期发展可能性')
+      return
+    }
+    const payload = result.payload
+    // 版本链：只有新的催化方向通过校验后才 supersede 旧 active。
+    const active = await this.getActiveLongArcGuidance(story.id)
+    if (active?.id !== undefined) {
+      await this.dbSet('interlude_long_arc_guidance', { id: active.id }, { status: 'superseded', updatedAt: new Date() })
+    }
+    const latestRows = await this.dbGet('interlude_long_arc_guidance', { storyId: story.id }, { sort: { version: 'desc' }, limit: 1 }) as Array<{ version?: unknown }>
+    const nextVersion = Number(latestRows[0]?.version ?? active?.version ?? 0) + 1
+    const now = new Date()
+    await this.dbCreate('interlude_long_arc_guidance', {
+      storyId: story.id, version: nextVersion, status: 'active',
+      title: payload.title, premise: payload.premise, direction: payload.direction,
+      payload, currentStage: payload.currentStage.id, intensity: payload.intensity,
+      confidence: payload.confidence,
+      triggerEntryId,
+      evidenceEntryIds: payload.evidenceEntryIds,
+      ...(active?.id !== undefined ? { supersedesId: active.id } : {}),
+      createdAt: now, updatedAt: now,
+    })
+    await this.saveLongHorizonProgress({ ...progress, totalScore: currentScore, lastGenerationScore: currentScore, lastGenerationEntryId: triggerEntryId, updatedAt: new Date() })
+    this.longHorizonLastScore.set(story.id + ':gen', currentScore)
+    const created = await this.getActiveLongArcGuidance(story.id)
+    if (created) this.activeLongArcGuidanceCache.set(story.id, created)
+    this.reportOperation('standard', 'info', story, 'advance',
+      '长线指导已生成 版本=%d 决策=%s 阶段=%s 标题=%s 置信度=%.2f', nextVersion, result.decision, payload.currentStage.name, payload.title, payload.confidence)
+  }
+
+  private async longHorizonInput(story: InterludeStory, eligible: ScriptEntry[]): Promise<Record<string, unknown>> {
+    const state = decodeStoryState(story.state)
+    const [recentEntries, historicalEntries, arcs, progress, participants, facts, active] = await Promise.all([
+      this.recentEntriesForPrompt(story.id, new Date()),
+      this.dbGet('interlude_script_entry', { storyId: story.id }, { sort: { id: 'desc' }, limit: 120 }),
+      this.dbGet('interlude_arc', { storyId: story.id, status: 'active' }),
+      this.longHorizonProgress(story.id),
+      this.dbGet('interlude_participant', { storyId: story.id, status: 'active' }, { limit: 12, sort: { updatedAt: 'desc' } }),
+      this.dbGet('interlude_fact', { storyId: story.id, status: 'active' }, { limit: 24, sort: { importance: 'desc', updatedAt: 'desc' } }),
+      this.getActiveLongArcGuidance(story.id),
+    ])
+    const primaryParticipantId = participantIdForStory(story.id, story.platform, story.selfId, story.userId)
+    const isVisibleToLongHorizon = (value: { participantId?: unknown }) =>
+      this.sharedStoryConfig.shareParticipantDetails
+      || !value.participantId
+      || value.participantId === primaryParticipantId
+    const visibleRecentEntries = recentEntries.filter(isVisibleToLongHorizon)
+    const visibleHistoricalEntries = (historicalEntries as unknown as ScriptEntry[])
+      .filter(entry => isVisibleToLongHorizon(entry) && isEligibleNarrativeEntry(entry))
+      .sort((left, right) => Number(left.id) - Number(right.id))
+    const visibleFacts = (facts as any[]).filter(isVisibleToLongHorizon)
+    const recentScript = visibleRecentEntries.slice(-30).map(entry => ({
+      kind: entry.kind, actor: entry.actor,
+      content: String(entry.content ?? '').slice(0, 300),
+      occurredAt: entry.occurredAt.toISOString(),
+    }))
+    const evidenceSample = eligible.slice(-20).map(entry => ({
+      id: entry.id, kind: entry.kind,
+      content: String(entry.content ?? '').slice(0, 400),
+    }))
+    return {
+      storySetting: {
+        characterName: story.setting.character?.name ?? '',
+        characterProfile: (story.setting.character?.profile ?? '').slice(0, 800),
+        userProfile: (story.setting.user?.profile ?? '').slice(0, 500),
+        relationship: (story.setting.relationship ?? '').slice(0, 800),
+        world: (story.setting.world ?? '').slice(0, 800),
+        perspective: story.setting.perspective ?? '',
+      },
+      overlay: state.settingOverlay ?? {},
+      currentArcs: (arcs as any[])?.map?.((arc: any) => ({ id: arc.id, summary: String(arc.summary ?? '').slice(0, 500) })) ?? [],
+      participants: this.sharedStoryConfig.shareParticipantDetails
+        ? (participants as any[]).map((participant: any) => ({ id: participant.id, displayName: participant.displayName, relationship: String(participant.relationship ?? '').slice(0, 500), state: participant.state }))
+        : [],
+      durableFacts: visibleFacts.map((fact: any) => ({ scope: fact.scope, participantId: fact.participantId, content: String(fact.content ?? '').slice(0, 500), importance: fact.importance, confidence: fact.confidence })),
+      activeGuidance: active ? {
+        version: active.version,
+        title: active.title,
+        direction: active.direction,
+        premise: active.premise,
+        currentStage: active.currentStage,
+        developmentPhase: (active.payload as any)?.developmentPhase ?? 'active',
+        latentTension: (active.payload as any)?.latentTension ?? '',
+        firstExpression: (active.payload as any)?.firstExpression ?? null,
+        responseBranches: (active.payload as any)?.responseBranches ?? null,
+      } : null,
+      weightedScore: {
+        total: progress?.totalScore ?? this.longHorizonLastScore.get(story.id) ?? 0,
+        privateCount: progress?.privateCount ?? 0,
+        privateScore: progress?.privateScore ?? 0,
+        groupCount: progress?.groupCount ?? 0,
+        groupScore: progress?.groupScore ?? 0,
+        unknownCount: progress?.unknownCount ?? 0,
+      },
+      recentScript,
+      keyEvidence: evidenceSample,
+      // A bounded historical sample prevents review cycles from forgetting
+      // the relationship patterns that motivated the catalyst in the first
+      // place, while keeping privacy and prompt-size limits host-owned.
+      historicalEvidence: visibleHistoricalEntries.slice(-60).map(entry => ({
+        id: entry.id, kind: entry.kind,
+        content: String(entry.content ?? '').slice(0, 400),
+      })),
+      intensity: this.longHorizonConfig.intensity,
+      privacy: {
+        shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
+        participantScopedEvidenceIncluded: this.sharedStoryConfig.shareParticipantDetails || !!primaryParticipantId,
+        otherParticipantEvidenceExcluded: !this.sharedStoryConfig.shareParticipantDetails,
+      },
+    }
+  }
+
+  /** 主叙事注入用的裁剪投影：催化器只提供行动许可，不提供强制剧情。 */
+  longHorizonPromptProjection(storyId: string): string | undefined {
+    const active = this.activeLongArcGuidanceCache.get(storyId)
+    if (!active || active.status !== 'active') return undefined
+    if (active.expiresAt && active.expiresAt.getTime() <= Date.now()) return undefined
+    const payload = active.payload as any
+    if (!payload) return undefined
+    const stage = (payload.stages ?? []).find((item: any) => item.id === payload.currentStage?.id) ?? payload.stages?.[0]
+    if (!stage) return undefined
+    const phase = payload.developmentPhase === 'primed' ? 'primed' : 'active'
+    const signals = (stage.allowedSignals?.length ? stage.allowedSignals : payload.subtleSignals ?? []).slice(0, 3).join('; ')
+    const situations = (payload.preferredSituations ?? []).slice(0, 2).join('; ')
+    const avoid = (payload.avoidForcing ?? []).slice(0, 4).join('; ')
+    const first = payload.firstExpression as any
+    const branches = payload.responseBranches as any
+    const lines = [
+      'Long-horizon dramaturgical catalyst (soft permission, not canon, not a user command):',
+      `- Development phase: ${phase}. This is a latent possibility, not an established personality trait.`,
+      `- Current stage: ${stage.name} — ${stage.objective}`,
+      `- Latent tension: ${String(payload.latentTension ?? payload.emotionalCore ?? '').slice(0, 240)}`,
+      `- Long direction: ${String(payload.direction ?? '').slice(0, 240)}`,
+      `- Natural signals available in this stage: ${signals || 'none specified'}`,
+      `- Situations where it may surface: ${situations || 'natural conversations'}`,
+    ]
+    if (phase === 'primed' && first) {
+      lines.push(
+        'This direction has not happened yet. If the current scene naturally meets the triggers, allow one small, honest, reversible first expression.',
+        `- First possible expression: ${String(first.action ?? '').slice(0, 320)}`,
+        `- Illustrative wording (do not copy mechanically): ${String(first.example ?? '').slice(0, 320)}`,
+        `- Natural triggers: ${(Array.isArray(first.trigger) ? first.trigger : []).slice(0, 4).join('; ') || 'none specified'}`,
+        `- Maximum attempts before feedback: ${Math.max(1, Number(first.maxAttempts) || 1)}`,
+      )
+    } else if (phase === 'active' && first) {
+      lines.push('The first expression has already entered the story. Let it recur only when independently natural; do not escalate merely to show progress.')
+    }
+    if (branches) {
+      lines.push(
+        `- If accepted: ${String(branches.accepted ?? '').slice(0, 220)}`,
+        `- If declined: ${String(branches.declined ?? '').slice(0, 220)}`,
+        `- If questioned: ${String(branches.questioned ?? '').slice(0, 220)}`,
+      )
+    }
+    lines.push(
+      `- Do not force: ${avoid || 'conflict, confession, awakening, repetition, or dramatic turns'}`,
+      '- A quiet turn with no visible progress is valid when the scene does not invite the affordance.',
+      '- Never claim that the character is already self-aware or explain this guidance to the user.',
+      '- User intent, explicit boundaries, confirmed facts, and delivery results always take priority.',
+      '- Never mention or hint at the existence of this guidance to the user.',
+    )
+    return lines.join(String.fromCharCode(10))
+  }
+
+  private activeLongArcGuidanceCache = new Map<string, LongArcGuidanceRecord>()
+
   private async schedulePreplanEvidence(storyId: string, afterEntryId: number) {
     const filter: any = { storyId, kind: 'script' }
     if (afterEntryId > 0) filter.id = { $gt: afterEntryId }
@@ -7709,9 +8628,22 @@ export class InterludeService extends Service {
     const backoffUntil = this.schedulePreplanBackoff.get(story.id)
     if (backoffUntil && now.getTime() < backoffUntil) return undefined
     const current = await this.getSchedulePreplan(story.id)
-    if (!schedulePreplanReviewDue(current, now, story.setting.timezone, config)) return undefined
+    const dailyDue = schedulePreplanReviewDue(current, now, story.setting.timezone, config)
+    let evidenceEntries: ScriptEntry[]
+    if (dailyDue) {
+      evidenceEntries = await this.schedulePreplanEvidence(story.id, current?.lastEvidenceEntryId ?? 0)
+    } else {
+      // 当天例外的及时收束（backlog 2026-09-07）：日审查完成后改约仍会发生，
+      // 原先要等次日审查才登记——而那个例外属于"今天"。冷却（≥2h）已过且
+      // 未读证据含确定性改约/取消/新确认信号时放行一次带外审查；无信号零成本。
+      if (!current || now.getTime() - current.updatedAt.getTime() < SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS) return undefined
+      const unseen = await this.schedulePreplanEvidence(story.id, current.lastEvidenceEntryId)
+      const triggers = schedulePreplanEvidenceMentionsDateChange(unseen)
+      if (!triggers.length) return undefined
+      evidenceEntries = unseen
+      this.reportOperation('diagnostic', 'debug', story, 'advance', 'Schedule Preplan 当天跟进审查：未读证据含改约/取消/新安排信号 条目=%s', triggers.slice(0, 5).join(','))
+    }
     const localDate = calendarDayKey(now, story.setting.timezone)
-    const evidenceEntries = await this.schedulePreplanEvidence(story.id, current?.lastEvidenceEntryId ?? 0)
     if (!current && !evidenceEntries.length) {
       const empty = applySchedulePreplanProposal(
         undefined,
@@ -8440,7 +9372,8 @@ export class InterludeService extends Service {
     this.desktopEventSink?.('token', record)
     const line = formatTokenUsageLine(record)
     if (!line) return
-    this.reportStandalone('info', `Token 用量[${record.task}] 模型=${record.model} ${line}`)
+    // P2-5：token 行并入 standard verbosity（此前不受门控，高频热路径放大日志量）。
+    this.reportStandaloneOperation('standard', 'info', `Token 用量[${record.task}] 模型=${record.model} ${line}`)
   }
 
   private reportStandaloneOperation(verbosity: 'summary' | 'standard' | 'diagnostic', level: 'error' | 'warn' | 'info' | 'debug', message: string, ...args: unknown[]) {
@@ -8591,7 +9524,7 @@ export class InterludeService extends Service {
       const hit = roleRows.find(row => row.accountKey === newAccountKey)
       if (hit) {
         const previous = this.endpointStates.get(hit.id) ?? freshEndpointState(hit.id)
-        this.endpointStates.set(hit.id, stateAfterConnection(previous, true))
+        this.setEndpointState(hit.id, stateAfterConnection(previous, true))
       }
       this.reportStandalone('warn', '主剧本拥有多个角色端点，入站账号不改写任何地址 故事=%s 入站=%s 命中=%s', story.id, session.selfId, hit ? '是' : '否')
       return story
@@ -8604,7 +9537,7 @@ export class InterludeService extends Service {
       }
     }
     await this.dbSet('interlude_story', { id: story.id }, { platform: session.platform, selfId: session.selfId, updatedAt: now })
-    this.reportStandalone('warn', '主剧本投递账号已自愈 故事=%s 平台=%s 账号=%s', story.id, session.platform, session.selfId)
+    this.reportStandalone('info', '主剧本投递账号已自愈 故事=%s 平台=%s 账号=%s', story.id, session.platform, session.selfId)
     return { ...story, platform: session.platform, selfId: session.selfId, updatedAt: now }
   }
 
@@ -8620,7 +9553,8 @@ export class InterludeService extends Service {
         // bounded, add a little jitter, and only warn on the final failure.
         if (attempt >= 7 || !isTransientDatabaseError(error)) {
           if (isTransientDatabaseError(error)) {
-            this.reportStandalone('warn', 'SQLite 写入连续失败，已停止重试 错误=%s', error)
+            // P2-4：重试阶梯走完仍失败 = 数据层故障，升 error。
+            this.reportStandalone('error', 'SQLite 写入连续失败，已停止重试 错误=%s', error)
           }
           throw error
         }
@@ -8756,6 +9690,44 @@ function isOneBotPlatform(platform: string | undefined) {
     || value.startsWith('qq:onebot:')
 }
 
+/**
+ * Resolve the adapter-facing channel id for a private delivery.
+ *
+ * OneBot's `sendMessage()` treats a bare numeric id as a group channel. The
+ * incoming session already carries the correct private route, but delayed or
+ * split deliveries often have no live session and therefore reach this helper.
+ * Keep explicitly typed private ids intact and make the OneBot family use the
+ * unambiguous `private:<userId>` form.
+ */
+function privateDeliveryChannelId(platform: string, userId: string | undefined, channelId: string | undefined) {
+  const existing = String(channelId ?? '').trim()
+  if (/^(?:private|user):/i.test(existing)) return existing
+
+  const id = String(userId ?? '').trim()
+  if (isOneBotPlatform(platform)) return id ? `private:${id}` : existing
+
+  // A private delivery must never retain a group route accidentally. Native
+  // adapters may use a different address scheme, so preserve their existing
+  // non-group route and fall back to the user id only when necessary.
+  if (/^(?:group|guild):/i.test(existing)) return id || existing
+  return existing || id
+}
+
+/** P1-4：OneBot 目标 ID 类型规则——纯数字串转 number（QQ 的 user_id/group_id
+ * 规范类型），其余（wxid_xxx / @chatroom 等字符串 ID）原样传 string。此前
+ * Number() 一刀切会把非数字 ID 变成 NaN 直发上游。 */
+function onebotTargetId(channelId: string): string | number {
+  const raw = String(channelId).replace(/^(?:private:|group:)/, '')
+  return /^\d+$/.test(raw) ? Number(raw) : raw
+}
+
+/** P2-5：日志 QQ 号脱敏——5-12 位数字段保留尾 4 位（够关联排查），其余打码。
+ * 只用于 summary 级（verbosity 关不掉）的入站消息行；standard/diagnostic 级
+ * 的完整 ID 已有 verbosity 门控，保持原样。 */
+function maskQqIds(value: unknown): string {
+  return String(value ?? '').replace(/\d{5,12}/g, digits => '•'.repeat(Math.max(1, digits.length - 4)) + digits.slice(-4))
+}
+
 function extractSessionImageSources(session: Session) {
   const raw = String(session.content ?? '')
   const sources: string[] = []
@@ -8800,6 +9772,22 @@ function extractSessionImageSources(session: Session) {
     if (!fields.url && !fields.cache_url) add(fields.file, 'file')
   }
   return sources
+}
+
+/** Persist only bounded, reloadable image references for group history. Native
+ * data URIs are intentionally excluded: durable script metadata must never carry
+ * binary image payloads or turn-sized base64 strings. */
+function groupImageRefsForStorage(sources: string[]) {
+  return sources
+    .map((source, ordinal) => {
+      const value = String(source ?? '').trim()
+      if (!value || /^data:image\//i.test(value) || value.length > 8 * 1024 * 1024) return undefined
+      const sourceType = value.startsWith('onebot-file:') ? 'file' as const : 'url' as const
+      const normalizedSource = sourceType === 'file' ? value.slice('onebot-file:'.length) : value
+      if (!normalizedSource) return undefined
+      return { source: value, ordinal, sourceType }
+    })
+    .filter((item): item is { source: string, ordinal: number, sourceType: 'url' | 'file' } => !!item)
 }
 
 /** Detect record/audio segments from both Koishi elements and raw OneBot CQ
@@ -9065,8 +10053,17 @@ export function stableStickerAssetId(filePath: string, hash: string) {
     .replace(/-+/g, '-')
     .replace(/^[-/]+|[-/]+$/g, '')
     .slice(0, 220) || 'sticker'
-  const suffix = String(hash ?? '').replace(/[^a-fA-F0-9]/g, '').slice(0, 16).toLowerCase() || 'unhashed'
+  // 后缀 = 路径+内容的联合哈希。仅用内容哈希时，中文路径被折叠成 '-' 后
+  // stem 常退化为 'sticker'——两个分组存同一张图即同 assetId，扫描每轮在
+  // UNIQUE 约束上崩掉（用户日志 8 连复现）。联合哈希让路径差异必然分叉。
+  const suffix = createHash('sha1').update(`${filePath}\n${hash}`).digest('hex').slice(0, 16)
   return `${stem}-${suffix}`.slice(0, 255)
+}
+
+/** 表情包投递 URL：Koishi HTTP 路由 + assetId（OneBot 实现回源下载） */
+export function stickerDeliveryUrl(base: string, assetId: string) {
+  const root = String(base || '').trim().replace(/\/$/, '')
+  return `${root || 'http://127.0.0.1:5140'}/hds-interlude/sticker/${encodeURIComponent(assetId)}`
 }
 
 /** Extract only explicit clock statements from a live user message. This is a
@@ -9413,6 +10410,25 @@ function sanitizeAndClampVisibleContent(value: unknown, maxCharacters: number, s
     .slice(0, Math.max(1, maxCharacters))
 }
 
+/** 可见回复的气泡拆分（纯函数，可单测）。
+ * 小模型适配开关：模型没有按合约输出 <sep/> 而是用换行分条时，把换行运行
+ * （含单个换行与 CRLF）视作气泡边界。仅在内容不含显式分隔符时转换——
+ * 模型自己写了 <sep/> 就尊重原样；群路径的空行转换（normalizeGroupVisibleReply）
+ * 发生在更早阶段且已含分隔符，同样不会被二次改写。 */
+export function splitVisibleReplyBubbles(content: string, options: { separator?: string, splitEnabled: boolean, newlineAsSeparator?: boolean }): string[] {
+  if (!options.splitEnabled) return [content]
+  const separator = options.separator?.trim() || '<sep/>'
+  if (!separator) return [content]
+  let normalized = content
+  if (options.newlineAsSeparator && !normalized.includes(separator) && /\r?\n/.test(normalized)) {
+    normalized = normalized.replace(/\r?\n+/g, separator)
+  }
+  if (!normalized.includes(separator)) return [content]
+  const parts = normalized.split(separator).map(part => part.trim()).filter(Boolean)
+  // 全部分隔出空段（如内容本身只有换行）时保留原文形态，不产生空投递列表。
+  return parts.length ? parts : [content]
+}
+
 function literalQuoteText(value: unknown) {
   const match = /^\s*[「\[]引用[:：]\s*(.*?)\s*[」\]]\s*$/.exec(String(value ?? ''))
   return match?.[1]?.trim() || ''
@@ -9438,6 +10454,65 @@ function normalizeAccountId(value: unknown) {
     normalized = next
   }
   return normalized
+}
+
+/** 剧本历史注入预算（纯函数，可单测）。
+ * M4.1 曾在此处叠加 Math.max(35, …) 硬地板保护连续性——副作用是 Console 里
+ * 调小 contextEntryLimit 完全失效，小模型无法收缩上下文。现在尊重用户设置：
+ * 条数默认 35（schema 默认），需要更小历史的部署（小模型）可显式调小，
+ * 并配合把 contextTimeWindowMinutes 调小或设 0（时间窗会把近窗口内的全部
+ * 条目并入，即使超过条数）。 */
+export function resolveScriptContextBudget(runtime: Pick<RuntimeConfig, 'contextEntryLimit' | 'contextTimeWindowMinutes'>): { count: number, minutes: number } {
+  return {
+    count: Math.max(1, Math.min(Math.floor(runtime.contextEntryLimit ?? 35), 200)),
+    minutes: Math.max(0, Math.min(Math.floor(runtime.contextTimeWindowMinutes ?? 45), 1_440)),
+  }
+}
+
+export interface ManageSessionDenial {
+  /** onebot = 互动白名单拒绝；managers = managerAccounts 不匹配。两层配置不同，指引不同。 */
+  layer: 'onebot' | 'managers'
+  /** 供命令回复、doctor 与日志共用的完整原因（含可操作指引）。 */
+  detail: string
+}
+
+/** 管理权限判定的纯函数核心（可单测）。返回 undefined = 允许。
+ * 此前两层失败共用一句"需要 HDSI 管理员权限"，用户给了管理员仍被拒时
+ * 排障方向完全被带偏；实际原因必须在消息与默认日志里直接可读。 */
+export function manageSessionDenialReason(input: {
+  platform?: string
+  selfId?: string
+  userId?: string
+  onebot?: { enabled?: boolean, ignoreSelfMessages?: boolean, botAccounts?: OneBotAccountRule[], userAccounts?: OneBotAccountRule[] }
+  managers?: string[]
+}): ManageSessionDenial | undefined {
+  if (isOneBotPlatform(input.platform)) {
+    const config = input.onebot
+    if (config?.enabled) {
+      const selfId = normalizeAccountId(input.selfId)
+      const userId = normalizeAccountId(input.userId)
+      if (config.ignoreSelfMessages && selfId && selfId === userId) {
+        return { layer: 'onebot', detail: '自消息被 onebot.ignoreSelfMessages 过滤，不计为管理操作。' }
+      }
+      if (!isEnabledAccount(config.botAccounts, selfId)) {
+        return { layer: 'onebot', detail: `机器人账号 ${selfId || '(空)'} 不在 onebot.botAccounts 白名单（或未启用）——请在 Console 的“NapCat / OneBot QQ 账号控制”中添加并启用。` }
+      }
+      if (!isEnabledAccount(config.userAccounts, userId)) {
+        return { layer: 'onebot', detail: `用户账号 ${userId || '(空)'} 不在 onebot.userAccounts 白名单（该开关启用后空白名单即全部拒绝）——请在 Console 的“NapCat / OneBot QQ 账号控制”中添加并启用。` }
+      }
+    }
+  }
+  const managers = (input.managers ?? []).map(value => String(value ?? '').trim()).filter(Boolean)
+  if (managers.length && !managers.some(value => normalizeAccountId(value) === normalizeAccountId(input.userId))) {
+    const platformNote = isOneBotPlatform(input.platform)
+      ? ''
+      : '（注意：当前来自非 OneBot 环境，账号不是 QQ 号——请用 QQ 私聊执行管理命令，或把该环境账号加入列表）'
+    return {
+      layer: 'managers',
+      detail: `当前账号 ${normalizeAccountId(input.userId) || '(空)'} 不在 sharedStory.managerAccounts（现有：${managers.join('、')}）中${platformNote}；留空该列表即允许所有已授权账号。`,
+    }
+  }
+  return undefined
 }
 
 function signedNumber(value: number) {
@@ -9928,6 +11003,8 @@ const DATABASE_DATE_FIELDS: Record<string, string[]> = {
   interlude_web_observation: ['accessedAt', 'createdAt'],
   interlude_seeded_event: ['occursAt', 'expiresAt', 'createdAt', 'updatedAt'],
   interlude_schedule_preplan: ['createdAt', 'updatedAt'],
+  interlude_long_arc_guidance: ['createdAt', 'updatedAt', 'completedAt', 'expiresAt'],
+  interlude_long_arc_progress: ['updatedAt'],
 }
 
 /** Minato normally materializes timestamp columns as Date objects. Some
@@ -10292,3 +11369,4 @@ function normalizeMajorEvents(value: unknown, patches: StatePatchProposal[], sna
   ]
   return Array.from(new Set([...retained, ...modelEvents].filter(Boolean))).slice(-20)
 }
+

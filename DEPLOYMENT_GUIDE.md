@@ -1,6 +1,6 @@
 # HDS Interlude 部署教程
 
-适用版本：`1.0.1-rc28`
+适用版本：`1.0.1-rc36`
 
 > 写给第一次把 HDSI 接到 QQ 上、并希望角色能长期生活下去的人。
 
@@ -47,7 +47,7 @@ Koishi 第一次启动会准备运行环境，耐心等待即可。
 
 ```powershell
 cd C:\Users\你的用户名\AppData\Roaming\Koishi\Desktop\data\instances\default
-npm install --save-exact C:\路径\koishi-plugin-hds-interlude-1.0.1-rc28.tgz
+node .yarn/releases/yarn-4.5.3.cjs add "koishi-plugin-hds-interlude@file:C:/路径/koishi-plugin-hds-interlude-1.0.1-rc36.tgz" --exact
 ```
 
 安装完成后回到 Koishi Console，添加或启用 `hds-interlude`。
@@ -228,3 +228,4 @@ C:\Users\你的用户名\AppData\Roaming\Koishi\Desktop\data\instances\default\d
 ---
 
 HDS Interlude 部署教程，基于 HDSI 当前 Console 与 OneBot/NapCat 流程整理。需要更新截图时，优先替换文中标注的十二个“配图位置”。
+

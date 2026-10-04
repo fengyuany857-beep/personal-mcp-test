@@ -4,8 +4,9 @@ import {
   NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, SeededWorldEvent, StatePatchProposal, StickerAsset, WebObservation,
 } from './types'
 import type { QzonePostRecord } from './qzone'
-import type { EndpointRow, StoryAliasRecord } from './endpoints'
+import type { EndpointRow, EndpointStateRecord, StoryAliasRecord } from './endpoints'
 import type { WorkRow } from './works'
+import type { LongArcGuidanceRow, LongArcProgressRow } from './long-arc'
 
 declare module 'koishi' {
   interface Tables {
@@ -25,6 +26,9 @@ declare module 'koishi' {
     interlude_seeded_event: SeededWorldEvent
     interlude_qzone_post: QzonePostRecord
     interlude_endpoint: EndpointRow
+    interlude_endpoint_state: EndpointStateRecord
+    interlude_long_arc_guidance: LongArcGuidanceRow
+    interlude_long_arc_progress: LongArcProgressRow
     interlude_story_alias: StoryAliasRecord
     interlude_work: WorkRow
   }
@@ -46,6 +50,10 @@ export function registerTables(ctx: Context) {
     if (existingTables.interlude_qzone_post && !existingTables.interlude_qzone_post.fields?.endpointId) {
       ctx.model.extend('interlude_qzone_post', { endpointId: 'string(63)' })
     }
+    // 被评论感知基线（rc29）：老库补列，缺省 undefined=尚未立基线。
+    if (existingTables.interlude_qzone_post && !existingTables.interlude_qzone_post.fields?.commentNum) {
+      ctx.model.extend('interlude_qzone_post', { commentNum: 'unsigned' })
+    }
     if (!existingTables.interlude_web_observation) registerWebObservationTable(ctx)
     if (!existingTables.interlude_overlay_snapshot) registerOverlaySnapshotTable(ctx)
     if (!existingTables.interlude_sticker) registerStickerTable(ctx)
@@ -53,8 +61,11 @@ export function registerTables(ctx: Context) {
     if (!existingTables.interlude_seeded_event) registerSeededEventTable(ctx)
     if (!existingTables.interlude_qzone_post) registerQzonePostTable(ctx)
     if (!existingTables.interlude_endpoint) registerEndpointTable(ctx)
+    if (!existingTables.interlude_endpoint_state) registerEndpointStateTable(ctx)
     if (!existingTables.interlude_story_alias) registerStoryAliasTable(ctx)
     if (!existingTables.interlude_work) registerWorkTable(ctx)
+    if (!existingTables.interlude_long_arc_guidance) registerLongArcGuidanceTable(ctx)
+    if (!existingTables.interlude_long_arc_progress) registerLongArcProgressTable(ctx)
     return
   }
 
@@ -128,8 +139,11 @@ export function registerTables(ctx: Context) {
   registerSeededEventTable(ctx)
   registerQzonePostTable(ctx)
   registerEndpointTable(ctx)
+  registerEndpointStateTable(ctx)
   registerStoryAliasTable(ctx)
   registerWorkTable(ctx)
+  registerLongArcGuidanceTable(ctx)
+  registerLongArcProgressTable(ctx)
 }
 
 function registerScriptEntryEmbedding(ctx: Context, tables = (ctx.model as any).tables ?? {}) {
@@ -184,7 +198,7 @@ function registerQzonePostTable(ctx: Context) {
   // 空间动作审计行：限流门（当日计数/最小间隔）与投递结果追溯共用。
   ctx.model.extend('interlude_qzone_post', {
     id: 'unsigned', storyId: 'string(255)', kind: 'string(16)', tid: 'string(127)',
-    targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)',
+    targetUin: 'string(63)', content: 'text', ugcRight: 'unsigned', endpointId: 'string(63)', commentNum: 'unsigned',
     status: 'string(16)', error: 'text', createdAt: 'timestamp', postedAt: 'timestamp',
   }, { primary: 'id', autoInc: true, indexes: ['storyId', 'kind', 'status', 'createdAt'] })
 }
@@ -195,6 +209,15 @@ function registerStoryAliasTable(ctx: Context) {
   ctx.model.extend('interlude_story_alias', {
     aliasStoryId: 'string(255)', canonicalStoryId: 'string(255)', reason: 'string(255)', createdAt: 'timestamp',
   }, { primary: 'aliasStoryId', indexes: ['canonicalStoryId'] })
+}
+
+function registerEndpointStateTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_endpoint_state) return
+  // M3：动态端点健康状态是诊断/门控快照，不改变 interlude_endpoint 的身份行。
+  // endpointId 为稳定主键；状态 JSON 保留未来字段，便于小版本扩展而无需再加列。
+  ctx.model.extend('interlude_endpoint_state', {
+    endpointId: 'string(63)', state: 'json', updatedAt: 'timestamp',
+  }, { primary: 'endpointId', indexes: ['updatedAt'] })
 }
 
 function registerEndpointTable(ctx: Context) {
@@ -218,6 +241,32 @@ function registerSchedulePreplanTable(ctx: Context) {
     lastEvidenceEntryId: 'unsigned', reviewReason: 'text', regimes: 'json', exceptions: 'json', materializedDays: 'json',
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, { primary: 'storyId', indexes: ['validThrough', 'lastReviewedLocalDate'] })
+}
+
+
+function registerLongArcGuidanceTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_long_arc_guidance) return
+  // 长线叙事指导（Narrative Attractor）：版本化生命周期行，非事实权威。
+  ctx.model.extend('interlude_long_arc_guidance', {
+    id: 'unsigned', storyId: 'string(255)', version: 'unsigned', status: 'string(16)',
+    title: 'string(255)', premise: 'text', direction: 'text',
+    payload: 'json', currentStage: 'string(80)', intensity: 'string(16)',
+    confidence: 'double', triggerEntryId: 'unsigned', evidenceEntryIds: 'json',
+    supersedesId: 'unsigned', createdAt: 'timestamp', updatedAt: 'timestamp',
+    completedAt: 'timestamp', expiresAt: 'timestamp',
+  }, { primary: 'id', autoInc: true, indexes: ['storyId', 'status', 'version'] })
+}
+
+function registerLongArcProgressTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_long_arc_progress) return
+  // Durable scan cursor and score baseline. Never overload a guidance version
+  // row with mutable accumulator state.
+  ctx.model.extend('interlude_long_arc_progress', {
+    storyId: 'string(255)', lastCountedEntryId: 'unsigned', totalScore: 'double',
+    privateCount: 'unsigned', privateScore: 'double', groupCount: 'unsigned', groupScore: 'double',
+    unknownCount: 'unsigned', lastGenerationScore: 'double', lastGenerationEntryId: 'unsigned',
+    updatedAt: 'timestamp',
+  }, { primary: 'storyId', indexes: ['lastCountedEntryId', 'updatedAt'] })
 }
 
 function registerWorkTable(ctx: Context) {

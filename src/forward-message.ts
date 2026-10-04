@@ -12,6 +12,10 @@ export interface ForwardReadResult {
   forwardCount: number
   truncated: boolean
   failed: boolean
+  /** P2-7：整体拉取失败的原因（模块保持零依赖，日志由调用方记录）。 */
+  cause?: string
+  /** P2-7：嵌套合并转发读取失败次数（>0 时正文以占位符降级，调用方记 warn）。 */
+  nestedFailed?: number
 }
 
 export async function readForwardContent(session: any, limits: Partial<ForwardReadLimits> = {}): Promise<ForwardReadResult | undefined> {
@@ -19,12 +23,14 @@ export async function readForwardContent(session: any, limits: Partial<ForwardRe
   if (!ids.length) return undefined
   const budget = forwardReadLimits(limits)
   const internal = session?.bot?.internal
-  if (typeof internal?._request !== 'function') return failureResult()
+  if (typeof internal?._request !== 'function') return { ...failureResult(), cause: '适配器不支持 get_forward_msg' }
+  const state = { nestedFailed: 0 }
   try {
-    const nodes = await fetchForwardNodes(internal, ids[0], budget, 0)
-    return normalizeForwardMessages(nodes, budget)
-  } catch {
-    return failureResult()
+    const nodes = await fetchForwardNodes(internal, ids[0], budget, 0, state)
+    const result = normalizeForwardMessages(nodes, budget)
+    return state.nestedFailed ? { ...result, nestedFailed: state.nestedFailed } : result
+  } catch (error) {
+    return { ...failureResult(), cause: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -32,7 +38,7 @@ function failureResult(): ForwardReadResult {
   return { content: '[收到一条合并转发消息，但暂时无法读取内容]', nodeCount: 0, forwardCount: 0, truncated: false, failed: true }
 }
 
-async function fetchForwardNodes(internal: any, id: string, limits: ForwardReadLimits, depth: number): Promise<any[]> {
+async function fetchForwardNodes(internal: any, id: string, limits: ForwardReadLimits, depth: number, state: { nestedFailed: number }): Promise<any[]> {
   const response = await withTimeout(Promise.resolve(internal._request('get_forward_msg', { id })), 30_000)
   if (response?.retcode != null && Number(response.retcode) !== 0) throw new Error(String(response.wording || response.message || `retcode=${response.retcode}`))
   if (response?.status && response.status !== 'ok') throw new Error(String(response.wording || response.message || response.status))
@@ -50,11 +56,13 @@ async function fetchForwardNodes(internal: any, id: string, limits: ForwardReadL
       const nestedId = String(data.id ?? data.res_id ?? data.forward_id ?? '').trim()
       if (!nestedId) continue
       try {
-        const nested = await fetchForwardNodes(internal, nestedId, limits, depth + 1)
+        const nested = await fetchForwardNodes(internal, nestedId, limits, depth + 1, state)
         const normalized = normalizeForwardMessages(nested, { ...limits, maxNodes: Math.min(limits.maxNodes, 10) }, depth + 1)
         segment.type = 'text'
         segment.data = { text: normalized.content }
       } catch {
+        // P2-7：记录失败次数——正文降级为占位符，但不再对调用方完全不可见。
+        state.nestedFailed += 1
         segment.type = 'text'
         segment.data = { text: `[嵌套合并转发读取失败｜资源 ${nestedId}]` }
       }

@@ -566,6 +566,7 @@ export interface OutgoingMessageDraft {
     eventId: string
     eventKind: 'outgoing-message' | 'group-message'
     causedByEventIds: string[]
+    endpointId?: string
     fullContent: string
     bubbleIndex: number
     bubbleCount: number
@@ -784,6 +785,17 @@ export interface NarrativeImage {
   dataUri: string
 }
 
+/** A native image recovered from a recent group message. The source metadata
+ * stays outside the persisted script row; only the transient model attachment
+ * carries image bytes. */
+export interface NarrativeHistoricalImage extends NarrativeImage {
+  sourceEntryId: number
+  senderId: string
+  senderName: string
+  occurredAt: Date
+  messageId?: string
+}
+
 /** A transient native-audio attachment for the current private-message turn.
  * The payload is a SnowLuma server-side transcode of the QQ voice record; it
  * is intentionally never persisted in script entries, memories, or facts. */
@@ -814,6 +826,9 @@ export interface NarrativeRequest {
   images?: NarrativeImage[]
   /** Native audio inputs observed in this one incoming user event only. */
   audio?: NarrativeAudio[]
+  /** Recent group images recovered from earlier group-message entries. These
+   * are historical evidence, not a new user event or instruction. */
+  historicalGroupImages?: NarrativeHistoricalImage[]
   /** Text-only observations produced by a separately configured visual model.
    * They are transient current-event context and never enter script storage. */
   visualObservations?: string[]
@@ -832,6 +847,8 @@ export interface NarrativeRequest {
   availableOutgoingEndpoints?: NarrativeEndpointOption[]
   /** Enabled when the story has usable endpoints on multiple channel kinds. */
   channelSelectionEnabled?: boolean
+  /** Phase 3（§7）：长线叙事指导的裁剪投影（soft constraint 文本）。 */
+  longHorizonGuidance?: string
   /** Sensitive details of other participants are opt-in because the model may be remote. */
   shareParticipantDetails: boolean
   dueIntents: NarrativeIntent[]
@@ -1104,6 +1121,11 @@ export interface OverlayCompactionDecision {
   majorEvents?: string[]
 }
 
+/** Request for the low-frequency long-horizon dramaturgical catalyst.
+ * The service owns eligibility, weighting, privacy filtering, and evidence IDs;
+ * the provider may propose a bounded, non-canon first-expression affordance. */
+export type LongArcGuidanceRequest = Record<string, unknown>
+
 export interface NarrativeCompactor {
   compact(request: CompactionRequest): Promise<CompactionDecision>
   compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>
@@ -1113,6 +1135,8 @@ export interface NarrativeCompactor {
   /** Low-temperature automatic-window director. A missing plan means the host
    * must defer the write rather than let free prose advance reality. */
   planTimeline?(request: TimelinePlanRequest): Promise<TimelinePlan | undefined>
+  /** Long-horizon guidance is deliberately independent from scene compaction. */
+  planLongArcGuidance?(request: LongArcGuidanceRequest): Promise<unknown | undefined>
 }
 
 export interface NarrativeEmbedder {

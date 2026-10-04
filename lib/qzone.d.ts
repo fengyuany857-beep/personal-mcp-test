@@ -22,6 +22,8 @@ export interface QzonePostRecord {
     ugcRight?: number;
     /** 执行账号的角色端点（P2-10：多 QQ 端点下限流/审计/归因隔离的键）。 */
     endpointId?: string;
+    /** 上次观测到的评论数（被评论感知基线；undefined=尚未建立基线）。 */
+    commentNum?: number;
     status: 'pending' | 'confirmed' | 'failed' | 'unknown';
     error?: string;
     createdAt: Date;
@@ -87,6 +89,26 @@ export interface QzoneFeedEntry {
 /** get_qzone_feeds 条目归一化（appid 311=说说；正文 html 阶段 1 不解析）。 */
 export declare function normalizeQzoneFeedEntry(raw: unknown, now?: Date): QzoneFeedEntry | undefined;
 /** 好友动态新鲜度过滤：只保留时间窗内的条目（feeds 深翻页不可靠，只吃首页）。 */
+export interface QzoneReactionDelta {
+    tid: string;
+    contentExcerpt: string;
+    previous: number;
+    current: number;
+}
+/** 被评论感知（纯函数）：她的说说评论数增量比对。
+ * - 首次观测只立基线不报增量——刚发布的帖子自带几条评论是常态，不是新事件；
+ * - 增量 > 0 才产出感知；计数回落（删评）静默下修基线，杜绝幽灵增量；
+ * - 帖子不在当前拉取列表（超出深度）时基线保持不动；
+ * - 赞数上游（SnowLuma mapMsgList/ RawEmotion）尚未暴露字段，此处只算评论；
+ *   上游补 like_num 后在 QzoneMsgEntry 加字段并入本函数即可。
+ * 感知零动作配额；产出的条目由下一次推进（自动或对话）自然携带，绝不触发推进。 */
+export declare function qzoneReactionDeltas(posts: ReadonlyArray<QzonePostRecord>, entries: ReadonlyArray<QzoneMsgEntry>): {
+    deltas: QzoneReactionDelta[];
+    baselines: Array<{
+        tid: string;
+        commentNum: number;
+    }>;
+};
 export declare function freshQzoneFeeds(feeds: ReadonlyArray<QzoneFeedEntry>, config: QzoneConfig, now?: Date): QzoneFeedEntry[];
 /** OneBot 动作调用接口（service 侧用 bot.internal._request 接线）。 */
 export type QzoneActionCaller = (action: string, params?: Record<string, unknown>) => Promise<unknown>;

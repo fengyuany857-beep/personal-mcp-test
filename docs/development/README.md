@@ -1,12 +1,12 @@
 # 开发与维护资料
 
-当前发布基线为 `1.0.1-rc12`。当前行为以源码、[当前架构](../ARCHITECTURE.md)、[V2 实施表](../V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md) 与[更新记录](../CHANGELOG.md)为准；以下 beta6/M10 文档用于追溯，不能覆盖当前实现。
+当前发布候选为 `1.0.1-rc33`；代码构建、测试与 Yarn 4 包验收已完成，真实运行环境验收由维护者最后执行。当前行为以源码、[当前架构](../ARCHITECTURE.md)、[V2 实施表](../V2_IN_PLACE_REFACTOR_IMPLEMENTATION_FORM.md) 与[更新记录](../CHANGELOG.md)为准；以下 beta6/M10 文档用于追溯，不能覆盖当前实现。
 
 ## 当前发布与近期增量
 
 - [FUNCTION_CONFLICT_AUDIT_2026-09-17.md](FUNCTION_CONFLICT_AUDIT_2026-09-17.md)：功能交接小修、日志证据与待决的大问题清单。
 
-- 2026-09-17 未发布修正：时间导演请求/解析错误分流、游标无关冷却与重载恢复，见 [更新记录](../CHANGELOG.md)。发布包仍为 rc12，未重新构建部署。
+- rc33 候选已完成源码构建、严格类型检查、全量测试与 Yarn 4 tgz 打包；详细门槛和剩余验收见 [PLUGIN_UPGRADE_EXECUTION_PLAN.md](PLUGIN_UPGRADE_EXECUTION_PLAN.md)。
 
 - [ANTHROPIC_MESSAGES_RC12.md](ANTHROPIC_MESSAGES_RC12.md)：rc12 协议选择、缓存与群音频接入边界。
 
@@ -27,3 +27,6 @@
 - [logging/LOG_FORMAT_DESIGN.md](logging/LOG_FORMAT_DESIGN.md)：日志字段与输出约束。
 
 早期实现笔记、历史发布向导、失败分析、源代码快照和发布检查产物均已归档至项目根目录的 `dustbin/`，不应作为当前实现依据。
+
+
+

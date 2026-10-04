@@ -3,7 +3,7 @@ import { messageEventReference, ScriptEventDraft, ScriptMessageEventReference } 
 
 export function attachMessageEvent(message: OutgoingMessageDraft, event: ScriptEventDraft | undefined, scriptEntryId?: number): OutgoingMessageDraft {
   const scriptEvent = event ? messageEventReference(event, 0, scriptEntryId) : undefined
-  return scriptEvent ? { ...message, scriptEvent } : message
+  return scriptEvent ? { ...message, ...(event?.endpointId && !message.endpointId ? { endpointId: event.endpointId } : {}), scriptEvent } : message
 }
 
 export function prepareOutgoingDelivery(message: OutgoingMessageDraft, bubbles: string[]): OutgoingMessageDraft | undefined {
@@ -39,6 +39,7 @@ export function restoreMessageEvent(value: unknown, content: string): ScriptMess
     ...(typeof event.scriptEntryId === 'number' && Number.isSafeInteger(event.scriptEntryId) ? { scriptEntryId: event.scriptEntryId } : {}),
     eventKind: event.eventKind,
     causedByEventIds,
+    ...(typeof event.endpointId === 'string' && event.endpointId ? { endpointId: event.endpointId } : {}),
     fullContent: typeof event.fullContent === 'string' ? event.fullContent : content,
     bubbleIndex: typeof event.bubbleIndex === 'number' && Number.isSafeInteger(event.bubbleIndex) ? event.bubbleIndex : 0,
     bubbleCount: typeof event.bubbleCount === 'number' && Number.isSafeInteger(event.bubbleCount) ? event.bubbleCount : 1,

@@ -30,6 +30,8 @@ function aliasFixture() {
     endpointRegistryReady: false,
     endpointRows: [] as EndpointRow[],
     endpointStates: new Map(),
+    setEndpointState: function (id: string, state: unknown) { (this.endpointStates as Map<string, unknown>).set(id, state) },
+    persistEndpointState: () => {},
     storyAliasRows: [] as StoryAliasRecord[],
     storyAliasProblems: new Set<string>(),
     config: { onebot: { groupChats: [] } },

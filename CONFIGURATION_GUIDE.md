@@ -1,6 +1,6 @@
 # HDS Interlude 配置指南
 
-适用版本：`1.0.1-rc28`
+适用版本：`1.0.1-rc36`
 
 第一次安装先看 `BEGINNER_GUIDE.md`。本文件按配置依赖关系组织字段；下方先列出当前 Console 的实际顺序，旧版本已经移除或隐藏的字段集中列在末尾，不再混入正常配置流程。
 
@@ -257,6 +257,8 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 
 `splitReplyMessages` 开启后，模型可以用 `messageSeparator`（默认 `<sep/>`）拆分聊天气泡。`typingBaseDelaySeconds`、`typingCharactersPerSecond` 和 `typingMaxDelaySeconds` 控制后续气泡的模拟输入时间；`typingJitterRatio` 默认 `0.3`，会在理论延迟上下约 30% 抖动，填 `0` 可恢复固定时长。
 
+`convertNewlineToSeparator`（默认关闭）是小模型适配开关：模型没有按合约输出 `<sep/>` 而是用换行分条时，把每个换行自动视作一条消息的分隔再发送。内容里已有 `<sep/>` 时不做转换；`splitReplyMessages` 关闭时该开关无效。Gemma 等不遵守分句合约的小模型建议开启。
+
 主模型尚未提交第一条回复时，新消息会废弃旧请求，并把旧、新消息合并后重新写作，不再受固定秒数窗口限制。第一条回复已经提交后，新消息会取消剩余分段；未发送文字以 `interruptedOutgoingDrafts` 进入替代提示词，表示主角想发送但被新消息打断，不能视为已送达内容。
 
 ### 6.3 自动生活和主动联系
@@ -271,8 +273,8 @@ Embedding 地址留空时，插件会尝试从标准 `/chat/completions` 地址�
 | `minimumAdvanceMinutes` | 手动推进在没有到期任务时需要的最小时间差。 |
 | `allowProactiveMessages` | 是否允许无新消息时产生可见主动联系。 |
 | `proactiveWillingnessThreshold` | 主模型主动联系意愿门槛。 |
-| `contextEntryLimit` | 近期上下文最低条目数，默认 `35`。与 cache-first 搭配时提升几乎不影响实际成本。 |
-| `contextTimeWindowMinutes` | 与条目下限取并集的时间窗口，默认 `45` 分钟；窗口内真实用户/角色消息受保护。 |
+| `contextEntryLimit` | 写入主叙事上下文的近期原始剧本条目数，默认 `35`。小模型可调小（如 `15`）——低于 35 的设置真实生效（旧版的 35 硬地板已移除）。 |
+| `contextTimeWindowMinutes` | 与条目数取并集的时间窗口，默认 `45` 分钟（窗口内条目全部并入，上限 500）；`0` 关闭。小模型收缩上下文时需与条数一起调小或关闭。 |
 | `memoryLimit` | 主叙事携带的长期事实数量。 |
 
 ## 6. urge：弹性推进（【节奏 6】）
@@ -333,6 +335,8 @@ Agency Window 包含 `activityLoad`、`privacy` 和 `deviceAccess`。自动生�
 `expressionThreshold` 是表达严格度，不是固定发送频率。HDSI 会同时校验模型意愿与当前回复文字是否具有相同的非语言含义：低分或语义不相符时不投递。`0.70` 是平衡值；`0.90` 以上非常克制；`0.95` 及以上接近关闭，适合只保留纯文字聊天的场景。
 
 `stickers.enabled` 默认关闭。开启后插件每五分钟扫描 `directory`，只对新增或变化的图片调用勾选了 `useForStickers` 的视觉模型生成描述；`maxFileSizeMB` 和 `catalogLimit` 分别限制单文件大小及主提示词可见素材数量。`stickers.descriptionResponseFormat` 可独立选择描述模型的返回格式：`json-object` 使用 API JSON mode；模型或中转站频繁报 JSON mode 错误时改为 `prompt-only`，插件不再发送 `response_format`，但仍会从模型输出中解析描述 JSON。
+
+**发送与投递**：表情包经 Koishi 自身 HTTP 服务回源投递（路由 `/hds-interlude/sticker/<素材ID>`），不再使用 `file:///` 本地路径——OneBot 实现（NapCat/Lagrange）与 Koishi 分容器或分进程部署时读不到对方文件系统（表现为 retcode 1200/100、路径明明正常）。基址自动推导顺序：`stickers.deliveryBaseUrl` 显式配置 > Koishi `selfUrl` > `http://127.0.0.1:5140`。NapCat 与 Koishi 不同机/不同容器时，把 `deliveryBaseUrl` 设为 NapCat 可访问的 Koishi 服务地址（如 `http://192.168.x.x:5140` 或 docker 网络内的服务名）。
 
 ## 12. memory：记忆与连续性（【内在 12】）
 
@@ -462,6 +466,40 @@ Alter 模型由上方 `useForAlter` 选择。`temperature`、`topP`、`maxTokens
 
 以她本人身份发说说/评论/点赞（经 SnowLuma 的 qzone 扩展动作；需连接在线）。默认关闭；高频会被 Qzone 风控，保持保守上限。启用后可用 `interlude.qzone <内容>` 直接发说说；叙事侧（她何时自发发布/对好友动态的反应）由后续版本接入。键：`enabled`（false）、`dailyPostCap`（3）、`dailyCommentCap`（6）、`dailyLikeCap`（12）、`minIntervalMinutes`（90，跨类型共享）、`feedWindowMinutes`（120，好友动态只消费窗口内新鲜说说）。设计见 `docs/QZONE_FEED_DESIGN.md`。
 
+## 19. longHorizon：长线叙事指导（【扩展 17】）
+
+实验性叙事催化器（Narrative Attractor）：累计加权叙事证据后异步生成阶段性人物弧线方向，主叙事在自然场景中参考它渐进推进。**默认关闭**。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关 |
+| `triggerScore` | `25` | 首次生成的加权分数门槛（私聊 1.0 / 群聊 0.5） |
+| `reviewIncrement` | `40` | 上次生成后再积累多少分触发复审 |
+| `privateWeight` | `1.0` | 私聊条目权重 |
+| `groupWeight` | `0.5` | 群聊条目权重 |
+| `intensity` | `subtle` | 指导强度（第一版默认 subtle） |
+
+**催化器三态生命周期**：`dormant`（有效的不写决定——推进复审基线但不产生 active 指导）、`prime`（允许一次最小、可逆的首次表达，含自然触发条件和最大尝试数）、`activate`（首次表达已被回应，方向可成为反复倾向）。模型未显式声明 `decision` 时保守落为 `dormant`。
+
+**模型路由**：长线指导模型复用 compaction 路由（在【必填 2】模型中心勾选"用于压缩整理"即可），温度自动钳制 ≤0.35，JSON mode 输出。
+
+**隐私边界**：`shareParticipantDetails=false` 时长线模型只看主参与者 + 全局条目；计分不受影响。
+
+**与现有系统的关系**：指导 ≠ 事实——实际行为经现有证据流程后才更新事实/overlay。Agency/Urge 行动容量不受指导影响。设计详见 `docs/LONG_HORIZON_NARRATIVE_GUIDANCE_DESIGN.md`。
+
+## 20. onebot：群聊历史图片回流
+
+群聊中用户发送的图片会持久化引用到 `metadata.groupImageRefs`。下一次真实进入群聊主叙事时，从同群历史条目中按新到旧选取图片作为视觉证据（低细节模式），当前回合图片与历史图片去重。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `groupChats[].historicalImageLimit` | `3` | 一次群聊主叙事最多附带的最近历史图片张数（0–6，设 0 关闭） |
+
+- 历史图片是**视觉证据**，不是当前指令；加载失败不阻塞本回合
+- mention-only 模式下未 @ 机器人的图片会落库但不单独触发主叙事
+- 持久化层只保存 URL / OneBot file 引用，不保存 data URI
+- 私聊图片行为不变
+
 ## 隐藏的历史兼容字段
 
 以下字段不再出现在 Console：
@@ -497,3 +535,4 @@ Alter 模型由上方 `useForAlter` 选择。`temperature`、`topP`、`maxTokens
 - `exhaustLimit` 熔断：连续跟随失败达此轮数（默认 6）后停止注入；更换主叙事模型或手动重置后恢复。
 
 这些是旧版本字段释义，不再是当前行为。当前续写从原始剧本的最后落点继续，长段复用仅作 debug 观测，不对相同短句、反复追问或文学形式做拦截和重试。
+

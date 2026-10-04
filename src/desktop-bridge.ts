@@ -11,6 +11,29 @@ import type { DesktopTimelineRangeRequest, InterludeService } from './service'
 export type DesktopRuntimePhase = 'running' | 'muted' | 'paused'
 export type DesktopDeliveryStatus = 'sent' | 'retryable-failed' | 'permanent-failed'
 
+/** Stable capability names advertised by the typ-0 bridge. Protocol is the
+ * envelope/schema version; optional behavior is negotiated independently. */
+const DESKTOP_BRIDGE_API_VERSION = 1
+const DESKTOP_BRIDGE_PROTOCOL = 4
+const DESKTOP_BRIDGE_CAPABILITIES = [
+  'phase', 'inbound', 'replay-inbox', 'snapshot', 'timeline-range',
+  'delivery', 'purge-range', 'cursor-set', 'endpoint-health',
+  // B1-3（W2/W3）：multi-account = worker 入站按端点注册表解析（第二账号事件
+  // 直达既有剧本）；onebot-action = worker 认识动作代理协议（宿主可安全启用
+  // handler，见 C 阶段）。旧桌面不识别这两个能力位，无副作用。
+  'multi-account', 'onebot-action',
+] as const
+
+/** W3 桥接动作代理结果帧（宿主 → worker）。ambiguous 与插件 QzoneActionError 同族：
+ * 传输异常/超时时可能已到达服务端，调用方必须保守处理（计入配额、禁止自动重试）。 */
+export interface DesktopOnebotActionResult {
+  ok: boolean
+  data?: unknown
+  errorCode?: string
+  ambiguous?: boolean
+  error?: string
+}
+
 export interface DesktopInboundEvent {
   transport: 'snowluma' | 'onebot-external' | 'sandbox'
   accountKey: string
@@ -33,6 +56,7 @@ type DesktopCommand =
   | { type: 'hdsi-desktop', command: 'inbound', value: { requestId: string, event: DesktopInboundEvent } }
   | { type: 'hdsi-desktop', command: 'replay-inbox', value: { requestId: string, records: Array<{ id: string, event: DesktopInboundEvent }> } }
   | { type: 'hdsi-desktop', command: 'snapshot', value: { requestId: string } }
+  | { type: 'hdsi-desktop', command: 'endpoint-health', value: { requestId: string } }
   | { type: 'hdsi-desktop', command: 'timeline-range', value: { requestId: string, query?: DesktopTimelineRangeRequest } }
   | { type: 'hdsi-desktop', command: 'delivery-result', value: { deliveryId: string, status: DesktopDeliveryStatus, messageIds?: string[], error?: string } }
   | { type: 'hdsi-desktop', command: 'purge-range', value: { requestId: string, from: string, to: string } }
@@ -41,6 +65,12 @@ type DesktopCommand =
 interface PendingDelivery {
   resolve: (messageIds: string[]) => void
   reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
+/** W3：动作代理 pending 条目（pending map 模式与 delivery 同族）。 */
+interface PendingAction {
+  resolve: (value: DesktopOnebotActionResult) => void
   timeout: ReturnType<typeof setTimeout>
 }
 
@@ -55,6 +85,12 @@ interface DesktopDeliveryRequest {
   replyTo?: string
   content: string
   occurredAt: string
+  /** B1-1（M3 语义）：模型显式选择的目标端点；缺省 = 来源端点（宿主按
+   *  selfId/accountKey 路由到对应上游）。 */
+  endpointId?: string
+  /** P1-1：业务幂等键（scriptEvent.eventId + bubbleIndex）。宿主 outbox 跨
+   *  deliveryId 去重，防止"上游已收、回执迟到"时重试造成重复投递。 */
+  intentKey?: string
 }
 
 function isPhase(value: unknown): value is DesktopRuntimePhase {
@@ -149,7 +185,41 @@ export function installDesktopBridge(service: InterludeService) {
     return true
   }
 
-  service.setDesktopEventSink((event, payload) => sendToDesktop(event, payload))
+  // ── W3（C2-1）：桥接动作代理——worker 内无 ctx.bots，qzone/贴纸/内部
+  // OneBot 动作全部经宿主代调上游。旧桌面无此 handler 时超时回落"不可用"。
+  const pendingActions = new Map<string, PendingAction>()
+  const requestOnebotAction = (input: { accountKey: string, action: string, params?: Record<string, unknown>, timeoutMs?: number }): Promise<DesktopOnebotActionResult> => {
+    const requestId = randomUUID()
+    const timeoutMs = Math.max(1_000, Math.min(input.timeoutMs ?? 30_000, 60_000))
+    return new Promise(resolve => {
+      const timeout = setTimeout(() => {
+        pendingActions.delete(requestId)
+        // 超时 = ambiguous（请求已写出、可能已到达服务端）——调用方保守处理。
+        resolve({ ok: false, ambiguous: true, errorCode: 'timeout', error: `等待宿主动作代理回执超时（${Math.round(timeoutMs / 1000)}s）——请求已写出，结果不可知，禁止自动重试。` })
+      }, timeoutMs)
+      pendingActions.set(requestId, { resolve, timeout })
+      sendToDesktop('onebot-action-request', { requestId, accountKey: input.accountKey, action: input.action, params: input.params ?? {}, timeoutMs })
+    })
+  }
+  const settleAction = (payload: unknown) => {
+    const value = payload as { requestId?: string } & DesktopOnebotActionResult
+    if (!value || typeof value.requestId !== 'string') return false
+    const pending = pendingActions.get(value.requestId)
+    if (!pending) return false
+    pendingActions.delete(value.requestId)
+    clearTimeout(pending.timeout)
+    pending.resolve({ ok: value.ok === true, data: value.data, errorCode: value.errorCode, ambiguous: value.ambiguous === true, error: value.error })
+    return true
+  }
+
+  service.setDesktopEventSink((event, payload) => {
+    // W3：动作代理回执经 event sink 进入（宿主 → worker 方向，非 command）
+    if (event === 'onebot-action-result' && settleAction(payload)) return
+    sendToDesktop(event, payload)
+  })
+  // W3（C2-1/C2-3）：把动作代理出口注入 service——qzoneCaller 与 sendSticker
+  // 桌面模式经此调用，替代 ctx.bots（worker 内不存在）。
+  service.setDesktopOnebotActionHandler(requestOnebotAction)
   // typ-0 后台投递通道：delayed/split/advance 消息没有实时 Session，经宿主
   // Outbox/渠道适配器投递，delivery-result 回执与实时路径共用同一 Promise。
   // 普通 Koishi（无 bridge 环境）不会安装本桥，行为不变。
@@ -166,7 +236,7 @@ export function installDesktopBridge(service: InterludeService) {
     })
     sendToDesktop('delivery', {
       deliveryId,
-      accountKey: `desktop:${delivery.selfId}`,
+      accountKey: `onebot:${delivery.selfId}`,
       transport: 'onebot-external',
       platform: delivery.platform,
       selfId: delivery.selfId,
@@ -175,6 +245,8 @@ export function installDesktopBridge(service: InterludeService) {
       replyTo: delivery.quoteMessageId,
       content: delivery.content,
       occurredAt: new Date().toISOString(),
+      ...(delivery.endpointId ? { endpointId: delivery.endpointId } : {}),
+      ...(delivery.intentKey ? { intentKey: delivery.intentKey } : {}),
     })
   }).catch(error => ({ ok: false as const, error: String(error) })))
   const initialPhase = isPhase(process.env.HDSI_PHASE) ? process.env.HDSI_PHASE : 'running'
@@ -213,14 +285,14 @@ export function installDesktopBridge(service: InterludeService) {
       if (command.command === 'phase') {
         if (!isRequestId(command.value?.requestId) || !isPhase(command.value?.phase)) throw new Error('无效 typ-0 运行状态请求。')
         await service.setDesktopRuntimePhase(command.value.phase)
-        sendToDesktop('phase-result', { requestId: command.value.requestId, accepted: true, phase: command.value.phase })
+        sendToDesktop('phase-result', { ok: true, requestId: command.value.requestId, accepted: true, phase: command.value.phase })
         return
       }
       if (command.command === 'inbound') {
         if (!isRequestId(command.value?.requestId) || !isInboundEvent(command.value?.event)) throw new Error('无效 typ-0 入站事件。')
         const accepted = service.getDesktopRuntimePhase() === 'running'
           && await service.receiveDesktopEvent(command.value.event, desktopSession(command.value.event, requestDelivery))
-        sendToDesktop('inbound-result', { requestId: command.value.requestId, accepted: !!accepted, error: accepted ? undefined : '当前剧本未接收该入站事件。' })
+        sendToDesktop('inbound-result', { ok: true, requestId: command.value.requestId, accepted: !!accepted, error: accepted ? undefined : '当前剧本未接收该入站事件。' })
         return
       }
       if (command.command === 'cursor-set') {
@@ -228,7 +300,7 @@ export function installDesktopBridge(service: InterludeService) {
         const cursorAt = new Date(command.value.cursorAt)
         if (Number.isNaN(cursorAt.getTime())) throw new Error('游标时间无法解析。')
         await service.setDesktopCursorAt(cursorAt)
-        sendToDesktop('cursor-set-result', { requestId: command.value.requestId, accepted: true, cursorAt: cursorAt.toISOString() })
+        sendToDesktop('cursor-set-result', { ok: true, requestId: command.value.requestId, accepted: true, cursorAt: cursorAt.toISOString() })
         return
       }
       if (command.command === 'replay-inbox') {
@@ -248,17 +320,26 @@ export function installDesktopBridge(service: InterludeService) {
             results.push({ id: record.id, accepted: false, error: String(error) })
           }
         }
-        sendToDesktop('replay-result', { requestId: command.value.requestId, results })
+        sendToDesktop('replay-result', { ok: true, requestId: command.value.requestId, results })
         return
       }
       if (command.command === 'snapshot') {
         if (!isRequestId(command.value?.requestId)) throw new Error('快照请求缺少 requestId。')
-        sendToDesktop('snapshot-result', { requestId: command.value.requestId, snapshot: await service.desktopTimelineSnapshot() })
+        sendToDesktop('snapshot-result', { ok: true, requestId: command.value.requestId, snapshot: await service.desktopTimelineSnapshot() })
+        return
+      }
+      if (command.command === 'endpoint-health') {
+        if (!isRequestId(command.value?.requestId)) throw new Error('端点健康请求缺少 requestId。')
+        sendToDesktop('endpoint-health-result', {
+          ok: true,
+          requestId: command.value.requestId,
+          snapshot: await service.desktopEndpointHealthSnapshot(),
+        })
         return
       }
       if (command.command === 'timeline-range') {
         if (!isRequestId(command.value?.requestId) || !isTimelineRangeRequest(command.value.query)) throw new Error('无效时间线范围请求。')
-        sendToDesktop('timeline-range-result', { requestId: command.value.requestId, projection: await service.desktopTimelineRange(command.value.query) })
+        sendToDesktop('timeline-range-result', { ok: true, requestId: command.value.requestId, projection: await service.desktopTimelineRange(command.value.query) })
         return
       }
       if (command.command === 'purge-range') {
@@ -269,7 +350,7 @@ export function installDesktopBridge(service: InterludeService) {
         const to = new Date(String(command.value?.to ?? ''))
         if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) throw new Error('选区删除时间范围无效。')
         const result = await service.desktopPurgeRange(from, to)
-        sendToDesktop('purge-range-result', { requestId: command.value.requestId, accepted: true, storyId: result.storyId })
+        sendToDesktop('purge-range-result', { ok: true, requestId: command.value.requestId, accepted: true, storyId: result.storyId })
         return
       }
     } catch (error) {
@@ -278,9 +359,11 @@ export function installDesktopBridge(service: InterludeService) {
         : command.command === 'inbound' ? 'inbound-result'
           : command.command === 'replay-inbox' ? 'replay-result'
             : command.command === 'snapshot' ? 'snapshot-result'
-              : command.command === 'timeline-range' ? 'timeline-range-result'
-                : command.command === 'purge-range' ? 'purge-range-result' : 'error'
-      sendToDesktop(response, { requestId, accepted: false, error: String(error), results: command.command === 'replay-inbox' ? [] : undefined })
+              : command.command === 'endpoint-health' ? 'endpoint-health-result'
+                : command.command === 'timeline-range' ? 'timeline-range-result'
+                : command.command === 'purge-range' ? 'purge-range-result'
+                  : command.command === 'cursor-set' ? 'cursor-set-result' : 'error'
+      sendToDesktop(response, { ok: false, requestId, accepted: false, error: String(error), errorCode: 'BRIDGE_REQUEST_FAILED', results: command.command === 'replay-inbox' ? [] : undefined })
       sendToDesktop('error', { command: command.command, requestId, message: String(error) })
     }
   }
@@ -291,15 +374,31 @@ export function installDesktopBridge(service: InterludeService) {
     // v4 adds deliveryActions/sceneCheckpoint fields to the timeline-range
     // projection and the host-side background delivery channel. Commands from
     // v2/v3 remain intact so an older desktop degrades gracefully.
-    .finally(() => sendToDesktop('bridge-ready', { protocol: 4, phase: service.getDesktopRuntimePhase() }))
+    .finally(() => sendToDesktop('bridge-ready', {
+      ok: true,
+      apiVersion: DESKTOP_BRIDGE_API_VERSION,
+      protocol: DESKTOP_BRIDGE_PROTOCOL,
+      phase: service.getDesktopRuntimePhase(),
+      capabilities: [...DESKTOP_BRIDGE_CAPABILITIES],
+    }))
   return () => {
     clearInterval(heartbeat)
     service.setDesktopDeliveryHandler(undefined)
+    service.setDesktopOnebotActionHandler(undefined)
     process.off('message', handle)
     for (const pending of pendingDeliveries.values()) {
       clearTimeout(pending.timeout)
       pending.reject(new Error('typ-0 bridge 已关闭。'))
     }
     pendingDeliveries.clear()
+    for (const pending of pendingActions.values()) {
+      clearTimeout(pending.timeout)
+      // P1-5：dispose 窗口内请求可能已写出宿主——与超时同族，按 ambiguous
+      // 保守结算（调用方计入配额、禁止自动重试），不再标记为确定失败。
+      pending.resolve({ ok: false, ambiguous: true, errorCode: 'bridge-closed', error: 'typ-0 bridge 已关闭——在途请求结果不可知，禁止自动重试。' })
+    }
+    pendingActions.clear()
   }
 }
+
+

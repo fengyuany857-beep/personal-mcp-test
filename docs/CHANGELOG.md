@@ -1,4 +1,103 @@
+## 1.0.1-rc36（2026-10-04，发布候选）
+
+- **小模型换行分句开关**：新增 `runtime.convertNewlineToSeparator`（默认关闭）——模型没有按合约输出 `<sep/>` 而是用换行分条时，把换行运行自动视作气泡边界再发送；内容已含显式分隔符时不转换，拆条关闭时无效。Gemma 等小模型建议开启。
+- **小模型上下文三件套**：`contextEntryLimit` + `contextTimeWindowMinutes` + `convertNewlineToSeparator` 配合收缩上下文与气泡形态。
+
+## 1.0.1-rc35（2026-10-04，发布候选）
+
+- **剧本历史条目旋钮修复**：移除 `recentEntriesForPrompt` 内 `Math.max(35, …)` 硬地板（M4.1 连续性加固引入）——此前 `contextEntryLimit` 低于 35 的设置静默失效，小模型无法收缩历史上下文。默认 35 保留在 Console 默认值；预算判定抽为 `resolveScriptContextBudget` 纯函数并补测试。
+- 字段说明重写：写明条数与时间窗的叠加语义（窗口内条目全部并入，收缩需两者配合）。
+
+## 1.0.1-rc34（2026-10-04，发布候选）
+
+- **权限拒绝可诊断**：`canManageSession` 的两层失败（OneBot 互动白名单拒绝 / `managerAccounts` 不匹配）此前共用一句"需要 HDSI 管理员权限"，新部署排障方向被误导。新增 `manageSessionDenialReason` 纯函数区分两层并生成含指引的原因文本；`interlude.story.start` 拒绝回复附带真实原因；`interlude.doctor` 增加管理权限检查项；拒绝日志升 standard 级。非 OneBot 环境（Console 沙盒）账号不匹配时提示环境差异。新增权限门测试七项。
+
+## 1.0.1-rc33（2026-10-03，发布候选）
+
+- 汇总 rc32 之后的发行前修复：长线后台任务异常吸收、日志留存接线与进程崩溃诊断、worker 异常退出状态持久化、投递幂等与桥接 ambiguous 语义、Qzone 增量提交、贴纸与原生表情宿主代理，以及 OneBot 多通道账号标识校验。
+- 桌面端同步支持 QQ 数字账号、微信字符串账号和其它 OneBot 账号 ID；旧 QQ 配置字段继续兼容读取。
+- 发布验证目标：Yarn 4 构建、类型检查、全量插件测试、桌面端运行时和 UI 测试均通过后生成 rc33 包。
+## Narrative Attractor 实现修正（2026-10-02）
+
+- 修复长线指导调用缺失：补齐 `NarrativeCompactor.planLongArcGuidance()` 和 OpenAI-compatible JSON side-task，达到阈值后不再静默跳过生成。
+- 新增 `interlude_long_arc_progress` 持久化累计状态表，保存 `lastCountedEntryId`、私聊/群聊分项分数、累计总分和 `lastGenerationScore`，避免首次生成前重复计分及进程重启后复审基线丢失。
+- 保持 Guidance 版本的 `triggerEntryId` 不可变；累计扫描游标不再写回历史 Guidance 行。
+- 增加后台生成去重、过期投影保护，并修正复审基线表达式。
+- 长线模型输入补充用户/关系设定、当前 participant（遵循 `shareParticipantDetails`）、持久事实、active Guidance 和私聊/群聊分项累计。
+- 修复 `script` 渲染条目的通道误判：优先读取 `scriptEvents`，群聊仅按 `0.5` 计权，混合私聊/群聊回合保守计为 unknown；新提交同时写入 `metadata.conversationKind`。
+- 固定有效计权契约：私聊始终 `1.0`、群聊始终 `0.5`；旧配置键继续读取但不再改变实际权重。
+- 增加后台模型隐私边界：`shareParticipantDetails=false` 时仅允许当前故事主参与者与全局剧本/事实进入长线模型，排除其它参与者的带 `participantId` 内容；计分仍正常累计。
+- 修复 Guidance 注入仅依赖 endpoint selection、跨故事缓存未加载、过期版本阻塞后续生成等问题。
+- Yarn 4 验证：typecheck 通过；全量测试 524 项，520 通过，0 失败，4 跳过。
+
 # 版本记录
+
+## 1.0.1-rc32（2026-10-02，发布候选）
+
+- **长线叙事催化器首次阈值调整**：Narrative Attractor 的默认首次加权证据阈值由 `50` 调整为 `25`；私聊按 `1.0` 计入、群聊按 `0.5` 计入的渠道策略保持不变。
+- **催化器实现保持稳定**：继续采用 `dormant / prime / activate` 生命周期，允许在首次表达前为主叙事提供一次最小、可撤回的戏剧性行动许可。
+- **发布验证**：完成 Yarn 4 严格类型检查、全量测试、Yakumo build 与 Yarn 4 tgz 打包；真实 Koishi Desktop 运行环境验收仍由维护者执行。
+
+## 1.0.1-rc31（2026-10-02，发布候选）
+
+- **群聊历史图片证据回流**：群聊图片引用写入 `interlude_script_entry.metadata.groupImageRefs`，不再只保留 `[图片]` 占位符；在 mention-only 模式下，未 @ 机器人的图片会落库但不会单独触发主叙事。
+- **主叙事附件选择**：下一次真实进入群聊主叙事时，从同一群聊的历史条目中按新到旧扫描，默认恢复最近 3 张、最多 6 张图片；当前回合图片与历史图片去重，历史图片使用低细节提示，加载失败不阻塞本回合。
+- **模型边界**：历史图片作为视觉证据而非当前指令发送；持久化层只保存 URL / OneBot file 引用，不保存 data URI。私聊图片行为保持不变。
+- **配置**：新增群聊 `historicalImageLimit`（默认 `3`，范围 `0–6`），设为 `0` 可关闭历史图片回流。
+- **发布流程**：使用 Yarn 4.5.3 完成类型检查、测试、Yakumo 构建、打包与实例安装；真实运行环境验收仍由维护者最后执行。
+
+
+## 长线叙事指导 Narrative Attractor Phase 0-3（2026-10-02）
+
+设计文档 LONG_HORIZON_NARRATIVE_GUIDANCE_DESIGN.md 的实现落地：
+
+- **Phase 0+1 纯函数层**（src/long-arc.ts）：isEligibleNarrativeEntry（叙事 kind 白名单 + 空内容排除）、resolveConversationKind（metadata > M4 通道标注 > kind 反推 > unknown）、resolveConversationWeight（私聊 1.0 / 群聊 0.5）、calculateLongHorizonScore（§4.2 公式）、shouldTriggerLongHorizon（首次/复审/暂停重建/未达阈值四态）、normalizeLongArcGuidance（结构化校验——缺证据/无 stages 拒绝；非 subtle 钳制）。7 项纯函数测试。
+- **Phase 2 持久化与异步生成**：interlude_long_arc_guidance 表（版本链）；longHorizonSweep 挂 persistDecision 返回路径（异步、不阻塞）；longHorizonGenerate → compactor planLongArcGuidance → 校验 → supersede + 写入新版本；active 内存缓存。
+- **Phase 3 主叙事注入**：NarrativeRequest.longHorizonGuidance 字段 + longHorizonPromptProjection()（§7 裁剪格式，~300 token 硬上限）+ systemPrompt 注入（CHANNELS 行之前）。每回合最多一个小信号、用户意图优先、不得提及指导存在。
+- **配置**：Console【扩展 16】longHorizon（enabled 默认关闭、triggerScore=50、reviewIncrement=40、intensity=subtle）。关闭时行为完全不变。
+- 测试基线：518 通过、0 失败。
+
+## 1.0.1-rc30（2026-10-02，发布候选）
+
+- **修复 OneBot 后续私聊投递**：无 live Session 的延迟/分段消息不再把裸用户 ID 传给 `bot.sendMessage()` 或 typ-0 宿主投递接口；OneBot 私聊目标统一规范化为 `private:<userId>`，避免被错误解释为 `send_group_msg`。
+- **发布流程**：本版本使用 Yarn 4 打包并安装，避免 npm lockfile 与 Koishi Desktop 实例的 Yarn lockfile 不一致。
+- **验收边界**：本批仍跳过真实运行环境验收，待维护者最后执行。
+
+## 1.0.1-rc29（2026-10-02，发布候选）
+
+rc28 以来的发布候选整理，包含 QZone 评论感知、Schedule Preplan 当天例外、表情包 HTTP 回源、EndpointState/Delivery Gate 以及多端点链路代码修复。
+
+- **发布卫生**：重新执行 Yakumo 构建；`src/` → `lib/` 新鲜度检查通过；严格类型检查通过；全量测试 `514` 项中 `510` 通过、`0` 失败、`4` 跳过；npm tgz dry-run 通过。
+- **多渠道 M3**：EndpointState 持久化快照、重启时不恢复旧在线事实、统一投递门控、主动联系门控、失败分类和 `endpoint-health` desktop bridge 投影已接入。
+- **多渠道 M4 代码修复**：即时私聊/群聊默认 endpoint 在 gate 前观察 live session；分段消息恢复显式 `endpointId`；显式 endpoint 继续禁止 fallback。
+- **文档与发行包**：`INDIRECT_SUBJECT_DESIGN.md`、`OFFLINE_ATTENTION_EXPERIMENT.md` 与 `docs/development` 已纳入发行包；工作区包与历史 rc28 正式包分离。
+- **验收边界**：真实双 QQ、多端点切换、断线重连和平台拒绝等运行环境验收不在本次自动步骤内，待维护者最后执行；SharedWorks/共同创作仍保持实验性、暂不纳入稳定承诺。
+
+## Schedule Preplan 当天例外及时收束（2026-10-02，已纳入 1.0.1-rc29）
+
+backlog 2026-09-07 挂账项。数据层例外机制 rc12 已就绪（登记/按日过期/物化），本批补齐两个缺口：
+
+- **及时性**：日审查为每日一次门——早审完成后下午临时改约要等次日才登记，而例外属于"今天"。新增确定性触发扫描（取消/改期/改约/敲定等语言痕迹，`kind=script` 证据管道天然排除世界事件/好友动态/空间条目，无新增量冲突）+ 带外跟进审查（冷却 ≥2h + 未读含信号才放行；无信号零模型调用，低频承诺保持）。
+- **防吸收与证据资格（审查教学三行）**：取消/改期/新确认的一次性安排归 exceptions 且只归 exceptions；周规律只有"新时间在不同日期重复出现或明确声明永久"才可改——同一事件不会变成长期作息；愿望/建议/未执行计划不算任何例外或规律的证据。
+- 测试 +3（触发词命中/愿望不命中/去重；跟进到期五态；教学断言）；全量 509 通过、0 失败、4 跳过。
+
+## QQ 空间被评论感知（2026-10-02，已纳入 1.0.1-rc29）
+
+- 用户需求：她的说说收到新评论时，信息由**下一次推进（自动或对话）自然携带**，被评论本身不触发 advance。
+- 实现：`qzoneReactionDeltas` 纯函数（首次观测立基线不报/增量>0 产出/删评回落静默下修/超出拉取深度不动）+ 动态轮询附带自空间 `get_qzone_msg_list` 比对 + `[空间动态]` 条目入账（复用 SOCIAL SURFACE 提示词规则，零提示词改动，`friend-feed`/system ownership）+ `interlude_qzone_post.commentNum` 基线列（老库自动补列）。
+- 边界：感知零动作配额（与 feed-seen 同族）；只覆盖 7 天内已确认帖子、单轮至多 3 条；feeds CGI 间歇失败不再中断整个轮询（跳过好友动态、感知照常）。赞数上游未暴露（SnowLuma 仅映射 cmtnum），结构已预留。
+- 测试 +1（基线/增量/回落/缺席四态）；全量 506 通过、0 失败、4 跳过。
+
+## 本地表情包发送修复（2026-09-30，已纳入 1.0.1-rc29）
+
+用户反馈：表情包发不出去（retcode 1200/100），路径与文件名正常。三处修复：
+
+- **投递形态改为 HTTP 回源**：原以 `file:///` 本地路径交给 OneBot 实现——Koishi 与 NapCat/Lagrange 分容器/分进程部署时（用户实测 `/root/hds-koishi/...` 与 docker 卷 `/koishi/...` 两种部署均复现），file URI 指向 Koishi 侧文件系统，OneBot 实现读不到，上传必然失败。现由 Koishi 自身 HTTP 服务提供回源路由 `/hds-interlude/sticker/<素材ID>`（仅素材库内、资产表登记且 active 的文件，86400s 缓存头），OneBot 实现按 URL 主动下载。基址推导：`stickers.deliveryBaseUrl` > Koishi `selfUrl` > `http://127.0.0.1:5140`；跨机/跨容器部署在配置中显式指定。不内联 base64，消息载荷保持轻量。
+- **assetId 折叠碰撞**：`stableStickerAssetId` 把中文路径折叠为 `-`，stem 常退化为 `sticker`——两个分组存同一张图即同 assetId，扫描每轮在 UNIQUE 约束上崩掉（用户日志"表情包库扫描失败"8 连复现，当轮描述/嵌入全部停摆）。后缀改为 sha1(路径+内容) 联合哈希，路径差异必然分叉；旧库行由下一轮扫描按 filePath 平滑迁移。
+- **历史重复行自愈**：扫描开始按 (assetId, filePath) 去重（保留 updatedAt 最新），旧缺陷留下的重复行不再每轮致崩。
+- 测试 +2（中文同内容不碰撞/确定性/内容换 id；投递 URL 归一/编码/回退），更新 1 处旧后缀推导断言。
+
+- **新设计文档**：`docs/OFFLINE_ATTENTION_EXPERIMENT.md`——离线注意力实验（"想不想聊"由模型申报 attentionAfter：closed→仅响铃 / dnd→勿扰；宿主执行"看不见"：消息分流入台账、锁屏摘要不泄内容、phoneCheck 两步回放回合、轰炸唤醒；无任何时刻表判定，回归三路 = 出站蕴含/自然注意到/轰炸）。仅设计，未实现；AG-M0~M3 分期。
 
 ## 1.0.1-rc28（2026-09-30）
 
@@ -857,3 +956,5 @@ rc27 以来增量：单剧本多通道 M2/M3/M4 全量落地 + DeepSeek V4.1 修
 ## 0.1.2-beta7 及更早
 
 旧发布包和历史目录保留完整版本样本。它们仅用于回溯，不代表当前代码。
+
+

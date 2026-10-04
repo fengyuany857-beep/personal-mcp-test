@@ -1,6 +1,6 @@
 import { Context, Service, Session } from 'koishi';
 import { type QzoneActionKind } from './qzone';
-import { type StoryAliasRecord } from './endpoints';
+import { type EndpointRow, type StoryAliasRecord } from './endpoints';
 import { HealthMonitor } from './health';
 import { UrgeConfig } from './urge';
 import { ModelConfig } from './narrator';
@@ -17,6 +17,23 @@ export interface DesktopTimelineRangeRequest {
     cursor?: string;
     detailLevel?: 'summary' | 'full';
     limit?: number;
+}
+/** Read-only endpoint health projection consumed by typ-0.  The desktop must
+ * not read interlude_endpoint or interlude_endpoint_state directly. */
+export interface DesktopEndpointHealth {
+    endpointId: string;
+    ownerKind: EndpointRow['ownerKind'];
+    ownerId: string;
+    platform: string;
+    channelKind: EndpointRow['channelKind'];
+    enabled: boolean;
+    online: boolean;
+    observedAt: string;
+    deliverable: boolean;
+    initiateAllowed: boolean;
+    cooldownUntil?: string;
+    lastError?: string;
+    note?: string;
 }
 /** Fix#9: 分页游标改为 occurredAt+id 双键（与排序键一致）；旧 entry:<id> 继续兼容。 */
 export interface TimelineCursor {
@@ -90,6 +107,7 @@ export interface Config {
     /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
     chatActions?: ChatActionsConfig;
     stickers?: StickerLibraryConfig;
+    longHorizon?: unknown;
     alterSystem?: AlterSystemConfig;
     chatRhythm?: ChatRhythmConfig;
     /** Timeline director for automatic windows; off = automatic turns run without a ledger. */
@@ -146,7 +164,8 @@ export interface StickerLibraryConfig {
     catalogLimit: number;
     descriptionMaxTokens?: number;
     /** API JSON mode is optional; prompt-only still asks for the compact JSON contract. */
-    descriptionResponseFormat?: 'json-object' | 'prompt-only';
+    descriptionResponseFormat?: 'json-object' | 'prompt-only'; /** 表情包投递基址（空=自动：selfUrl → http://127.0.0.1:5140）。OneBot 实现与 Koishi 不共享文件系统时须经 HTTP 回源。 */
+    deliveryBaseUrl?: string;
 }
 export interface GroupChatRule {
     groupId: string;
@@ -158,6 +177,8 @@ export interface GroupChatRule {
     contextLimit: number;
     debounceSeconds: number;
     cooldownSeconds: number;
+    /** Number of recent historical group images attached to a later narrative turn. */
+    historicalImageLimit?: number;
     /** 档位化的群聊意愿门：off/quiet/reserved/normal/active/eager/auto/custom。 */
     willingnessPreset?: string;
     /** auto 档三态（busy/asleep/idle）各自使用的档位。 */
@@ -243,6 +264,8 @@ export interface RuntimeConfig {
     /** Split model reply.content into multiple QQ messages at the configured separator. */
     splitReplyMessages?: boolean;
     messageSeparator?: string;
+    /** 小模型适配：可见回复未用分句标记而用换行时，把换行视作气泡边界。 */
+    convertNewlineToSeparator?: boolean;
     typingBaseDelaySeconds?: number;
     typingCharactersPerSecond?: number;
     typingMaxDelaySeconds?: number;
@@ -423,6 +446,7 @@ export declare class InterludeService extends Service {
     /** 端点注册表内存缓存（M1a）：行来自 interlude_endpoint；状态为进程内三维时效。 */
     private endpointRows;
     private endpointStates;
+    private endpointStateWriteQueue;
     private endpointRegistryReady;
     /** M1b 剧本别名缓存（interlude_story_alias），随注册表一同加载。 */
     private storyAliasRows;
@@ -491,6 +515,9 @@ export declare class InterludeService extends Service {
      * 消息只能经宿主渠道投递。bridge 安装时注册，普通 Koishi 永远为空。
      */
     private desktopDeliveryHandler?;
+    /** W3（C2-1）：桥接动作代理出口——desktop-bridge 安装后非空；普通 Koishi 恒空。
+     * qzoneCaller 与 sendSticker 桌面模式经此调用宿主代调上游 OneBot 动作。 */
+    private desktopOnebotActionHandler?;
     constructor(ctx: Context, config: Config);
     private startBackgroundTasks;
     setNarrator(provider: NarrativeProvider): void;
@@ -500,8 +527,11 @@ export declare class InterludeService extends Service {
     setEmbedder(provider: NarrativeEmbedder): void;
     /** Optional typ-0 bridge hook. No sink is installed in normal Koishi use. */
     setDesktopEventSink(sink?: (event: string, payload: unknown) => void): void;
+    /** P2-4：Puppeteer 缺失提示进程内只打一次。 */
+    private puppeteerHintLogged;
     /** typ-0 bridge 在安装时注册后台投递通道；卸载时传 undefined 复原。 */
     setDesktopDeliveryHandler(handler?: InterludeService['desktopDeliveryHandler']): void;
+    setDesktopOnebotActionHandler(handler?: InterludeService['desktopOnebotActionHandler']): void;
     getDesktopRuntimePhase(): DesktopRuntimePhase;
     setDesktopRuntimePhase(phase: DesktopRuntimePhase): Promise<void>;
     /** Snapshot is intentionally small; detailed timeline uses desktopTimelineSnapshot below. */
@@ -513,6 +543,16 @@ export declare class InterludeService extends Service {
             cursorAt: string;
             updatedAt: string;
         }[];
+    }>;
+    /**
+     * Endpoint health is deliberately projected by the worker.  This keeps the
+     * desktop read-only and, more importantly, makes all availability decisions
+     * use the same conservative TTL/cooldown rules as delivery itself.
+     */
+    desktopEndpointHealthSnapshot(): Promise<{
+        protocol: number;
+        generatedAt: string;
+        endpoints: DesktopEndpointHealth[];
     }>;
     /** Read-only desktop projection. The host never opens or mutates HDSI tables directly. */
     desktopTimelineSnapshot(): Promise<{
@@ -705,6 +745,10 @@ export declare class InterludeService extends Service {
     /** Same account gate for direct-message work that already has a participant. */
     canHandleParticipant(participant: InterludeParticipant): boolean;
     canManageSession(session: Session): boolean;
+    /** 管理命令被拒的具体原因（两层：OneBot 互动白名单 / managerAccounts）。
+     * 拒绝时记 standard 级 warn——此前区分线索藏在 diagnostic debug 里，新部署
+     * 排障完全看不见。 */
+    manageSessionDenial(session: Session): ManageSessionDenial | undefined;
     /** Background life updates only require the bot account to remain enabled. */
     canHandleStory(story: InterludeStory): boolean;
     findStory(session: Session): Promise<any>;
@@ -817,6 +861,7 @@ export declare class InterludeService extends Service {
     private flushGroupTurn;
     private flushGroupTurnUnlocked;
     private groupMessages;
+    private loadHistoricalGroupImages;
     private groupCooldownActive;
     private groupChatCapabilities;
     private privateChatCapabilities;
@@ -846,6 +891,12 @@ export declare class InterludeService extends Service {
     private describeUserEvent;
     private readForward;
     private scanStickerLibrary;
+    /** 表情包投递基址：显式配置 > Koishi selfUrl > 本机默认端口。 */
+    private stickerDeliveryBase;
+    /** 表情包 HTTP 回源路由：OneBot 实现（NapCat/Lagrange）分容器时经此下载文件。
+     * 仅服务素材库内、资产表登记过的文件；assetId 即查询键，无目录穿越面。 */
+    private registerStickerRoute;
+    private stickerRouteRegistered;
     private refreshStickerCatalog;
     private semanticStickerEmbeddingEnabled;
     /** Vectorize described-but-unindexed sticker assets in the background. The
@@ -1144,12 +1195,30 @@ export declare class InterludeService extends Service {
     /** 好友动态轮询：感知零模型调用——新鲜说说写成 [好友动态] 条目，反应留给回合内决策。 */
     private qzoneFeedSweepRunning;
     private qzoneFeedSweep;
+    /** 被评论感知：她的说说评论数增量轮询。感知零动作配额；产出 [空间动态] 条目
+     * （ SOCIAL SURFACE 规则现成，零提示词改动），由下一次推进（自动或对话）自然
+     * 携带——轮询本身绝不调度推进（用户要求：被赞不立即开 advance）。 */
+    private qzoneReactionSweep;
     /** 加载并补齐端点注册表（幂等）：active 故事/参与者/启用的群规则派生行。 */
     /** 加载并补齐端点注册表（幂等 + 单飞：并发调用共享同一次 reconcile）。 */
     private endpointRegistryInFlight;
     /** 端点/别名运行期写队列（P1-2）：所有注册表变更串行执行，杜绝并发"查后写"重复。 */
     private endpointWriteQueue;
     private enqueueEndpointWrite;
+    /** Keep health snapshots durable without making connector lifecycle writes part of
+     * the message transaction. The global DB writer still serializes physical writes. */
+    private persistEndpointState;
+    private setEndpointState;
+    private endpointGateReason;
+    /**
+     * Agency uses the normal delivery gate plus the optional channel-specific
+     * initiation gate.  EndpointState.initiate is intentionally optional: QQ
+     * and other transports without a context-token concept remain compatible
+     * with the historical proactive path, while a present-but-expired token is
+     * a hard, explicitly classified failure.
+     */
+    private endpointInitiateGateReason;
+    private endpointForDelivery;
     private ensureEndpointRegistry;
     private reconcileEndpointRegistry;
     /** 运行期增量登记（P1-2）：故事/参与者创建时同步 upsert 端点行。
@@ -1265,6 +1334,22 @@ export declare class InterludeService extends Service {
      * 取记录时若两个槽位都没有物化天，先本地无模型重物化（锚定今天）再算窗口。 */
     private currentSchedulePreplanWindow;
     private getSchedulePreplan;
+    private longHorizonConfig;
+    private longHorizonSweepRunning;
+    private longHorizonLastScore;
+    private longHorizonGenerationRunning;
+    /** Story ids whose active guidance row has already been loaded for this process. */
+    private longHorizonGuidanceLoaded;
+    private longHorizonSweep;
+    private longHorizonProgress;
+    private saveLongHorizonProgress;
+    private getActiveLongArcGuidance;
+    private ensureLongHorizonGuidanceLoaded;
+    private longHorizonGenerate;
+    private longHorizonInput;
+    /** 主叙事注入用的裁剪投影：催化器只提供行动许可，不提供强制剧情。 */
+    longHorizonPromptProjection(storyId: string): string | undefined;
+    private activeLongArcGuidanceCache;
     private schedulePreplanEvidence;
     private saveSchedulePreplan;
     private prepareSchedulePreplanReview;
@@ -1379,6 +1464,8 @@ export declare function calibratedNativeFaceWillingness(semantic: NativeFaceSema
  * content hash fragment so every row is globally unique and stable for an
  * unchanged file. */
 export declare function stableStickerAssetId(filePath: string, hash: string): string;
+/** 表情包投递 URL：Koishi HTTP 路由 + assetId（OneBot 实现回源下载） */
+export declare function stickerDeliveryUrl(base: string, assetId: string): string;
 /** Extract only explicit clock statements from a live user message. This is a
  * small factual aid, not an attempt to infer every temporal expression. */
 export declare function extractUserReportedTimes(content: string, now: Date, timezone: string): UserReportedTime[];
@@ -1406,6 +1493,47 @@ export declare function normalizeGroupVisibleReply(raw: NarrativeDecision['group
 export declare function hoistParticipantlessInteraction<T extends NarrativeDecision>(decision: T, phase: NarrativeRequest['phase']): T;
 export declare function requiresVisibleReplyRecovery(phase: NarrativeRequest['phase'], groupContext: GroupContext | undefined, decision: NarrativeDecision): boolean;
 export declare function visibleReplyMode(decision: NarrativeDecision, phase: NarrativeRequest['phase'], groupContext?: GroupContext): string;
+/** 可见回复的气泡拆分（纯函数，可单测）。
+ * 小模型适配开关：模型没有按合约输出 <sep/> 而是用换行分条时，把换行运行
+ * （含单个换行与 CRLF）视作气泡边界。仅在内容不含显式分隔符时转换——
+ * 模型自己写了 <sep/> 就尊重原样；群路径的空行转换（normalizeGroupVisibleReply）
+ * 发生在更早阶段且已含分隔符，同样不会被二次改写。 */
+export declare function splitVisibleReplyBubbles(content: string, options: {
+    separator?: string;
+    splitEnabled: boolean;
+    newlineAsSeparator?: boolean;
+}): string[];
+/** 剧本历史注入预算（纯函数，可单测）。
+ * M4.1 曾在此处叠加 Math.max(35, …) 硬地板保护连续性——副作用是 Console 里
+ * 调小 contextEntryLimit 完全失效，小模型无法收缩上下文。现在尊重用户设置：
+ * 条数默认 35（schema 默认），需要更小历史的部署（小模型）可显式调小，
+ * 并配合把 contextTimeWindowMinutes 调小或设 0（时间窗会把近窗口内的全部
+ * 条目并入，即使超过条数）。 */
+export declare function resolveScriptContextBudget(runtime: Pick<RuntimeConfig, 'contextEntryLimit' | 'contextTimeWindowMinutes'>): {
+    count: number;
+    minutes: number;
+};
+export interface ManageSessionDenial {
+    /** onebot = 互动白名单拒绝；managers = managerAccounts 不匹配。两层配置不同，指引不同。 */
+    layer: 'onebot' | 'managers';
+    /** 供命令回复、doctor 与日志共用的完整原因（含可操作指引）。 */
+    detail: string;
+}
+/** 管理权限判定的纯函数核心（可单测）。返回 undefined = 允许。
+ * 此前两层失败共用一句"需要 HDSI 管理员权限"，用户给了管理员仍被拒时
+ * 排障方向完全被带偏；实际原因必须在消息与默认日志里直接可读。 */
+export declare function manageSessionDenialReason(input: {
+    platform?: string;
+    selfId?: string;
+    userId?: string;
+    onebot?: {
+        enabled?: boolean;
+        ignoreSelfMessages?: boolean;
+        botAccounts?: OneBotAccountRule[];
+        userAccounts?: OneBotAccountRule[];
+    };
+    managers?: string[];
+}): ManageSessionDenial | undefined;
 export declare function hasRequiredNarrativeScript(value: NarrativeDecision | undefined | null): boolean;
 export declare function resolveBlindModeConfig(value?: Partial<BlindModeConfig>): BlindModeConfig;
 /** Scene compaction may update a tiny roster only with explicit observed

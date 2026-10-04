@@ -3,8 +3,7 @@ import test from 'node:test'
 import { systemPrompt, toPromptPayload } from '../src/narrator'
 import {
   applySchedulePreplanProposal, DEFAULT_SCHEDULE_PREPLAN_CONFIG, materializeSchedulePreplan,
-  nextSchedulePreplanTransition, schedulePreplanNeedsModel, schedulePreplanReviewDue, schedulePreplanWindow,
-} from '../src/schedule-preplan'
+  nextSchedulePreplanTransition, schedulePreplanNeedsModel, schedulePreplanReviewDue, schedulePreplanWindow, SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS, schedulePreplanEvidenceMentionsDateChange, schedulePreplanFollowUpDue } from '../src/schedule-preplan'
 import { emptyStorySetting, emptyStoryState, NarrativeRequest, SchedulePreplanRecord, SchedulePreplanRegime, ScriptEntry } from '../src/types'
 
 const regime: SchedulePreplanRegime = {
@@ -141,4 +140,57 @@ test('prompt payload exposes Schedule Preplan as planned structure separate from
   assert.equal(payload.availableNearFuture.schedulePreplan.plannedNotObserved, true)
   assert.equal(payload.ongoingThreads.state.schedulePreplan, undefined)
   assert.ok(payload.availableNearFuture.schedulePreplan.blocks.length <= 8)
+})
+
+test('当天例外触发扫描：改约/取消/新确认命中，愿望与闲聊不命中', () => {
+  const hit = schedulePreplanEvidenceMentionsDateChange([
+    { id: 1, content: '她给对方发消息：今晚的健身取消啦，改天再约。' },
+    { id: 2, content: '"那我们把见面改成八点半？"对方回复说好。' },
+    { id: 3, content: '她和朋友敲定了周六上午十点的牙医。' },
+  ])
+  assert.deepEqual(hit, [1, 2, 3])
+  const miss = schedulePreplanEvidenceMentionsDateChange([
+    { id: 4, content: '她想去看那部新电影，但还没买票。' },
+    { id: 5, content: '晚饭是昨天的剩面，味道一般。' },
+  ])
+  assert.deepEqual(miss, [])
+  // 去重 + 非法 id 过滤
+  const dupes = schedulePreplanEvidenceMentionsDateChange([
+    { id: 7, content: '约好了周日去爬山' }, { id: 7, content: '约好了周日去爬山' }, { id: 0, content: '取消了' },
+  ])
+  assert.deepEqual(dupes, [7])
+})
+
+test('当天跟进审查到期：日审已过 + 冷却已过 + 未读含信号', () => {
+  const config = { ...DEFAULT_SCHEDULE_PREPLAN_CONFIG, reviewAfterLocalHour: 3 }
+  const tz = 'Asia/Shanghai'
+  // 日审已于今晨完成（lastReviewedLocalDate=今天），updatedAt=3:20 本地
+  const reviewed = {
+    storyId: 's', revision: 1, timezone: tz, validFrom: '2026-10-02', validThrough: '2026-10-15',
+    lastReviewedLocalDate: '2026-10-02', lastEvidenceEntryId: 100, reviewReason: 'r',
+    regimes: [], exceptions: [], materializedDays: [],
+    createdAt: new Date('2026-10-01T00:00:00Z'), updatedAt: new Date('2026-10-01T19:20:00Z'),
+  }
+  const nowLate = new Date('2026-10-01T22:00:00Z') // 本地 06:00？——用 UTC 差表达冷却 >2h：updatedAt+2h41m
+  // 冷却未过（updatedAt+1h）
+  const tooSoon = new Date(reviewed.updatedAt.getTime() + 60 * 60_000)
+  assert.equal(schedulePreplanFollowUpDue(reviewed, [{ id: 101, content: '今晚的课取消了' }], tooSoon, config), false, '冷却未过')
+  // 冷却已过 + 信号命中
+  assert.equal(schedulePreplanFollowUpDue(reviewed, [{ id: 101, content: '今晚的课取消了' }], nowLate, config), true, '命中放行')
+  // 冷却已过但无信号
+  assert.equal(schedulePreplanFollowUpDue(reviewed, [{ id: 101, content: '平平无奇的一天' }], nowLate, config), false, '无信号零成本')
+  // 无记录 / 未启用 → false
+  assert.equal(schedulePreplanFollowUpDue(undefined, [{ id: 1, content: '取消了' }], nowLate, config), false)
+  assert.equal(schedulePreplanFollowUpDue(reviewed, [{ id: 101, content: '取消了' }], nowLate, { ...config, enabled: false }), false)
+  // 日审查本身到期时走正常路径（跟进返回 false）
+  const stale = { ...reviewed, lastReviewedLocalDate: '2026-10-01' }
+  assert.equal(schedulePreplanFollowUpDue(stale, [{ id: 101, content: '取消了' }], nowLate, config), false, '日审到期让位正常路径')
+})
+
+test('审查教学：单次事件只进例外、不得吸收进周规律；愿望不算证据', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../src/narrator.ts', import.meta.url), 'utf8')
+  assert.match(src, /belongs to exceptions for its exact date\. Do NOT change weekly blocks because of a single occurrence/)
+  assert.match(src, /shows the new time repeating on separate dates or being stated as permanent/)
+  assert.match(src, /A wish, a suggestion, a tentative idea, or an unexecuted plan in conversation is not evidence/)
 })

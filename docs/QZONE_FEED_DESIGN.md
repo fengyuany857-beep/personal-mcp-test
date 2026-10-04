@@ -109,5 +109,5 @@ SnowLuma qzone API ─┤ 好友动态轮询 → 过滤/去重/正文对齐     
 - 深翻页不可靠：只消费首页（`page_num=1`），时间窗兜底
 - feeds 正文是预渲染 html：当前只用结构化字段 + msg_list 对齐；html 解析留待需要时做
 - 图片说说：发送链路支持（SnowLuma 自动上传），意图 payload 尚未开放图片字段——等她的素材库（表情包/相册）与空间打通后设计
-- 她被赞/被评论的感知：`get_qzone_msg_list` 的 comment_num 轮询增量留待后续（情绪素材：那条说说有 3 个赞）
+- 她被评论的感知（rc29 已实现）：动态轮询附带拉取她自己的 `get_qzone_msg_list`，与 `interlude_qzone_post.commentNum` 基线比对——首次观测只立基线，增量>0 写 `[空间动态]` 条目（SOCIAL SURFACE 规则现成），由下一次推进（自动或对话）自然携带，**轮询绝不触发推进**；删评回落静默下修基线。感知零动作配额，只覆盖 7 天内已确认的帖子、单轮至多 3 条。赞数感知待上游暴露（SnowLuma `mapMsgList`/`RawEmotion` 目前只映射 `cmtnum`；补 `like_num` 后在 `QzoneMsgEntry` 加字段并入 `qzoneReactionDeltas` 即可）
 - 群发动态（appid 4=相册等）：当前只消费说说类

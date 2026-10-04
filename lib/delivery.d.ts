@@ -11,6 +11,7 @@ export declare function scriptEventPayload(message: OutgoingMessageDraft, bubble
         eventId: string;
         eventKind: "outgoing-message" | "group-message";
         causedByEventIds: string[];
+        endpointId?: string;
         fullContent: string;
         bubbleCount: number;
     };
@@ -22,6 +23,7 @@ export declare function deliveryEntryMetadata(message: OutgoingMessageDraft, ext
     eventId?: string;
     eventKind?: "outgoing-message" | "group-message";
     causedByEventIds?: string[];
+    endpointId?: string;
     fullContent?: string;
     bubbleCount?: number;
     visible: boolean;

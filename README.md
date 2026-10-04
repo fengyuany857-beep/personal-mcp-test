@@ -6,7 +6,7 @@
 
 HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
-当前版本：`1.0.1-rc28`（单剧本多通道 M2/M3/M4 全量：回合来源追踪/用户端点链接/显式端点投递/确定性通道标注/多平台端点选择；DeepSeek V4.1 回复模式修复；世界事件切面轮换架构修订；文档补全。前版：TurnEngine/Scheduler 模块化；九项能力修复与 invalidate 边界；见 [更新记录](docs/CHANGELOG.md)）。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
+当前版本：`1.0.1-rc36`（长线叙事催化器 dormant/prime/activate；发行前修复三批：投递幂等/Qzone 增量一致性/崩溃诊断/日志分级与脱敏；管理权限拒绝可诊断；`contextEntryLimit` 硬地板移除——小模型可收缩历史上下文；新增小模型换行分句开关 `convertNewlineToSeparator`。前版要点：单剧本多通道 M2/M3/M4 全量、DeepSeek V4.1 回复模式修复、世界事件切面轮换；见 [更新记录](docs/CHANGELOG.md)）。rc12 起新增可选 Anthropic Messages 端点，兼容现有 payload 与 cache-first 编排；群音频可直接触发携带原生音频的写作。保留跨会话投递能力。配置与边界见 [rc12 说明](docs/development/ANTHROPIC_MESSAGES_RC12.md)、[更新记录](docs/CHANGELOG.md) 与 [文档索引](docs/README.md)。
 
 ## 文档导航
 
@@ -16,6 +16,7 @@ HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙�
 - 管理员命令：[command.md](command.md)
 - 当前架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - QQ 合并转发读取设计：[docs/FORWARD_MESSAGE_READING_DESIGN.md](docs/FORWARD_MESSAGE_READING_DESIGN.md)
+- 群聊历史图片证据回流：[docs/GROUP_HISTORICAL_IMAGE_CONTEXT_DESIGN.md](docs/GROUP_HISTORICAL_IMAGE_CONTEXT_DESIGN.md)
 - Alter System 设计与运行规则：[docs/ALTER_SYSTEM.md](docs/ALTER_SYSTEM.md)
 - Agency Window 设计与运行规则：[docs/AGENCY_WINDOW.md](docs/AGENCY_WINDOW.md)
 - Schedule Preplan 近期日程层：[docs/SCHEDULE_PREPLAN.md](docs/SCHEDULE_PREPLAN.md)
@@ -283,28 +284,30 @@ OneBot 模式采用显式白名单：启用后，绑定的机器人 QQ 账号和
 
 ```bash
 npm install koishi-plugin-hds-interlude@beta
+# 或使用 corepack yarn（Koishi 官方推荐）：
+corepack yarn add "koishi-plugin-hds-interlude@file:./koishi-plugin-hds-interlude-1.0.1-rc36.tgz" --exact
 ```
 
 稳定版发布后可省略 `@beta`。然后在 Koishi Console 添加 `hds-interlude` 插件并完成配置。
 
 ### 本地 tgz 安装
 
-使用本地预发布包时，可在 Koishi 实例目录执行：
+使用本地预发布包时，Koishi Desktop 实例必须使用 Yarn 4 更新 package.json 与 yarn.lock；不要用 npm 安装：
 
 ```bash
-npm install /absolute/path/to/koishi-plugin-hds-interlude-1.0.1-rc28.tgz
+node .yarn/releases/yarn-4.12.0.cjs add "koishi-plugin-hds-interlude@file:C:/absolute/path/to/koishi-plugin-hds-interlude-1.0.1-rc36.tgz" --exact
 ```
 
 Windows 示例：
 
 ```powershell
-npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-1.0.1-rc28.tgz
+node .yarn/releases/yarn-4.12.0.cjs add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc36.tgz" --exact
 ```
 
 Koishi Desktop 的实例使用 Yarn 4。请在实例目录执行以下命令，并在完成后重载插件或重启 Desktop：
 
 ```powershell
-corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc28.tgz" --exact
+node .yarn/releases/yarn-4.12.0.cjs add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-1.0.1-rc36.tgz" --exact
 ```
 
 安装后重新加载 Koishi，再在 Console 启用插件。
@@ -417,3 +420,5 @@ npm test
 ```
 
 构建产物位于 `plugins/hds-interlude/lib`。发布前建议运行构建、测试和 `npm pack --dry-run`，确认包内包含 `lib` 与需要分发的文档。
+
+

@@ -125,6 +125,16 @@ export interface EndpointState {
         reason?: string;
     };
 }
+/** interlude_endpoint_state 持久快照。动态状态写入独立表，避免污染身份注册表。 */
+export interface EndpointStateRecord {
+    endpointId: string;
+    state: EndpointState;
+    updatedAt: Date;
+}
+/** 防御性读取持久快照；坏快照不会阻塞端点注册表启动。 */
+export declare function normalizeEndpointState(raw: unknown, endpointId?: string): EndpointState | undefined;
+/** Restart recovery keeps diagnostic observations but never restores live connection truth. */
+export declare function restoreEndpointState(endpointId: string, snapshot: EndpointState | undefined, now?: number): EndpointState;
 /** 进程重启后的保守初值：一切未知按不可用处理，待连接器/首次投递/入站恢复。 */
 export declare function freshEndpointState(endpointId: string, now?: number): EndpointState;
 export declare function stateAfterConnection(state: EndpointState, online: boolean, now?: number): EndpointState;
@@ -132,8 +142,8 @@ export declare function stateAfterInbound(state: EndpointState, now?: number): E
 export declare function stateAfterOutbound(state: EndpointState, ok: boolean, note: string, cooldownMs?: number, now?: number): EndpointState;
 /** deliverable 确认的保质期（P2-8）：超过 TTL 的 allowed 按未知保守处理，
  *  直到下一次出站/入站观测刷新——陈旧的"可投递"不是事实。
- *  注：isEndpointDeliverable 的投递门控属 M3 范围——M1/M2 不在出站路径消费
- *  （重启保守初值会误伤正常投递）；当前仅用于健康面板/管理命令展示。 */
+ *  M3 出站路径会消费该函数；重启快照即使保存了上次成功，也必须先经过
+ *  当前连接器的在线事实确认。 */
 export declare const ENDPOINT_DELIVERABLE_TTL_MS: number;
 /** 冷却期内视为不可投递（保守）；冷却结束允许重试探测；allowed 超过 TTL 视为过期。 */
 export declare function isEndpointDeliverable(state: EndpointState | undefined, now?: number): boolean;

@@ -9,11 +9,13 @@
 
 ## 待评估项
 
-### Schedule Preplan：当天例外的及时收束
+### Schedule Preplan：当天例外的及时收束（✅ 2026-10-02 已实现）
 
 保留日常低频审查与稳定周规律。仅在已提交的剧本明确出现取消、改期或已确认的新安排时，登记一次来源化的日期例外审查。单次聊天、愿望和未实现计划不能修改日程。
 
 验收：临时改约后，后续时间导演与联系资格能读取该例外；同一事件不会变成长期作息。
+
+实现（rc29）：确定性触发扫描 `schedulePreplanEvidenceMentionsDateChange`（取消/改期/改约/敲定等语言痕迹，证据管道 kind=script 天然排除世界事件与空间条目）+ 日审完成后的带外跟进审查（`schedulePreplanFollowUpDue`：冷却 ≥2h + 未读含信号才放行，无信号零模型调用）+ 审查教学三行（单次事件只进 exceptions、周规律只有"新时间在不同日期重复或明确永久"才可改、愿望/建议/未执行计划不算证据）。例外的登记/按日过期/物化消费（时间导演与联系资格经 materializeSchedulePreplan → schedulePreplanWindow → payload）自 rc12 起已就绪。
 
 ### Schedule Preplan：证据扫描与隐私投影
 

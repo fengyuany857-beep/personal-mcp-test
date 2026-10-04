@@ -19,6 +19,8 @@ export interface ScriptEventDraft {
     occurredAt: string;
     causedByEventIds: string[];
     participantId?: string;
+    /** M4: selected transport endpoint is part of the authored event, not only the runtime draft. */
+    endpointId?: string;
     content?: string;
     bubbles?: string[];
     deliveryMode?: ScriptDeliveryMode;
@@ -53,6 +55,7 @@ export interface ScriptMessageEventReference {
     scriptEntryId?: number;
     eventKind: 'outgoing-message' | 'group-message';
     causedByEventIds: string[];
+    endpointId?: string;
     fullContent: string;
     bubbleIndex: number;
     bubbleCount: number;

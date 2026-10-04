@@ -1,6 +1,6 @@
 # HDS Interlude 管理与查看指令
 
-适用版本：`1.0.1-rc28`
+适用版本：`1.0.1-rc36`
 ## 使用前先看这里
 
 - 新手安装和首次测试：`BEGINNER_GUIDE.md`
@@ -443,3 +443,4 @@ interlude.purge.range 2026-08-14T09:00:00+08:00 2026-08-14T10:00:00+08:00
 | `interlude.advance` 没有消息 | 模型完成了剧本补写，但当前没有生成可投递消息。 |
 | `interlude.compact` 没有整理内容 | 当前未压缩条目或字符数未达到 `memory.sceneEntryThreshold` / `sceneCharacterThreshold`。 |
 | 日志中看不到正常运行信息 | 将 `logging.level` 设为 `info`，并将 `logging.verbosity` 设为 `standard`；排查时序或跳过原因时临时使用 `diagnostic`，完成后恢复。 |
+

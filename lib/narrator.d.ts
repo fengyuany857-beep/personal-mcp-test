@@ -1,6 +1,6 @@
 import { Context } from 'koishi';
 import { type ContractTier, type ModelFamily, type SpecialtyProfile } from './specialization';
-import { AlterAnalysisDecision, AlterAnalysisRequest, AlterSystemConfig, ChatActionCapabilities, CompactionDecision, CompactionRequest, NarrativeDecision, NarrativeProvider, OverlayCompactionDecision, OverlayCompactionRequest, EarlyNarrativeReply, NarrativeCompactor, NarrativeEmbedder, NarrativeImage, NarrativeRequest, SchedulePreplanProposal, SchedulePreplanReviewRequest, ScriptEntry, StickerCatalogEntry, TimelinePlan, TimelinePlanRequest } from './types';
+import { AlterAnalysisDecision, AlterAnalysisRequest, AlterSystemConfig, ChatActionCapabilities, CompactionDecision, CompactionRequest, NarrativeDecision, NarrativeProvider, OverlayCompactionDecision, OverlayCompactionRequest, EarlyNarrativeReply, LongArcGuidanceRequest, NarrativeCompactor, NarrativeEmbedder, NarrativeImage, NarrativeRequest, SchedulePreplanProposal, SchedulePreplanReviewRequest, ScriptEntry, StickerCatalogEntry, TimelinePlan, TimelinePlanRequest } from './types';
 import { ModelRoutingTable } from './model-routing';
 export { configuredProviders, effectiveMainModelId, resolveModelRouting, usesRemoteProviders, ZHIPU_OFFICIAL_CHAT_ENDPOINT, } from './model-routing';
 export { storyLocalTimeContext } from './time';
@@ -181,6 +181,7 @@ export declare class SilentCompactor implements NarrativeCompactor {
     compactOverlay(): Promise<OverlayCompactionDecision>;
     planSchedulePreplan(): Promise<SchedulePreplanProposal | undefined>;
     planTimeline(): Promise<TimelinePlan | undefined>;
+    planLongArcGuidance(): Promise<unknown | undefined>;
 }
 /** A no-op embedder lets memory retrieval fall back to rule-based ranking. */
 export declare class SilentEmbedder implements NarrativeEmbedder {
@@ -235,6 +236,7 @@ export declare class OpenAICompatibleNarrator implements NarrativeProvider {
     setSideTaskHealthReporter(reporter: (task: string, ok: boolean) => void): void;
     compact(request: CompactionRequest): Promise<CompactionDecision>;
     planTimeline(request: TimelinePlanRequest): Promise<TimelinePlan | undefined>;
+    planLongArcGuidance(request: LongArcGuidanceRequest): Promise<unknown | undefined>;
     planSchedulePreplan(request: SchedulePreplanReviewRequest): Promise<SchedulePreplanProposal | undefined>;
     compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>;
     analyzeAlter(request: AlterAnalysisRequest, alterConfig: AlterSystemConfig): Promise<AlterAnalysisDecision>;
@@ -292,7 +294,7 @@ export declare function computeTokenCost(record: TokenUsageRecord): {
 /** One human-readable log line: usage numbers, cache hit rate, and optional
  * billing. Absent fields are simply omitted instead of printed as zero. */
 export declare function formatTokenUsageLine(record: TokenUsageRecord): string;
-export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile, proactiveContactMode?: 'strict' | 'natural' | 'balanced', channelSelectionEnabled?: boolean): string;
+export declare function systemPrompt(phase: NarrativeRequest['phase'], mainPrompt: string | undefined, formatPrompt: string | undefined, fixedPrompt: string, baseStylePrompt: string, storyStylePrompt: string, refreshContinuity?: boolean, alterEnabled?: boolean, agencyEnabled?: boolean, perspectiveEnabled?: boolean, outputRecovery?: boolean, chatCapabilities?: ChatActionCapabilities, hasQuotedMessage?: boolean, stickerCatalog?: StickerCatalogEntry[], schedulePreplanEnabled?: boolean, streamingReplyFirst?: boolean, cacheFirstPayload?: boolean, groupTurn?: boolean, writingOptions?: NarrativeRequest['writingOptions'], specialty?: SpecialtyProfile, proactiveContactMode?: 'strict' | 'natural' | 'balanced', channelSelectionEnabled?: boolean, longHorizonGuidance?: string): string;
 export declare function writingAffordances(options?: NarrativeRequest['writingOptions']): string;
 /** A guard paragraph rendered into the writing affordances when the host has
  * detected a fixed bubble-count run in her recent delivered replies. */

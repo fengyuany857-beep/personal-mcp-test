@@ -1,8 +1,9 @@
 import { Context } from 'koishi';
 import { InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent, NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, SeededWorldEvent, StatePatchProposal, StickerAsset, WebObservation } from './types';
 import type { QzonePostRecord } from './qzone';
-import type { EndpointRow, StoryAliasRecord } from './endpoints';
+import type { EndpointRow, EndpointStateRecord, StoryAliasRecord } from './endpoints';
 import type { WorkRow } from './works';
+import type { LongArcGuidanceRow, LongArcProgressRow } from './long-arc';
 declare module 'koishi' {
     interface Tables {
         interlude_story: InterludeStory;
@@ -21,6 +22,9 @@ declare module 'koishi' {
         interlude_seeded_event: SeededWorldEvent;
         interlude_qzone_post: QzonePostRecord;
         interlude_endpoint: EndpointRow;
+        interlude_endpoint_state: EndpointStateRecord;
+        interlude_long_arc_guidance: LongArcGuidanceRow;
+        interlude_long_arc_progress: LongArcProgressRow;
         interlude_story_alias: StoryAliasRecord;
         interlude_work: WorkRow;
     }

@@ -126,7 +126,7 @@ test('group delivery uses the bot from the live session before stale story trans
   const sentByStaleBot: unknown[][] = []
   const service = {
     ctx: { bots: [{ selfId: 'old-bot', platform: 'onebot', sendMessage: async (...args: unknown[]) => sentByStaleBot.push(args) }] },
-    splitOutgoingMessage: () => ['你好'],
+    ensureEndpointRegistry: async () => {}, splitOutgoingMessage: () => ['你好'],
     endpointAddressSync: (legacy: unknown) => legacy,
     noteEndpointOutbound: () => {},
     report: () => undefined,
@@ -174,7 +174,7 @@ test('a failed segment makes group delivery incomplete, even when an earlier seg
   const deliveredSegments: string[] = []
   const service = {
     ctx: { bots: [] },
-    splitOutgoingMessage: () => ['第一段', '第二段'],
+    ensureEndpointRegistry: async () => {}, splitOutgoingMessage: () => ['第一段', '第二段'],
     endpointAddressSync: (legacy: unknown) => legacy,
     noteEndpointOutbound: () => {},
     report: () => undefined,

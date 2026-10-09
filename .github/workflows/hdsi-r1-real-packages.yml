@@ -64,7 +64,7 @@ jobs:
 
       - name: Install real pinned XState and json-rules-engine
         working-directory: hdsi
-        run: npm install --save-exact --no-audit --no-fund xstate@5.33.2 json-rules-engine@7.3.2
+        run: npm install --save-exact --no-audit --no-fund xstate@5.33.2 json-rules-engine@7.3.1
 
       - name: Confirm real package tree
         working-directory: hdsi

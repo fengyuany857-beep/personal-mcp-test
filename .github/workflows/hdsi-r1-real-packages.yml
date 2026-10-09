@@ -1,0 +1,93 @@
+name: HDSI R1 | Real npm packages (isolated)
+
+on:
+  push:
+    branches:
+      - hdsi-r1-ci-isolated-20261010
+    paths:
+      - .github/workflows/hdsi-r1-real-packages.yml
+      - ci/hdsi-r1-real-package-smoke.cjs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-hdsi-real-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout isolated harness branch
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout exact HDSI rc36 mirror commit
+        uses: actions/checkout@v4
+        with:
+          repository: yunwuneo/hds-interlude
+          ref: 338e7096bf2df66fa0643b6518172066da379479
+          path: hdsi
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify source identity
+        working-directory: hdsi
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "338e7096bf2df66fa0643b6518172066da379479"
+          test "$(git hash-object src/database.ts)" = "d1ceae17cb7ede3b241d533179c343acc5c7dfe6"
+          node -e "const p=require('./package.json');if(p.version!=='1.0.1-rc36')process.exit(1)"
+          node --version
+          npm --version
+
+      - name: Install HDSI baseline from its committed lockfile
+        working-directory: hdsi
+        run: npm ci --no-audit --no-fund
+
+      - name: Baseline TypeScript typecheck
+        working-directory: hdsi
+        run: npm run typecheck
+
+      - name: Baseline tests
+        working-directory: hdsi
+        run: npm test
+
+      - name: Baseline build
+        working-directory: hdsi
+        run: npm run build
+
+      - name: Install real pinned XState and json-rules-engine
+        working-directory: hdsi
+        run: npm install --save-exact --no-audit --no-fund xstate@5.33.2 json-rules-engine@7.3.2
+
+      - name: Confirm real package tree
+        working-directory: hdsi
+        run: npm ls xstate json-rules-engine --depth=0
+
+      - name: Run real-library attention, restoration and rules smoke tests
+        working-directory: hdsi
+        run: node ../harness/ci/hdsi-r1-real-package-smoke.cjs
+
+      - name: Rebuild HDSI with installed libraries
+        working-directory: hdsi
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Upload bounded verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdsi-r1-real-packages-evidence
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            hdsi/hdsi-r1-real-smoke-report.json
+            hdsi/package.json
+            hdsi/package-lock.json

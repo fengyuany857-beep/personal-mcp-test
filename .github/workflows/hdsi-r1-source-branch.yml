@@ -22,6 +22,7 @@ jobs:
           ref: 338e7096bf2df66fa0643b6518172066da379479
           path: upstream
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Verify immutable source baseline
         run: |

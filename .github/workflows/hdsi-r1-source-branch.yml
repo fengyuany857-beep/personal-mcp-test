@@ -1,0 +1,58 @@
+name: HDSI R1 - Create clean source branch
+
+on:
+  push:
+    branches:
+      - hdsi-r1-ci-isolated-20261010
+    paths:
+      - .github/workflows/hdsi-r1-source-branch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact verified HDSI source
+        uses: actions/checkout@v4
+        with:
+          repository: yunwuneo/hds-interlude
+          ref: 338e7096bf2df66fa0643b6518172066da379479
+          path: upstream
+          persist-credentials: false
+
+      - name: Verify immutable source baseline
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "338e7096bf2df66fa0643b6518172066da379479"
+          test "$(git -C upstream hash-object src/database.ts)" = "d1ceae17cb7ede3b241d533179c343acc5c7dfe6"
+          grep -q '"version": "1.0.1-rc36"' upstream/package.json
+          test -f upstream/LICENSE
+          echo "VERIFIED_UPSTREAM_SHA=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push upstream commit to isolated source branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target_branch="hdsi-r1-source-candidate-20261010"
+          remote_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          # Require a nonexistent branch: no overwrite, no force, no main mutation.
+          if git -C upstream ls-remote --exit-code "$remote_url" "refs/heads/$target_branch" >/dev/null 2>&1; then
+            echo "Ref already exists, refusing overwrite." >&2
+            exit 1
+          fi
+          git -C upstream -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push "$remote_url" "HEAD:refs/heads/$target_branch"
+          echo "Created: https://github.com/${GITHUB_REPOSITORY}/tree/$target_branch" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate new branch points to same commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          remote_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          got=$(git -C upstream -c credential.helper='!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' ls-remote "$remote_url" "refs/heads/hdsi-r1-source-candidate-20261010" | cut -f1)
+          test "$got" = "338e7096bf2df66fa0643b6518172066da379479"
+          echo "Source-branch identity PASS: $got" >> "$GITHUB_STEP_SUMMARY"

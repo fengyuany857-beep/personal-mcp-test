@@ -422,3 +422,22 @@ npm test
 构建产物位于 `plugins/hds-interlude/lib`。发布前建议运行构建、测试和 `npm pack --dry-run`，确认包内包含 `lib` 与需要分发的文档。
 
 
+## 独立构建（GitHub Fork）
+
+本仓库 fork 自 Gitee 原仓库 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)。原仓库是作者 Koishi 工作区（Yarn 4 + Yakumo）中的一个子目录，`tsconfig.json` 依赖工作区根部的 `tsconfig.base.json`，无法单独构建。本 fork 已改为可在仓库根目录直接独立构建：
+
+```bash
+# 需要 Node.js 20+
+npm install
+npm run build      # esbuild 打包 lib/index.js + tsc 生成 lib/*.d.ts
+npm run typecheck  # 与原作者相同的严格未使用检查
+npm test           # node:test + tsx
+```
+
+说明：
+
+- `tsconfig.json` 已内联原 Koishi 工作区的基础配置（`target: es2022`、`moduleResolution: bundler`、仅输出声明文件等），不再引用 `../../tsconfig.base.json`。
+- `npm run build:js` 使用与 Yakumo 构建相同的 esbuild 参数（CJS、`platform=node`、依赖全部 external、`keepNames`、`charset=utf8`），并锁定 `esbuild@0.23.1`：在相同源码下生成的 `lib/index.js` 与原仓库提交的 bundle 逐字节一致。
+- 开发依赖新增 `koishi`、`typescript`（5.9）、`tsx`、`esbuild`、`@types/node` 与 `@minatojs/driver-sqlite`（使 `test/works-sqlite.test.ts` 可以运行）。
+- `test/model-behavior.test.ts` 的 4 项真实模型测试在未设置模型端点/密钥环境变量时会自动跳过。
+- 建议的 CI：在 GitHub Actions 中依次执行 `npm ci`、`npm run build`、`npm run typecheck`、`npm test`（Node 20 / 22）。
